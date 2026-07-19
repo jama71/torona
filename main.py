@@ -33,6 +33,29 @@ try:
 except ImportError:
     Shazam = None
 
+# ------------------------------------------------------------
+# ffmpeg: bundled via imageio-ffmpeg so it works on ANY host
+# (Railway/Docker/etc.) without relying on apt packages being
+# installed by the build system. This fixes:
+#   "No such file or directory: 'ffmpeg'"
+# ------------------------------------------------------------
+try:
+    import imageio_ffmpeg
+
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["PATH"] = os.path.dirname(FFMPEG_PATH) + os.pathsep + os.environ.get("PATH", "")
+    os.environ.setdefault("FFMPEG_BINARY", FFMPEG_PATH)
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
+
+try:
+    # some libraries (pydub, etc.) look at this instead of PATH
+    from pydub import AudioSegment
+
+    AudioSegment.converter = FFMPEG_PATH
+except Exception:
+    pass
+
 # ============================================================
 # CONFIG  (only these need to be set in Railway env variables)
 # ============================================================
@@ -43,6 +66,16 @@ ADMIN_IDS = {
 }
 # Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
+# Optional: path to a cookies.txt (Netscape format) to help yt-dlp bypass
+# YouTube's "Sign in to confirm you're not a bot" checks on some hosts.
+COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or None
+
+# A realistic desktop User-Agent + an Android/iOS "player_client" combo is
+# currently the most reliable way to dodge YouTube's bot-check without cookies.
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
 CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
@@ -714,23 +747,60 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
+# Fallback order of YouTube "player_client" configs. Some of these dodge the
+# "Sign in to confirm you're not a bot" check better than others depending on
+# the datacenter IP the bot is hosted on, so we try them one by one.
+PLAYER_CLIENT_FALLBACKS = [
+    ["android", "web", "ios"],
+    ["ios"],
+    ["tv_embedded", "web"],
+    ["mweb"],
+]
+
+
+def _is_bot_check_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "sign in to confirm" in msg or "not a bot" in msg
+
+
 def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
-    ydl_opts = {
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "restrictfilenames": True,
-    }
-    if use_proxy and GENERAL_PROXY:
-        ydl_opts["proxy"] = GENERAL_PROXY
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-        filename = ydl.prepare_filename(info)
-        return filename, info
+    last_exc = None
+    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
+        ydl_opts = {
+            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+            "format": "best[ext=mp4]/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "restrictfilenames": True,
+            "ffmpeg_location": FFMPEG_PATH,
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "http_headers": {"User-Agent": DEFAULT_UA},
+            "geo_bypass": True,
+            "retries": 3,
+        }
+        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+            ydl_opts["cookiefile"] = COOKIES_FILE
+        if use_proxy and GENERAL_PROXY:
+            ydl_opts["proxy"] = GENERAL_PROXY
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if "entries" in info:
+                    info = info["entries"][0]
+                filename = ydl.prepare_filename(info)
+                return filename, info
+        except Exception as e:
+            last_exc = e
+            # Only worth retrying with a different client for the bot-check
+            # error and only for youtube urls; anything else, fail fast.
+            if "youtube" not in url and "youtu.be" not in url:
+                raise
+            if not _is_bot_check_error(e):
+                raise
+            log.warning("yt-dlp attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
+            continue
+    raise last_exc
 
 
 async def download_media(url: str, outdir: str, platform: str):
@@ -740,23 +810,40 @@ async def download_media(url: str, outdir: str, platform: str):
 
 
 def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
-    ydl_opts = {
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "restrictfilenames": True,
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ],
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-        filename = ydl.prepare_filename(info)
-        return os.path.splitext(filename)[0] + ".mp3"
+    last_exc = None
+    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
+        ydl_opts = {
+            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "restrictfilenames": True,
+            "ffmpeg_location": FFMPEG_PATH,
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "http_headers": {"User-Agent": DEFAULT_UA},
+            "geo_bypass": True,
+            "retries": 3,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            ],
+        }
+        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+            ydl_opts["cookiefile"] = COOKIES_FILE
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+                if "entries" in info:
+                    info = info["entries"][0]
+                filename = ydl.prepare_filename(info)
+                return os.path.splitext(filename)[0] + ".mp3"
+        except Exception as e:
+            last_exc = e
+            if not _is_bot_check_error(e):
+                raise
+            log.warning("song search attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
+            continue
+    raise last_exc
 
 
 async def search_and_download_song(query: str, outdir: str) -> str:
@@ -766,12 +853,13 @@ async def search_and_download_song(query: str, outdir: str) -> str:
 
 def extract_audio_for_recognition(video_path: str, outdir: str) -> str:
     audio_path = os.path.join(outdir, "sample.mp3")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    result = subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    if result.returncode != 0 or not os.path.exists(audio_path):
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode(errors='ignore')[-500:]}")
     return audio_path
 
 
