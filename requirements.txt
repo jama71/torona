@@ -2,3 +2,4 @@ aiogram==3.13.1
 yt-dlp>=2024.8.6
 shazamio>=0.7.0
 asyncpg>=0.29.0
+imageio-ffmpeg>=0.5.1
