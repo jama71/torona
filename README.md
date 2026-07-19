@@ -1,59 +1,104 @@
-# MediaSaver Telegram Bot
+# Media Downloader + Music Recognition Telegram Bot
 
-Instagram, YouTube, TikTok, Pinterest va Snapchat'dan media (video/rasm) yuklab beruvchi
-va videodagi musiqani Shazam orqali aniqlab, uni YouTube'dan MP3 shaklida topib beruvchi bot.
+Instagram, YouTube, TikTok, Pinterest va Snapchat'dan media yuklab beruvchi,
+videodagi musiqani Shazam orqali aniqlab, YouTube'dan topib MP3 shaklda
+yuboruvchi Telegram bot. PostgreSQL bazasi bilan ishlaydi, Railway'ga deploy
+qilishga tayyor.
 
-## Imkoniyatlari
+## Imkoniyatlar
 
-- `/start` bosilganda majburiy til tanlash (🇺🇿 O'zbek / 🇷🇺 Rus / 🇬🇧 Ingliz)
-- Instagram, YouTube, TikTok, Pinterest, Snapchat havolalaridan media yuklab berish
-- Yuklangan video ostida **"🎵 Musiqani aniqlash"** tugmasi
-- Shazam (shazamio) orqali musiqani aniqlash → YouTube'dan qidirib MP3 formatida yuborish
-- TikTok bloklangan hududlarda proxy ishlatish o'rniga foydalanuvchiga
-  "TikTok xizmatlari hozircha ishlamayapti" degan xabar chiqadi
-- Standart admin panel: `/admin` — statistika va barcha foydalanuvchilarga xabar yuborish (broadcast)
+- Birinchi `/start`da bot nomi (tokendan avtomatik aniqlanadi) + 3 tilda
+  (🇺🇿 O'zbek, 🇷🇺 Rus, 🇬🇧 Ingliz) tilni majburiy tanlash
+- Instagram, YouTube, TikTok, Pinterest, Snapchat havolalaridan media yuklab
+  berish (`yt-dlp` orqali)
+- Video ostidagi **"🎵 Musiqani aniqlash"** tugmasi orqali:
+  - `ffmpeg` bilan videodan audio ajratiladi
+  - `shazamio` orqali qo'shiq aniqlanadi
+  - Topilgan qo'shiq YouTube'dan qidirilib, MP3 formatda yuboriladi
+  - Fayllar foydalanuvchiga yuborilgach (yoki musiqa tugmasi ishlatilgach)
+    darhol diskdan o'chiriladi (bepul hostingga mos, cache saqlanmaydi)
+- TikTok serverda bloklangan bo'lsa (yuklab bo'lmasa), proxy ishlatishning
+  o'rniga foydalanuvchiga **"TikTok xizmatlari hozircha ishlamayapti"**
+  degan xabar yuboriladi
+- Oddiy foydalanuvchi uchun pastki tugmalar: **🌐 Til** va **❓ Yordam**
+- Admin uchun qo'shimcha **🛠 Admin panel** tugmasi, ichida:
+  - 📊 Statistika
+  - 📢 Xabar yuborish (broadcast)
+  - ➕ Majburiy obuna qo'shish
+  - 📋 Majburiy obunalar ro'yxati (❌ tugmasi bilan olib tashlash)
+- **Majburiy obuna (mandatory subscription):**
+  - Kanal/gurux **ochiq** bo'lsa — foydalanuvchiga oddiy public link (`t.me/username`) beriladi
+  - Kanal/gurux **yopiq** bo'lsa — bot o'sha kanalga/guruhga administrator
+    qilib qo'yilgach, bot o'zi maxsus **join-request** private taklif havolasi
+    yaratadi; foydalanuvchi shu link orqali qo'shilish so'rovini yuborgach,
+    botdan foydalanishga ruxsat beriladi (qo'shilish so'rovi yuborilgani
+    yetarli, admin tomonidan tasdiqlash shart emas)
+  - Foydalanuvchi hali obuna bo'lmagan bo'lsa, link yuborsa, botdan foydalanish
+    to'xtatilib, obuna bo'lish kerak bo'lgan kanallar ro'yxati va "✅ Tekshirish"
+    tugmasi ko'rsatiladi
 
-## O'rnatish
+## Fayllar
 
-1. Python 3.10+ va **ffmpeg** o'rnatilgan bo'lishi kerak:
-
-   ```bash
-   sudo apt update && sudo apt install ffmpeg -y
-   ```
-
-2. Kutubxonalarni o'rnating:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Muhit o'zgaruvchilarini sozlang (terminalda yoki `.env` fayl orqali):
-
-   ```bash
-   export BOT_TOKEN="123456:ABC-YourBotTokenHere"
-   export ADMIN_ID="123456789"   # sizning shaxsiy Telegram ID raqamingiz
-   ```
-
-   Botni @BotFather orqali yarating va tokenni oling.
-   O'z Telegram ID raqamingizni bilish uchun @userinfobot ga yozing.
-
-4. Botni ishga tushiring:
-
-   ```bash
-   python main.py
-   ```
-
-## Fayl tuzilishi
-
-- `main.py` — botning to'liq kodi (aiogram 3, yt-dlp, shazamio, aiosqlite)
+- `main.py` — botning to'liq kodi (bitta faylda)
 - `requirements.txt` — kerakli kutubxonalar
-- `bot.db` — SQLite baza (avtomatik yaratiladi, foydalanuvchilar va tillarni saqlaydi)
-- `downloads/` — vaqtincha yuklanган fayllar papkasi (avtomatik yaratiladi)
+- `Procfile` — Railway/Heroku uchun ishga tushirish buyrug'i
+- `nixpacks.toml` — Railway build vaqtida `ffmpeg`ni avtomatik o'rnatadi
+- `runtime.txt` — Python versiyasi
+- `.env.example` — qaysi environment variable'lar kerakligi namunasi
 
-## Eslatmalar
+## Railway'ga deploy qilish
 
-- Instagram va musiqa aniqlash — botning asosiy va eng barqaror ishlaydigan qismi.
-- TikTok ba'zi serverlarda bloklangan bo'lishi mumkin — bunday holatda proxy ishlatilmaydi,
-  aksincha foydalanuvchiga tushunarli xabar ko'rsatiladi.
-- Admin panelni faqat `ADMIN_ID` da ko'rsatilgan foydalanuvchi ochishi mumkin.
-- Katta fayllarni yuborishda Telegram Bot API cheklovlariga (odatiy botlar uchun ~50MB) e'tibor bering.
+1. Ushbu papkani (yoki repo'ni) Railway'ga ulang / push qiling.
+2. Railway loyihasiga **PostgreSQL** plaginini qo'shing (Railway avtomatik
+   `DATABASE_URL` degan environment variable yaratib beradi).
+3. Loyihaning **Variables** bo'limiga faqat quyidagilarni qo'shing:
+
+   | Variable       | Qiymat                                              |
+   |----------------|------------------------------------------------------|
+   | `BOT_TOKEN`    | BotFather bergan token                               |
+   | `DATABASE_URL` | Railway Postgres o'zi avtomatik beradi (link qo'yasiz) |
+   | `ADMIN_IDS`    | Admin(lar)ning Telegram user ID'lari, vergul bilan   |
+
+   Boshqa hech narsa kerak emas — bot nomi tokendan o'zi aniqlanadi.
+
+4. Railway `nixpacks.toml` fayli orqali `ffmpeg`ni avtomatik o'rnatadi va
+   `Procfile`dagi `python main.py` buyrug'i bilan botni ishga tushiradi.
+5. Deploy tugagach, bot avtomatik ishga tushadi (`start_polling`).
+
+## Mahalliy (lokal) ishga tushirish
+
+```bash
+# ffmpeg o'rnatilgan bo'lishi kerak
+sudo apt update && sudo apt install -y ffmpeg
+
+pip install -r requirements.txt
+
+export BOT_TOKEN="123456:ABC-your-telegram-bot-token"
+export DATABASE_URL="postgresql://user:password@host:port/dbname"
+export ADMIN_IDS="123456789,987654321"
+
+python main.py
+```
+
+## Majburiy obuna qanday qo'shiladi
+
+1. Admin panelda **➕ Majburiy obuna qo'shish** tugmasini bosing.
+2. Botni avval o'sha kanal/guruhga **administrator** qilib qo'ying.
+3. Keyin botga o'sha kanal/guruhdagi istalgan xabarni **forward** qiling,
+   yoki uning `@username`'ini, yoki chat ID sini yuboring.
+4. Bot avtomatik ravishda:
+   - kanal **ochiq** (username bor) bo'lsa — public link (`t.me/username`) saqlaydi;
+   - kanal **yopiq** (username yo'q) bo'lsa — o'zi join-request turidagi maxsus
+     taklif havola yaratadi va shuni saqlaydi.
+5. Ro'yxatni **📋 Majburiy obunalar** tugmasidan ko'rish va ❌ orqali
+   o'chirish mumkin.
+
+## Eslatma
+
+- Instagram va boshqa platformalarning ba'zi private/himoyalangan postlari
+  `yt-dlp` orqali yuklab bo'lmasligi mumkin — bu saytlarning cheklovlariga
+  bog'liq.
+- Musiqa aniqlash internetga (Shazam va YouTube qidiruviga) ulanishni talab
+  qiladi.
+- Bepul (free) hostingda disk tejash uchun har bir so'rovdan keyingi
+  vaqtinchalik fayllar avtomatik o'chiriladi.
