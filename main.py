@@ -38,14 +38,30 @@ except ImportError:
 # (Railway/Docker/etc.) without relying on apt packages being
 # installed by the build system. This fixes:
 #   "No such file or directory: 'ffmpeg'"
+#
+# IMPORTANT: imageio-ffmpeg's binary is NOT named "ffmpeg" (e.g.
+# "ffmpeg-linux64-v4.2.2"), but shazamio/pydub always shell out to the
+# literal command name "ffmpeg". Just adding its folder to PATH is not
+# enough - we create a symlink (or copy) literally called "ffmpeg" in a
+# directory we control and put THAT directory on PATH.
 # ------------------------------------------------------------
 try:
     import imageio_ffmpeg
 
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["PATH"] = os.path.dirname(FFMPEG_PATH) + os.pathsep + os.environ.get("PATH", "")
+    _real_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    _ffmpeg_dir = os.path.join(tempfile.gettempdir(), "ffmpeg_bin")
+    os.makedirs(_ffmpeg_dir, exist_ok=True)
+    FFMPEG_PATH = os.path.join(_ffmpeg_dir, "ffmpeg")
+    if not os.path.exists(FFMPEG_PATH):
+        try:
+            os.symlink(_real_ffmpeg, FFMPEG_PATH)
+        except Exception:
+            shutil.copy(_real_ffmpeg, FFMPEG_PATH)
+        os.chmod(FFMPEG_PATH, 0o755)
+    os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
     os.environ.setdefault("FFMPEG_BINARY", FFMPEG_PATH)
-except Exception:
+except Exception as e:
+    logging.getLogger("bot").warning("imageio-ffmpeg setup failed: %s", e)
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 try:
