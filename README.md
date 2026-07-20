@@ -128,6 +128,26 @@ bermaydi). Ular keyingi safar chatga yozganda yoki qayta tekshiruv
 ("✅ Tekshirish" tugmasi) orqali a'zo deb aniqlanadi, lekin hisoblagichga
 faqat haqiqiy qo'shilish/chiqish hodisasi bo'yicha qo'shiladi.
 
+## Yangi: matn orqali musiqa qidirish (video shart emas)
+
+Foydalanuvchi endi shunchaki qo'shiq yoki ijrochi nomini yozib yuborishi
+mumkin (masalan `tame impala`) — video havolasi yuborish shart emas. Bot:
+
+1. YouTube'dan shu nom bo'yicha qidiradi;
+2. Natijalarni 8 tadan sahifalab, har biri nomi + davomiyligi + ko'rishlar
+   soni bilan ko'rsatadi;
+3. Har bir natija uchun 1–8 raqamli tugmalar chiqadi — bosilgan qo'shiq
+   avtomatik YouTube'dan yuklab olinib, **MP3** shaklda yuboriladi;
+4. Pastda ◀️ (oldingi sahifa), ❌ (bekor qilish) va ▶️ (keyingi sahifa)
+   tugmalari bor.
+
+Eslatma: yuborilgan skrinshotdagi pastki qatordagi 4 ta tugma (🎨, `BR: *`,
+`? Lossless`, `Title`) boshqa (uchinchi tomon) musiqa botiga tegishli va
+ularning vazifasi screenshot orqali aniq emas edi — shuning uchun ular
+qo'shilmadi. Kerak bo'lsa, ularning aniq vazifasini tushuntirib bersangiz
+(masalan bitrate tanlash, lossless format tanlash va h.k.), xohlagan
+funksiyani alohida qo'shib beraman.
+
 ## Eslatma
 
 - Instagram va boshqa platformalarning ba'zi private/himoyalangan postlari
