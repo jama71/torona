@@ -112,6 +112,13 @@ PLATFORM_PATTERNS = {
 # token -> local video path, used only for the "detect music" button
 FILE_CACHE: dict[str, str] = {}
 
+# token -> {"query": str, "results": [...], "page": int}, used for the
+# text-based music search feature (search -> pick from list -> mp3)
+SEARCH_CACHE: dict[str, dict] = {}
+SEARCH_RESULTS_PER_PAGE = 8
+SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
+SEARCH_CACHE_TTL_SECONDS = 600
+
 # bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
 
@@ -149,12 +156,17 @@ TEXTS = {
         "broadcast_done": "✅ Xabar {count} ta foydalanuvchiga yuborildi.",
         "file_expired": "⏱ Vaqt tugadi, iltimos havolani qayta yuboring.",
         "lang_set": "✅ Til o'zbekcha etib o'rnatildi.",
+        "searching": "🔍 Qidirilmoqda...",
+        "search_no_results": "😔 Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.",
+        "search_results_range": "Natijalar {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Yordam</b>\n\n"
             "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
             "2) Bot mediani yuklab beradi.\n"
             "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
-            "MP3 shaklida yuboradi.\n\n"
+            "MP3 shaklida yuboradi.\n"
+            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot YouTube'dan "
+            "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
             "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
         ),
         "btn_lang": "🌐 Til",
@@ -211,11 +223,16 @@ TEXTS = {
         "broadcast_done": "✅ Сообщение отправлено {count} пользователям.",
         "file_expired": "⏱ Время истекло, отправьте ссылку заново.",
         "lang_set": "✅ Язык установлен: русский.",
+        "searching": "🔍 Ищем...",
+        "search_no_results": "😔 Ничего не найдено. Попробуйте другой запрос.",
+        "search_results_range": "Результаты {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Помощь</b>\n\n"
             "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
             "2) Бот скачает медиа.\n"
-            "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n\n"
+            "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
+            "4) Или просто напишите название песни/исполнителя — бот найдёт на YouTube "
+            "и пришлёт выбранный трек в MP3.\n\n"
             "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
         ),
         "btn_lang": "🌐 Язык",
@@ -273,11 +290,16 @@ TEXTS = {
         "broadcast_done": "✅ Message sent to {count} users.",
         "file_expired": "⏱ Session expired, please send the link again.",
         "lang_set": "✅ Language set to English.",
+        "searching": "🔍 Searching...",
+        "search_no_results": "😔 Nothing found. Try a different search term.",
+        "search_results_range": "Results {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Help</b>\n\n"
             "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
             "2) The bot downloads the media.\n"
-            "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n\n"
+            "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
+            "4) Or just type a song/artist name — the bot will search YouTube and send the "
+            "track you pick as MP3.\n\n"
             "To change language, use the \"🌐 Language\" button below."
         ),
         "btn_lang": "🌐 Language",
@@ -934,6 +956,157 @@ async def search_and_download_song(query: str, outdir: str) -> str:
     return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
 
 
+def format_duration(seconds) -> str:
+    if not seconds:
+        return "?"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_count(n) -> str:
+    if not n:
+        return "0"
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1000:.0f}k"
+    return str(n)
+
+
+def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
+    last_exc = None
+    for player_clients in PLAYER_CLIENT_FALLBACKS:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "ffmpeg_location": FFMPEG_PATH,
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "http_headers": {"User-Agent": DEFAULT_UA},
+            "geo_bypass": True,
+        }
+        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+            ydl_opts["cookiefile"] = COOKIES_FILE
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                entries = [e for e in (info.get("entries") or []) if e]
+                results = []
+                for e in entries:
+                    vid = e.get("id")
+                    results.append(
+                        {
+                            "id": vid,
+                            "title": e.get("title") or "Unknown",
+                            "uploader": e.get("uploader") or e.get("channel") or "",
+                            "duration": e.get("duration"),
+                            "view_count": e.get("view_count"),
+                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
+                        }
+                    )
+                return results
+        except Exception as e:
+            last_exc = e
+            if not _is_bot_check_error(e):
+                raise
+            continue
+    raise last_exc
+
+
+async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _run_ytdlp_text_search, query, limit)
+
+
+def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
+    last_exc = None
+    for player_clients in PLAYER_CLIENT_FALLBACKS:
+        ydl_opts = {
+            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "restrictfilenames": True,
+            "ffmpeg_location": FFMPEG_PATH,
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "http_headers": {"User-Agent": DEFAULT_UA},
+            "geo_bypass": True,
+            "retries": 3,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            ],
+        }
+        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+            ydl_opts["cookiefile"] = COOKIES_FILE
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                return os.path.splitext(filename)[0] + ".mp3"
+        except Exception as e:
+            last_exc = e
+            if not _is_bot_check_error(e):
+                raise
+            continue
+    raise last_exc
+
+
+async def download_song_by_url(url: str, outdir: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
+
+
+def render_search_page(lang: str, token: str):
+    data = SEARCH_CACHE[token]
+    results = data["results"]
+    page = data["page"]
+    start = page * SEARCH_RESULTS_PER_PAGE
+    end = min(start + SEARCH_RESULTS_PER_PAGE, len(results))
+    page_items = results[start:end]
+
+    lines = [
+        f"🔍 {data['query']}",
+        t(lang, "search_results_range", start=start + 1, end=end, total=len(results)),
+        "",
+    ]
+    for i, item in enumerate(page_items, start=1):
+        dur = format_duration(item.get("duration"))
+        views = format_count(item.get("view_count"))
+        lines.append(f"{i}. {item['title']} — {dur} · 👁 {views}")
+    text = "\n".join(lines)
+
+    number_rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in range(1, len(page_items) + 1):
+        row.append(InlineKeyboardButton(text=str(i), callback_data=f"srch:{token}:{i}"))
+        if len(row) == 4:
+            number_rows.append(row)
+            row = []
+    if row:
+        number_rows.append(row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"srch:{token}:prev"))
+    nav_row.append(InlineKeyboardButton(text="❌", callback_data=f"srch:{token}:cancel"))
+    if end < len(results):
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"srch:{token}:next"))
+
+    return text, InlineKeyboardMarkup(inline_keyboard=number_rows + [nav_row])
+
+
+async def _expire_search_cache(token: str, delay: int):
+    await asyncio.sleep(delay)
+    SEARCH_CACHE.pop(token, None)
+
+
 def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
     audio_path = os.path.join(outdir, "sample.mp3")
     result = subprocess.run(
@@ -1028,9 +1201,109 @@ async def _expire_cache(token: str, outdir: str, delay: int):
 
 
 @router.message(F.text & ~F.text.regexp(URL_RE.pattern) & ~F.text.startswith("/"))
-async def handle_non_link_text(message: Message):
+async def handle_text_search(message: Message):
     lang = await get_user_lang(message.from_user.id)
-    await message.answer(t(lang, "no_link"))
+
+    missing = await get_unsubscribed_channels(message.from_user.id)
+    if missing:
+        await message.answer(t(lang, "subscribe_required"), reply_markup=subscribe_kb(lang, missing))
+        return
+
+    query = message.text.strip()
+    if not query:
+        return
+
+    status = await message.answer(t(lang, "searching"))
+    try:
+        results = await text_search_youtube(query)
+    except Exception as e:
+        log.warning("text search failed: %s", e)
+        await status.edit_text(t(lang, "error"))
+        return
+
+    if not results:
+        await status.edit_text(t(lang, "search_no_results"))
+        return
+
+    token = uuid.uuid4().hex[:12]
+    SEARCH_CACHE[token] = {"query": query, "results": results, "page": 0}
+    asyncio.create_task(_expire_search_cache(token, delay=SEARCH_CACHE_TTL_SECONDS))
+
+    text, kb = render_search_page(lang, token)
+    await status.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("srch:"))
+async def cb_search_action(call: CallbackQuery):
+    lang = await get_user_lang(call.from_user.id)
+    _, token, action = call.data.split(":", 2)
+    data = SEARCH_CACHE.get(token)
+    if not data:
+        await call.answer(t(lang, "file_expired"), show_alert=True)
+        return
+
+    if action == "cancel":
+        SEARCH_CACHE.pop(token, None)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    if action == "prev":
+        if data["page"] > 0:
+            data["page"] -= 1
+        text, kb = render_search_page(lang, token)
+        await call.message.edit_text(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    if action == "next":
+        max_page = (len(data["results"]) - 1) // SEARCH_RESULTS_PER_PAGE
+        if data["page"] < max_page:
+            data["page"] += 1
+        text, kb = render_search_page(lang, token)
+        await call.message.edit_text(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    # otherwise `action` is the 1..8 button - the user picked a song
+    if not action.isdigit():
+        await call.answer()
+        return
+    start = data["page"] * SEARCH_RESULTS_PER_PAGE
+    real_idx = start + int(action) - 1
+    if real_idx >= len(data["results"]):
+        await call.answer()
+        return
+    entry = data["results"][real_idx]
+
+    await call.answer()
+    status = await call.message.answer(t(lang, "downloading"))
+    work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
+    try:
+        mp3_path = await download_song_by_url(entry["url"], work_dir)
+        title = entry.get("title") or "Unknown"
+        performer = entry.get("uploader") or ""
+        await call.message.answer_audio(
+            FSInputFile(mp3_path),
+            title=title,
+            performer=performer,
+            caption=t(lang, "song_caption", title=title, artist=performer),
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("song download (text search) failed: %s", e)
+        try:
+            await status.edit_text(t(lang, "error"))
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ============================================================
