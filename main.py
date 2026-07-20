@@ -19,6 +19,7 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     ChatJoinRequest,
+    ChatMemberUpdated,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
@@ -181,6 +182,7 @@ TEXTS = {
         "still_not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz.",
         "now_subscribed": "✅ Rahmat! Endi botdan foydalanishingiz mumkin, havolani yuboring.",
         "channel_type_public": "ochiq kanal/gurux",
+        "channel_subs_label": "{count} a'zo",
         "channel_type_private": "yopiq kanal/gurux",
     },
     "ru": {
@@ -241,6 +243,7 @@ TEXTS = {
         "still_not_subscribed": "❌ Вы ещё не подписаны на все каналы.",
         "now_subscribed": "✅ Спасибо! Теперь вы можете пользоваться ботом, отправьте ссылку.",
         "channel_type_public": "открытый канал/группа",
+        "channel_subs_label": "{count} подписчиков",
         "channel_type_private": "закрытый канал/группа",
     },
     "en": {
@@ -301,6 +304,7 @@ TEXTS = {
         "still_not_subscribed": "❌ You haven't subscribed to all channels yet.",
         "now_subscribed": "✅ Thanks! You can use the bot now, send a link.",
         "channel_type_public": "public channel/group",
+        "channel_subs_label": "{count} subs",
         "channel_type_private": "private channel/group",
     },
 }
@@ -340,6 +344,14 @@ async def init_db():
             """CREATE TABLE IF NOT EXISTS join_requests (
                 chat_id BIGINT,
                 user_id BIGINT,
+                PRIMARY KEY (chat_id, user_id)
+            )"""
+        )
+        await conn.execute(
+            """CREATE TABLE IF NOT EXISTS channel_subscribers (
+                chat_id BIGINT,
+                user_id BIGINT,
+                joined_at TIMESTAMP DEFAULT now(),
                 PRIMARY KEY (chat_id, user_id)
             )"""
         )
@@ -419,6 +431,33 @@ async def has_join_request(chat_id: int, user_id: int) -> bool:
             "SELECT 1 FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
         )
         return row is not None
+
+
+async def get_channel_by_chat_id(chat_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM mandatory_channels WHERE chat_id=$1", chat_id)
+
+
+async def mark_channel_subscriber(chat_id: int, user_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO channel_subscribers (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            chat_id, user_id,
+        )
+
+
+async def unmark_channel_subscriber(chat_id: int, user_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM channel_subscribers WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
+        )
+
+
+async def count_channel_subscribers(chat_id: int) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM channel_subscribers WHERE chat_id=$1", chat_id
+        )
 
 
 # ============================================================
@@ -659,6 +698,21 @@ async def do_add_channel(message: Message, state: FSMContext):
     )
 
 
+async def _build_channel_rows(lang: str, channels) -> list:
+    rows = []
+    for c in channels:
+        kind = t(lang, "channel_type_private") if c["is_private"] else t(lang, "channel_type_public")
+        count = await count_channel_subscribers(c["chat_id"])
+        subs_label = t(lang, "channel_subs_label", count=count)
+        rows.append(
+            [InlineKeyboardButton(
+                text=f"❌ {c['title']} ({kind}, {subs_label})",
+                callback_data=f"delchan:{c['id']}",
+            )]
+        )
+    return rows
+
+
 @router.message(F.text.in_({v["btn_list_channels"] for v in TEXTS.values()}))
 async def btn_list_channels(message: Message):
     lang = await get_user_lang(message.from_user.id)
@@ -668,12 +722,7 @@ async def btn_list_channels(message: Message):
     if not channels:
         await message.answer(t(lang, "channel_list_empty"))
         return
-    rows = []
-    for c in channels:
-        kind = t(lang, "channel_type_private") if c["is_private"] else t(lang, "channel_type_public")
-        rows.append(
-            [InlineKeyboardButton(text=f"❌ {c['title']} ({kind})", callback_data=f"delchan:{c['id']}")]
-        )
+    rows = await _build_channel_rows(lang, channels)
     await message.answer(t(lang, "channel_list_title"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -689,14 +738,10 @@ async def cb_delete_channel(call: CallbackQuery):
     if not channels:
         await call.message.edit_text(t(lang, "channel_list_empty"))
     else:
-        rows = []
-        for c in channels:
-            kind = t(lang, "channel_type_private") if c["is_private"] else t(lang, "channel_type_public")
-            rows.append(
-                [InlineKeyboardButton(text=f"❌ {c['title']} ({kind})", callback_data=f"delchan:{c['id']}")]
-            )
+        rows = await _build_channel_rows(lang, channels)
         await call.message.edit_text(t(lang, "channel_list_title"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer(t(lang, "channel_removed"))
+
 
 
 # ============================================================
@@ -705,6 +750,28 @@ async def cb_delete_channel(call: CallbackQuery):
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
+
+
+# ============================================================
+# HANDLER: track join/leave events for mandatory channels
+# (requires the bot to be an admin there - Telegram then sends
+# chat_member updates for every member change in that chat)
+# ============================================================
+@router.chat_member()
+async def on_chat_member_update(update: ChatMemberUpdated):
+    channel = await get_channel_by_chat_id(update.chat.id)
+    if not channel:
+        return
+
+    joined_statuses = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+    is_member_now = update.new_chat_member.status in joined_statuses
+    was_member_before = update.old_chat_member.status in joined_statuses
+    user_id = update.new_chat_member.user.id
+
+    if is_member_now and not was_member_before:
+        await mark_channel_subscriber(update.chat.id, user_id)
+    elif not is_member_now and was_member_before:
+        await unmark_channel_subscriber(update.chat.id, user_id)
 
 
 # ============================================================
@@ -867,15 +934,20 @@ async def search_and_download_song(query: str, outdir: str) -> str:
     return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
 
 
-def extract_audio_for_recognition(video_path: str, outdir: str) -> str:
+def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
     audio_path = os.path.join(outdir, "sample.mp3")
     result = subprocess.run(
         [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode(errors='ignore')[-500:]}")
+        # No audio track in the source (e.g. a silent GIF/video) - this is a
+        # normal case, not a real error: just tell the user music wasn't found.
+        if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
+            return None
+        raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
     return audio_path
 
 
@@ -979,6 +1051,9 @@ async def cb_recognize_music(call: CallbackQuery):
     video_outdir = os.path.dirname(video_path)
     try:
         audio_sample = extract_audio_for_recognition(video_path, work_dir)
+        if not audio_sample:
+            await status.edit_text(t(lang, "not_recognized"))
+            return
         song = await recognize_song(audio_sample)
         if not song:
             await status.edit_text(t(lang, "not_recognized"))
@@ -993,6 +1068,11 @@ async def cb_recognize_music(call: CallbackQuery):
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
         )
+        # the mp3 itself is the result now - clear the "recognizing.../found..." status line
+        try:
+            await status.delete()
+        except Exception:
+            pass
     except Exception as e:
         log.warning("music recognition failed: %s", e)
         try:
