@@ -148,6 +148,48 @@ qo'shilmadi. Kerak bo'lsa, ularning aniq vazifasini tushuntirib bersangiz
 (masalan bitrate tanlash, lossless format tanlash va h.k.), xohlagan
 funksiyani alohida qo'shib beraman.
 
+## YouTube "Sign in to confirm you're not a bot" davom etsa (2026-07-20)
+
+Loglardan ko'rinishicha, bu xato **barcha** `player_client` variantlarida
+(`android`, `ios`, `tv_embedded+web`, `mweb`) bir xilda chiqyapti. Bu shuni
+bildiradiki, muammo client turida emas — **Railway serverining IP manzili
+YouTube tomonidan butunlay bloklangan/shubhali deb belgilangan**. Bunday
+holatda client turini almashtirish yordam bermaydi — yagona ishonchli yechim
+**haqiqiy brauzer cookies**idan foydalanish.
+
+### Cookies qanday qo'shiladi (Railway'da eng oson yo'l)
+
+1. Kompyuteringizda YouTube'ga (oddiy, botsiz) hisobingiz bilan kiring.
+2. Brauzeringizga cookies eksport qiluvchi kengaytma o'rnating, masalan
+   **"Get cookies.txt LOCALLY"** (Chrome/Firefox uchun mavjud).
+3. youtube.com sahifasida turib, kengaytma orqali cookies.txt faylini
+   yuklab oling (Netscape formatida bo'ladi).
+4. Ushbu faylning **butun matnini** nusxalab, Railway'ning **Variables**
+   bo'limida yangi environment variable yarating:
+   - Nomi: `YOUTUBE_COOKIES`
+   - Qiymati: cookies.txt faylining to'liq matni (bir nechta qatordan iborat
+     bo'ladi — Railway buni to'liq qabul qiladi)
+
+   Agar Railway ko'p qatorli qiymatni qabul qilmasa, buning o'rniga faylni
+   base64'ga o'girib, `YOUTUBE_COOKIES_B64` nomli variable sifatida
+   qo'yishingiz mumkin:
+   ```bash
+   base64 -w0 cookies.txt
+   ```
+   Natijani `YOUTUBE_COOKIES_B64` qiymatiga qo'ying.
+
+5. Deploy qilgach, bot avtomatik shu cookie'lardan foydalanadi — hech qanday
+   qo'shimcha sozlash kerak emas.
+
+**Muhim:** cookies vaqti-vaqti bilan eskiradi (odatda bir necha oyda) —
+agar xato qayta paydo bo'lsa, cookies.txt faylini yangidan eksport qilib,
+environment variable'ni yangilang.
+
+Cookies qo'yilmagan holatda ham bot ishlayveradi (chunki `player_client`
+fallback hali ham ba'zi hostlarda yordam beradi), lekin agar serveringiz
+IP manzili YouTube tomonidan bloklangan bo'lsa, faqat cookies muammoni
+butunlay hal qiladi.
+
 ## Eslatma
 
 - Instagram va boshqa platformalarning ba'zi private/himoyalangan postlari
