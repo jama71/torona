@@ -93,6 +93,41 @@ python main.py
 5. Ro'yxatni **📋 Majburiy obunalar** tugmasidan ko'rish va ❌ orqali
    o'chirish mumkin.
 
+## Loglardagi xatolarga tuzatish (2026-07-19)
+
+- **`No such file or directory: 'ffmpeg'`** — `ffmpeg` endi tizimga
+  o'rnatilishiga bog'liq emas: `imageio-ffmpeg` kutubxonasi orqali o'z-o'zidan
+  ishlaydigan ffmpeg binary avtomatik yuklab olinadi va shu ishlatiladi. Hech
+  qanday qo'shimcha sozlash kerak emas.
+- **`Sign in to confirm you're not a bot` (YouTube)** — bot endi bir nechta
+  `player_client` (`android`, `ios`, `tv_embedded`, `mweb`) bilan ketma-ket
+  urinib ko'radi, shu xato chiqqanda avtomatik boshqasiga o'tadi. Agar baribir
+  muammo davom etsa, ixtiyoriy ravishda `COOKIES_FILE` environment variable
+  orqali (Netscape formatidagi) YouTube cookies fayl yo'lini ko'rsatishingiz
+  mumkin — bu eng ishonchli yechim.
+- **Audiosiz media (masalan GIF)** — endi xato sifatida ko'rsatilmaydi, buning
+  o'rniga "musiqa aniqlanmadi" degan oddiy xabar chiqadi.
+- **"Musiqa qidirilyapti / yuklanmoqda" oraliq xabarlari** — musiqa muvaffaqiyatli
+  topilib yuborilgach, bu oraliq statusi avtomatik o'chiriladi — chatda faqat
+  yakuniy MP3 qoladi.
+
+## Majburiy obuna: a'zolar sonini hisoblash
+
+Bot har bir majburiy kanal/guruhda **administrator** bo'lgach, Telegram unga
+o'sha chat bo'yicha barcha a'zolik o'zgarishlari (`chat_member` update)
+haqida xabar bera boshlaydi. Bot buni kuzatib, har bir kanal uchun **botimiz
+orqali qo'shilgan a'zolar sonini** DB'da saqlaydi va **📋 Majburiy obunalar**
+ro'yxatida har bir kanal nomi yonida ko'rsatadi, masalan:
+
+> ❌ Mening kanalim (yopiq kanal/gurux, 128 a'zo)
+
+**Eslatma:** bu hisoblagich faqat kanal **botga admin qilib qo'shilgandan
+keyin** sodir bo'lgan qo'shilish/chiqishlarni sanaydi — kanalga avvaldan a'zo
+bo'lganlar avtomatik hisoblanmaydi (Telegram bunday tarixiy ma'lumotni
+bermaydi). Ular keyingi safar chatga yozganda yoki qayta tekshiruv
+("✅ Tekshirish" tugmasi) orqali a'zo deb aniqlanadi, lekin hisoblagichga
+faqat haqiqiy qo'shilish/chiqish hodisasi bo'yicha qo'shiladi.
+
 ## Eslatma
 
 - Instagram va boshqa platformalarning ba'zi private/himoyalangan postlari
