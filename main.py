@@ -86,6 +86,31 @@ ADMIN_IDS = {
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 
 
+def _repair_cookie_line(line: str) -> str:
+    """Netscape cookie lines are tab-separated (7 fields). Some copy-paste
+    paths (chat UIs, some env-var editors) can collapse tabs into spaces -
+    if that happened but the 7 fields are still intact, rejoin them with
+    real tabs so yt-dlp's cookiejar parser accepts the line."""
+    if line.startswith("#") or not line.strip():
+        return line
+    if line.count("\t") == 6:
+        return line
+    parts = line.split()
+    if len(parts) == 7:
+        return "\t".join(parts)
+    return line
+
+
+def _normalize_cookies_content(content: str) -> str:
+    return "\n".join(_repair_cookie_line(l) for l in content.splitlines()) + "\n"
+
+
+def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
+    data_lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
+    valid = [l for l in data_lines if l.count("\t") == 6]
+    return len(valid), len(data_lines)
+
+
 def _setup_youtube_cookies() -> str | None:
     """
     YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
@@ -97,27 +122,64 @@ def _setup_youtube_cookies() -> str | None:
       - YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content
       - YOUTUBE_COOKIES      -> raw cookies.txt content (Netscape format)
       - COOKIES_FILE         -> path to an already-mounted cookies.txt file
+
+    This is deliberately defensive: copy-pasting a long value into an env
+    var UI can drop characters or turn tabs into spaces. We repair what we
+    reasonably can and always log a clear, actionable line about what was
+    (or wasn't) loaded instead of failing silently.
     """
+    logger = logging.getLogger("bot")
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
     path = os.getenv("COOKIES_FILE", "").strip()
 
     content = None
+    source = None
     if b64:
+        # drop any whitespace/newlines a UI may have injected, then fix padding
+        cleaned = "".join(b64.split())
+        padding = len(cleaned) % 4
+        if padding:
+            cleaned += "=" * (4 - padding)
         try:
-            content = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            content = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
+            source = "YOUTUBE_COOKIES_B64"
         except Exception as e:
-            logging.getLogger("bot").warning("failed to decode YOUTUBE_COOKIES_B64: %s", e)
+            logger.warning(
+                "YOUTUBE_COOKIES_B64 could not be decoded (%s). It was most likely cut off "
+                "while copy-pasting - re-copy the FULL base64 string (no line breaks) and "
+                "redeploy. Falling back to YOUTUBE_COOKIES / player_client fallback for now.",
+                e,
+            )
     elif raw:
         content = raw
+        source = "YOUTUBE_COOKIES"
 
     if content:
-        cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        with open(cookies_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return cookies_path
+        content = _normalize_cookies_content(content)
+        valid, total = _count_valid_cookie_lines(content)
+        if total == 0 or valid == 0:
+            logger.warning(
+                "%s does not look like a valid cookies.txt (found %d/%d usable cookie "
+                "lines) - ignoring it. YouTube downloads will rely on the player_client "
+                "fallback only, which may hit the bot-check again.",
+                source, valid, total,
+            )
+        else:
+            if valid < total:
+                logger.warning(
+                    "%s: only %d/%d cookie lines look valid - the value may be truncated. "
+                    "Using it anyway; re-copy the full cookies.txt if YouTube errors persist.",
+                    source, valid, total,
+                )
+            cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
+            return cookies_path
 
     if path and os.path.exists(path):
+        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path)
         return path
 
     return None
