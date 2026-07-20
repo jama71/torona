@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -83,9 +84,48 @@ ADMIN_IDS = {
 }
 # Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
-# Optional: path to a cookies.txt (Netscape format) to help yt-dlp bypass
-# YouTube's "Sign in to confirm you're not a bot" checks on some hosts.
-COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or None
+
+
+def _setup_youtube_cookies() -> str | None:
+    """
+    YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
+    "Sign in to confirm you're not a bot" REGARDLESS of which player_client
+    yt-dlp uses. The only reliable fix is real browser cookies.
+
+    Easiest for Railway: paste the cookies.txt CONTENT directly into an env
+    variable (no file/volume needed) via one of:
+      - YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content
+      - YOUTUBE_COOKIES      -> raw cookies.txt content (Netscape format)
+      - COOKIES_FILE         -> path to an already-mounted cookies.txt file
+    """
+    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    path = os.getenv("COOKIES_FILE", "").strip()
+
+    content = None
+    if b64:
+        try:
+            content = base64.b64decode(b64).decode("utf-8", errors="ignore")
+        except Exception as e:
+            logging.getLogger("bot").warning("failed to decode YOUTUBE_COOKIES_B64: %s", e)
+    elif raw:
+        content = raw
+
+    if content:
+        cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        with open(cookies_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return cookies_path
+
+    if path and os.path.exists(path):
+        return path
+
+    return None
+
+
+# Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
+# "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
+COOKIES_FILE = _setup_youtube_cookies()
 
 # A realistic desktop User-Agent + an Android/iOS "player_client" combo is
 # currently the most reliable way to dodge YouTube's bot-check without cookies.
@@ -868,6 +908,22 @@ def _is_bot_check_error(exc: Exception) -> bool:
     return "sign in to confirm" in msg or "not a bot" in msg
 
 
+_cookie_hint_logged = False
+
+
+def _raise_ytdlp_failure(last_exc: Exception):
+    global _cookie_hint_logged
+    if last_exc is not None and _is_bot_check_error(last_exc) and not COOKIES_FILE and not _cookie_hint_logged:
+        _cookie_hint_logged = True
+        log.error(
+            "YouTube blocked every player_client fallback with a bot-check error. "
+            "This host's IP is very likely flagged - set YOUTUBE_COOKIES (or "
+            "YOUTUBE_COOKIES_B64) in the environment with a real browser's "
+            "cookies.txt content to fix this reliably. See README."
+        )
+    raise last_exc
+
+
 def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
@@ -905,7 +961,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 raise
             log.warning("yt-dlp attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
             continue
-    raise last_exc
+    _raise_ytdlp_failure(last_exc)
 
 
 async def download_media(url: str, outdir: str, platform: str):
@@ -948,7 +1004,7 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
                 raise
             log.warning("song search attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
             continue
-    raise last_exc
+    _raise_ytdlp_failure(last_exc)
 
 
 async def search_and_download_song(query: str, outdir: str) -> str:
@@ -1016,7 +1072,7 @@ def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
             if not _is_bot_check_error(e):
                 raise
             continue
-    raise last_exc
+    _raise_ytdlp_failure(last_exc)
 
 
 async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
@@ -1055,7 +1111,7 @@ def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
             if not _is_bot_check_error(e):
                 raise
             continue
-    raise last_exc
+    _raise_ytdlp_failure(last_exc)
 
 
 async def download_song_by_url(url: str, outdir: str) -> str:
