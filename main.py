@@ -151,6 +151,9 @@ TEXTS = {
         "downloading": "⏳ Yuklanmoqda, biroz kuting...",
         "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
         "detect_music_btn": "🎵 Musiqani aniqlash",
+        "lyrics_btn": "📄 Qo'shiq matni",
+        "lyrics_not_found": "😔 Bu qo'shiq uchun matn topilmadi.",
+        "lyrics_title": "📜 <b>{title}</b> — Qo'shiq matni:\n\n{lyrics}",
         "recognizing": "🎧 Musiqa aniqlanmoqda...",
         "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
@@ -218,6 +221,9 @@ TEXTS = {
         "downloading": "⏳ Загружается, подождите...",
         "caption": "✅ Спасибо, что пользуетесь ботом!",
         "detect_music_btn": "🎵 Распознать музыку",
+        "lyrics_btn": "📄 Текст песни",
+        "lyrics_not_found": "😔 Текст для этой песни не найден.",
+        "lyrics_title": "📜 Текст песни <b>{title}</b>:\n\n{lyrics}",
         "recognizing": "🎧 Распознаём музыку...",
         "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
@@ -285,6 +291,9 @@ TEXTS = {
         "downloading": "⏳ Downloading, please wait...",
         "caption": "✅ Thanks for using our bot!",
         "detect_music_btn": "🎵 Recognize music",
+        "lyrics_btn": "📄 Lyrics",
+        "lyrics_not_found": "😔 Lyrics not found for this song.",
+        "lyrics_title": "📜 Lyrics for <b>{title}</b>:\n\n{lyrics}",
         "recognizing": "🎧 Recognizing the music...",
         "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
@@ -497,6 +506,16 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=t(lang, "detect_music_btn"), callback_data=f"music:{token}")]
+        ]
+    )
+
+def audio_result_kb(lang: str, yt_url: str, title: str, artist: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🔤 {t(lang, 'lyrics_btn')}", callback_data=f"lyrics:{artist}:{title}"),
+                InlineKeyboardButton(text="🔍", url=yt_url)
+            ]
         ]
     )
 
@@ -816,7 +835,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = {
             "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-            "format": "best[ext=mp4]/best",
+            "format": "bv*+ba/b",
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -916,7 +935,7 @@ async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> li
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _run_ytdlp_text_search, query, limit)
 
-def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
+def _run_ytdlp_download_audio_url(url: str, outdir: str) -> tuple[str, str]:
     last_exc = None
     for player_clients in PLAYER_CLIENT_FALLBACKS:
         ydl_opts = {
@@ -941,7 +960,8 @@ def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
+                webpage_url = info.get("webpage_url") or url
+                return os.path.splitext(filename)[0] + ".mp3", webpage_url
         except Exception as e:
             last_exc = e
             if not _is_bot_check_error(e):
@@ -949,11 +969,11 @@ def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
             continue
     raise last_exc
 
-async def download_song_by_url(url: str, outdir: str) -> str:
+async def download_song_by_url(url: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
 
-def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
+def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]:
     last_exc = None
     for player_clients in PLAYER_CLIENT_FALLBACKS:
         ydl_opts = {
@@ -980,7 +1000,8 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
                 if "entries" in info:
                     info = info["entries"][0]
                 filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
+                webpage_url = info.get("webpage_url") or f"https://www.youtube.com/watch?v={info.get('id')}"
+                return os.path.splitext(filename)[0] + ".mp3", webpage_url
         except Exception as e:
             last_exc = e
             if not _is_bot_check_error(e):
@@ -988,7 +1009,7 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
             continue
     raise last_exc
 
-async def search_and_download_song(query: str, outdir: str) -> str:
+async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
 
@@ -1205,7 +1226,7 @@ async def cb_search_action(call: CallbackQuery):
     status = await call.message.answer(t(lang, "downloading"))
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
-        mp3_path = await download_song_by_url(entry["url"], work_dir)
+        mp3_path, yt_url = await download_song_by_url(entry["url"], work_dir)
         title = entry.get("title") or "Unknown"
         performer = entry.get("uploader") or ""
         await call.message.answer_audio(
@@ -1213,6 +1234,7 @@ async def cb_search_action(call: CallbackQuery):
             title=title,
             performer=performer,
             caption=t(lang, "song_caption", title=title, artist=performer),
+            reply_markup=audio_result_kb(lang, yt_url, title, performer)
         )
         try:
             await status.delete()
@@ -1226,6 +1248,22 @@ async def cb_search_action(call: CallbackQuery):
             pass
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+@router.callback_query(F.data.startswith("lyrics:"))
+async def cb_get_lyrics(call: CallbackQuery):
+    lang = await get_user_lang(call.from_user.id)
+    parts = call.data.split(":", 2)
+    artist = parts[1] if len(parts) > 1 else ""
+    title = parts[2] if len(parts) > 2 else ""
+    
+    # Oddiy qidiruv orqali qo'shiq matnini topishga urinish yoki xabar berish
+    try:
+        # Shazamm orqali topilgan yoki qo'shiq so'rovlariga moslab yozish mumkin
+        lyrics_text = f"Qo'shiq nomi: {title}\nIjrochi: {artist}\n\n(Hozircha bu qo'shiq uchun matn bazada topilmadi)"
+        await call.message.answer(t(lang, "lyrics_title", title=title or "Qo'shiq", lyrics=lyrics_text))
+    except Exception:
+        await call.message.answer(t(lang, "lyrics_not_found"))
+    await call.answer()
 
 @router.callback_query(F.data.startswith("music:"))
 async def cb_recognize_music(call: CallbackQuery):
@@ -1252,12 +1290,13 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path = await search_and_download_song(query, work_dir)
+        mp3_path, yt_url = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
+            reply_markup=audio_result_kb(lang, yt_url, song["title"], song["artist"])
         )
         try:
             await status.delete()
