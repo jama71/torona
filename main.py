@@ -42,16 +42,7 @@ except ImportError:
     Shazam = None
 
 # ------------------------------------------------------------
-# ffmpeg: bundled via imageio-ffmpeg so it works on ANY host
-# (Railway/Docker/etc.) without relying on apt packages being
-# installed by the build system. This fixes:
-#   "No such file or directory: 'ffmpeg'"
-#
-# IMPORTANT: imageio-ffmpeg's binary is NOT named "ffmpeg" (e.g.
-# "ffmpeg-linux64-v4.2.2"), but shazamio/pydub always shell out to the
-# literal command name "ffmpeg". Just adding its folder to PATH is not
-# enough - we create a symlink (or copy) literally called "ffmpeg" in a
-# directory we control and put THAT directory on PATH.
+# ffmpeg setup
 # ------------------------------------------------------------
 try:
     import imageio_ffmpeg
@@ -73,7 +64,6 @@ except Exception as e:
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 try:
-    # some libraries (pydub, etc.) look at this instead of PATH
     from pydub import AudioSegment
 
     AudioSegment.converter = FFMPEG_PATH
@@ -81,22 +71,17 @@ except Exception:
     pass
 
 # ============================================================
-# CONFIG  (only these need to be set in Railway env variables)
+# CONFIG
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
-# Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 
 
 def _repair_cookie_line(line: str) -> str:
-    """Netscape cookie lines are tab-separated (7 fields). Some copy-paste
-    paths (chat UIs, some env-var editors) can collapse tabs into spaces -
-    if that happened but the 7 fields are still intact, rejoin them with
-    real tabs so yt-dlp's cookiejar parser accepts the line."""
     if line.startswith("#") or not line.strip():
         return line
     if line.count("\t") == 6:
@@ -117,12 +102,6 @@ def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
     return len(valid), len(data_lines)
 
 
-# Fallback YouTube cookies baked directly into the code, so the bot works
-# out of the box without requiring any env var setup. If YOUTUBE_COOKIES /
-# YOUTUBE_COOKIES_B64 / COOKIES_FILE are set in the environment, those take
-# priority over this default. When these cookies eventually expire, either
-# set one of those env vars with a fresh export, or just replace the string
-# below with a newly exported cookies.txt content.
 DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
 # https://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file! Do not edit.
@@ -162,38 +141,12 @@ def _try_load_cookie_candidate(source: str, content: str, logger) -> str | None:
     content = _normalize_cookies_content(content)
     valid, total = _count_valid_cookie_lines(content)
     if total == 0 or valid == 0:
-        logger.warning(
-            "%s does not look like a valid cookies.txt (found %d/%d usable cookie lines) - "
-            "skipping it and trying the next available source.",
-            source, valid, total,
-        )
         return None
-    if valid < total:
-        logger.warning(
-            "%s: only %d/%d cookie lines look valid - the value may be truncated, using it anyway.",
-            source, valid, total,
-        )
     path = _write_cookies_file(content)
-    logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
     return path
 
 
 def _setup_youtube_cookies() -> str | None:
-    """
-    YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
-    "Sign in to confirm you're not a bot" REGARDLESS of which player_client
-    yt-dlp uses. The only reliable fix is real browser cookies.
-
-    Tries each source in order and FALLS THROUGH to the next one if a
-    source is set but turns out invalid/empty/truncated - a broken or
-    stale env var (e.g. left over from earlier troubleshooting) must never
-    block the built-in default from being used:
-      1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
-      2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
-      3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
-      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if nothing
-         else worked, so the bot works without any extra setup.
-    """
     logger = logging.getLogger("bot")
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
@@ -209,11 +162,8 @@ def _setup_youtube_cookies() -> str | None:
             result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
             if result:
                 return result
-        except Exception as e:
-            logger.warning(
-                "YOUTUBE_COOKIES_B64 could not be decoded (%s) - trying the next available source.",
-                e,
-            )
+        except Exception:
+            pass
 
     if raw:
         result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
@@ -221,70 +171,20 @@ def _setup_youtube_cookies() -> str | None:
             return result
 
     if path_env and os.path.exists(path_env):
-        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
         return path_env
 
-    result = _try_load_cookie_candidate(
-        "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)",
-        DEFAULT_YOUTUBE_COOKIES,
-        logger,
-    )
-    if result:
-        return result
-
-    logger.warning("No usable YouTube cookies found anywhere - relying on player_client fallback only.")
-    return None
+    return _try_load_cookie_candidate("default", DEFAULT_YOUTUBE_COOKIES, logger)
 
 
-def _check_cookies_expiry(cookies_path: str | None) -> None:
-    """Warn if any session cookies appear to be expired (expiry < now)."""
-    if not cookies_path or not os.path.exists(cookies_path):
-        return
-    logger = logging.getLogger("bot")
-    now = int(__import__("time").time())
-    expired_count = 0
-    try:
-        with open(cookies_path, encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("#") or not line.strip():
-                    continue
-                parts = line.strip().split("\t")
-                if len(parts) < 7:
-                    continue
-                try:
-                    exp = int(parts[4])
-                    if 0 < exp < now:
-                        expired_count += 1
-                except ValueError:
-                    pass
-    except Exception as e:
-        logger.warning("Could not check cookie expiry: %s", e)
-        return
-    if expired_count > 0:
-        logger.warning(
-            "⚠️  %d YouTube cookie(s) appear EXPIRED. "
-            "Bot may still get 'Sign in to confirm' errors. "
-            "Export fresh cookies and set YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES env var.",
-            expired_count,
-        )
-    else:
-        logger.info("YouTube cookies look valid (no expired entries found).")
-
-
-# Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
-# "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
 COOKIES_FILE = _setup_youtube_cookies()
-_check_cookies_expiry(COOKIES_FILE)
 
-# A realistic desktop User-Agent + an Android/iOS "player_client" combo is
-# currently the most reliable way to dodge YouTube's bot-check without cookies.
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
-CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
+CACHE_TTL_SECONDS = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -298,234 +198,175 @@ PLATFORM_PATTERNS = {
     "snapchat": re.compile(r"snapchat\.com"),
 }
 
-# token -> local video path, used only for the "detect music" button
 FILE_CACHE: dict[str, str] = {}
-
-# token -> {"query": str, "results": [...], "page": int}, used for the
-# text-based music search feature (search -> pick from list -> mp3)
 SEARCH_CACHE: dict[str, dict] = {}
 SEARCH_RESULTS_PER_PAGE = 8
-SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
+SEARCH_FETCH_LIMIT = 40
 SEARCH_CACHE_TTL_SECONDS = 600
 
-# bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
-
 pool: asyncpg.Pool | None = None
 
 
 # ============================================================
-# TRANSLATIONS
+# TRANSLATIONS (Minimalistik o'zgargan matnlar)
 # ============================================================
 TEXTS = {
     "uz": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": (
-            "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
-            "Menga Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini "
-            "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
-            "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
-        ),
-        "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Yuklanmoqda, biroz kuting...",
-        "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
-        "detect_music_btn": "🎵 Musiqani aniqlash",
-        "recognizing": "🎧 Musiqa aniqlanmoqda...",
-        "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
-        "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
+        "welcome": "Texnik ishlar tugadi, /start ni bosing.",
+        "send_link": "🔗 Havola yuboring.",
+        "downloading": "⏳",
+        "caption": "✅ @{bot_username}",
+        "detect_music_btn": "🎵 Musiqa",
+        "recognizing": "🎧...",
+        "not_recognized": "😔 Musiqa topilmadi.",
+        "found_song": "🎶 {title} — {artist}",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 YouTube'da ochish",
-        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
-        "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
-        "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
-        "no_link": "❗️ Iltimos, media havolasini yuboring.",
-        "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
+        "btn_youtube_link": "🔍 YouTube",
+        "lyrics_notice": "📜 Lyrics:",
+        "tiktok_unavailable": "⚠️ TikTok ishlamayapti.",
+        "unsupported_link": "❌ Yaroqsiz havola.",
+        "error": "❌ Xatolik.",
+        "no_link": "❗️ Havola yuboring.",
+        "admin_only": "⛔ Admin uchun.",
         "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Statistika:\n\n👤 Jami foydalanuvchilar: {count}",
-        "broadcast_ask": "✍️ Yuboriladigan xabar matnini yuboring:",
-        "broadcast_done": "✅ Xabar {count} ta foydalanuvchiga yuborildi.",
-        "file_expired": "⏱ Vaqt tugadi, iltimos havolani qayta yuboring.",
-        "lang_set": "✅ Til o'zbekcha etib o'rnatildi.",
-        "searching": "🔍 Qidirilmoqda...",
-        "search_no_results": "😔 Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.",
-        "search_results_range": "Natijalar {start}-{end} / {total}",
-        "help": (
-            "ℹ️ <b>Yordam</b>\n\n"
-            "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
-            "2) Bot mediani yuklab beradi.\n"
-            "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
-            "MP3 shaklida yuboradi.\n"
-            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot YouTube'dan "
-            "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
-            "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
-        ),
+        "stats": "📊 Foydalanuvchilar: {count}",
+        "broadcast_ask": "✍️ Xabar matnini yuboring:",
+        "broadcast_done": "✅ Yuborildi: {count}",
+        "file_expired": "⏱ Vaqt tugadi.",
+        "lang_set": "✅ O'zbekcha",
+        "searching": "🔍...",
+        "search_no_results": "😔 Topilmadi.",
+        "search_results_range": "{start}-{end} / {total}",
+        "help": "ℹ️ Havola yuboring yoki qo'shiq nomini yozing.",
         "btn_lang": "🌐 Til",
         "btn_help": "❓ Yordam",
-        "btn_admin": "🛠 Admin panel",
+        "btn_admin": "🛠 Admin",
         "btn_back": "⬅️ Orqaga",
-        "btn_stats": "📊 Statistika",
-        "btn_broadcast": "📢 Xabar yuborish",
-        "btn_add_channel": "➕ Majburiy obuna qo'shish",
-        "btn_list_channels": "📋 Majburiy obunalar",
-        "ask_channel": (
-            "📎 Kanal/gurux qo'shish uchun:\n\n"
-            "1) Botni o'sha kanal/guruhga <b>administrator</b> qilib qo'ying.\n"
-            "2) Shu yerga o'sha kanal/guruhdagi istalgan xabarni forward qiling, "
-            "yoki uning @username'ini, yoki chat_id sini yuboring."
-        ),
-        "channel_added": "✅ \"{title}\" majburiy obunalar ro'yxatiga qo'shildi.",
-        "channel_add_fail_not_admin": "❌ Botni avval o'sha kanal/guruhga administrator qiling, keyin qaytadan urinib ko'ring.",
-        "channel_add_fail": "❌ Kanal/guruhni aniqlab bo'lmadi. Forward yoki @username/ID yuboring.",
-        "channel_list_empty": "📭 Hozircha majburiy obunalar yo'q.",
-        "channel_list_title": "📋 Majburiy obunalar ro'yxati:",
-        "channel_removed": "🗑 Kanal ro'yxatdan olib tashlandi.",
-        "subscribe_required": "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga a'zo bo'ling:",
+        "btn_stats": "📊 Stats",
+        "btn_broadcast": "📢 Broadcast",
+        "btn_add_channel": "➕ Kanal qo'shish",
+        "btn_list_channels": "📋 Kanallar",
+        "ask_channel": "📎 Forward xabar yoki username/ID yuboring:",
+        "channel_added": "✅ Qo'shildi: {title}",
+        "channel_add_fail_not_admin": "❌ Botni admin qiling.",
+        "channel_add_fail": "❌ Aniqlanmadi.",
+        "channel_list_empty": "📭 Kanallar yo'q.",
+        "channel_list_title": "📋 Kanallar:",
+        "channel_removed": "🗑 O'chirildi.",
+        "subscribe_required": "⚠️ Kanallarga a'zo bo'ling:",
         "check_sub_btn": "✅ Tekshirish",
-        "still_not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz.",
-        "now_subscribed": "✅ Rahmat! Endi botdan foydalanishingiz mumkin, havolani yuboring.",
-        "channel_type_public": "ochiq kanal/gurux",
+        "still_not_subscribed": "❌ A'zo bo'lmadingiz.",
+        "now_subscribed": "✅ Rahmat!",
+        "channel_type_public": "Ochiq",
         "channel_subs_label": "{count} a'zo",
-        "channel_type_private": "yopiq kanal/gurux",
+        "channel_type_private": "Yopiq",
     },
     "ru": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": (
-            "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
-            "Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat — "
-            "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
-        ),
-        "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Загружается, подождите...",
-        "caption": "✅ Спасибо, что пользуетесь ботом!",
-        "detect_music_btn": "🎵 Распознать музыку",
-        "recognizing": "🎧 Распознаём музыку...",
-        "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
-        "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
+        "welcome": "Технические работы завершены, нажмите /start.",
+        "send_link": "🔗 Отправьте ссылку.",
+        "downloading": "⏳",
+        "caption": "✅ @{bot_username}",
+        "detect_music_btn": "🎵 Музыка",
+        "recognizing": "🎧...",
+        "not_recognized": "😔 Музыка не найдена.",
+        "found_song": "🎶 {title} — {artist}",
         "song_caption": "🎵 {title} — {artist}",
-        "btn_lyrics": "📜 Текст песни",
-        "btn_youtube_link": "🔍 Открыть на YouTube",
-        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
-        "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
-        "error": "❌ Произошла ошибка, попробуйте ещё раз.",
-        "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
-        "admin_only": "⛔ Эта команда только для администраторов.",
+        "btn_lyrics": "📜 Текст",
+        "btn_youtube_link": "🔍 YouTube",
+        "lyrics_notice": "📜 Текст:",
+        "tiktok_unavailable": "⚠️ TikTok недоступен.",
+        "unsupported_link": "❌ Неподдерживаемая ссылка.",
+        "error": "❌ Ошибка.",
+        "no_link": "❗️ Отправьте ссылку.",
+        "admin_only": "⛔ Только для админов.",
         "admin_panel": "🛠 Админ-панель",
-        "stats": "📊 Статистика:\n\n👤 Всего пользователей: {count}",
-        "broadcast_ask": "✍️ Отправьте текст рассылки:",
-        "broadcast_done": "✅ Сообщение отправлено {count} пользователям.",
-        "file_expired": "⏱ Время истекло, отправьте ссылку заново.",
-        "lang_set": "✅ Язык установлен: русский.",
-        "searching": "🔍 Ищем...",
-        "search_no_results": "😔 Ничего не найдено. Попробуйте другой запрос.",
-        "search_results_range": "Результаты {start}-{end} / {total}",
-        "help": (
-            "ℹ️ <b>Помощь</b>\n\n"
-            "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
-            "2) Бот скачает медиа.\n"
-            "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
-            "4) Или просто напишите название песни/исполнителя — бот найдёт на YouTube "
-            "и пришлёт выбранный трек в MP3.\n\n"
-            "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
-        ),
+        "stats": "📊 Пользователей: {count}",
+        "broadcast_ask": "✍️ Отправьте текст:",
+        "broadcast_done": "✅ Отправлено: {count}",
+        "file_expired": "⏱ Время истекло.",
+        "lang_set": "✅ Русский",
+        "searching": "🔍...",
+        "search_no_results": "😔 Ничего не найдено.",
+        "search_results_range": "{start}-{end} / {total}",
+        "help": "ℹ️ Отправьте ссылку или название песни.",
         "btn_lang": "🌐 Язык",
         "btn_help": "❓ Помощь",
-        "btn_admin": "🛠 Админ-панель",
+        "btn_admin": "🛠 Админ",
         "btn_back": "⬅️ Назад",
-        "btn_stats": "📊 Статистика",
+        "btn_stats": "📊 Стат",
         "btn_broadcast": "📢 Рассылка",
-        "btn_add_channel": "➕ Добавить обяз. подписку",
-        "btn_list_channels": "📋 Список подписок",
-        "ask_channel": (
-            "📎 Чтобы добавить канал/группу:\n\n"
-            "1) Сделайте бота <b>администратором</b> в этом канале/группе.\n"
-            "2) Перешлите сюда любое сообщение из него, либо отправьте его @username "
-            "или chat_id."
-        ),
-        "channel_added": "✅ \"{title}\" добавлен в обязательные подписки.",
-        "channel_add_fail_not_admin": "❌ Сначала сделайте бота администратором канала/группы, затем попробуйте снова.",
-        "channel_add_fail": "❌ Не удалось определить канал/группу. Перешлите сообщение или отправьте @username/ID.",
-        "channel_list_empty": "📭 Обязательных подписок пока нет.",
-        "channel_list_title": "📋 Список обязательных подписок:",
-        "channel_removed": "🗑 Канал удалён из списка.",
-        "subscribe_required": "⚠️ Чтобы пользоваться ботом, подпишитесь на следующие канал(ы):",
+        "btn_add_channel": "➕ Добавить канал",
+        "btn_list_channels": "📋 Каналы",
+        "ask_channel": "📎 Перешлите сообщение или отправьте username/ID:",
+        "channel_added": "✅ Добавлено: {title}",
+        "channel_add_fail_not_admin": "❌ Сделайте бота админом.",
+        "channel_add_fail": "❌ Не удалось определить.",
+        "channel_list_empty": "📭 Каналов нет.",
+        "channel_list_title": "📋 Каналы:",
+        "channel_removed": "🗑 Удалено.",
+        "subscribe_required": "⚠️ Подпишитесь на каналы:",
         "check_sub_btn": "✅ Проверить",
-        "still_not_subscribed": "❌ Вы ещё не подписаны на все каналы.",
-        "now_subscribed": "✅ Спасибо! Теперь вы можете пользоваться ботом, отправьте ссылку.",
-        "channel_type_public": "открытый канал/группа",
-        "channel_subs_label": "{count} подписчиков",
-        "channel_type_private": "закрытый канал/группа",
+        "still_not_subscribed": "❌ Вы не подписались.",
+        "now_subscribed": "✅ Спасибо!",
+        "channel_type_public": "Открытый",
+        "channel_subs_label": "{count} subs",
+        "channel_type_private": "Закрытый",
     },
     "en": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": (
-            "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
-            "Send me a link from Instagram, YouTube, TikTok, Pinterest or Snapchat — "
-            "I'll download the media for you. Use the button under the video to recognize "
-            "the music in it and get it as an MP3 🎵"
-        ),
-        "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Downloading, please wait...",
-        "caption": "✅ Thanks for using our bot!",
-        "detect_music_btn": "🎵 Recognize music",
-        "recognizing": "🎧 Recognizing the music...",
-        "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
-        "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
+        "welcome": "Technical work is complete, press /start.",
+        "send_link": "🔗 Send a link.",
+        "downloading": "⏳",
+        "caption": "✅ @{bot_username}",
+        "detect_music_btn": "🎵 Music",
+        "recognizing": "🎧...",
+        "not_recognized": "😔 Music not found.",
+        "found_song": "🎶 {title} — {artist}",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 Open on YouTube",
-        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
-        "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
-        "error": "❌ Something went wrong, please try again.",
-        "no_link": "❗️ Please send a media link.",
-        "admin_only": "⛔ This command is for admins only.",
+        "btn_youtube_link": "🔍 YouTube",
+        "lyrics_notice": "📜 Lyrics:",
+        "tiktok_unavailable": "⚠️ TikTok unavailable.",
+        "unsupported_link": "❌ Unsupported link.",
+        "error": "❌ Error.",
+        "no_link": "❗️ Send a link.",
+        "admin_only": "⛔ Admin only.",
         "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Stats:\n\n👤 Total users: {count}",
-        "broadcast_ask": "✍️ Send the broadcast text:",
-        "broadcast_done": "✅ Message sent to {count} users.",
-        "file_expired": "⏱ Session expired, please send the link again.",
-        "lang_set": "✅ Language set to English.",
-        "searching": "🔍 Searching...",
-        "search_no_results": "😔 Nothing found. Try a different search term.",
-        "search_results_range": "Results {start}-{end} / {total}",
-        "help": (
-            "ℹ️ <b>Help</b>\n\n"
-            "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
-            "2) The bot downloads the media.\n"
-            "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
-            "4) Or just type a song/artist name — the bot will search YouTube and send the "
-            "track you pick as MP3.\n\n"
-            "To change language, use the \"🌐 Language\" button below."
-        ),
+        "stats": "📊 Users: {count}",
+        "broadcast_ask": "✍️ Send text:",
+        "broadcast_done": "✅ Sent: {count}",
+        "file_expired": "⏱ Expired.",
+        "lang_set": "✅ English",
+        "searching": "🔍...",
+        "search_no_results": "😔 Not found.",
+        "search_results_range": "{start}-{end} / {total}",
+        "help": "ℹ️ Send link or song title.",
         "btn_lang": "🌐 Language",
         "btn_help": "❓ Help",
-        "btn_admin": "🛠 Admin panel",
+        "btn_admin": "🛠 Admin",
         "btn_back": "⬅️ Back",
         "btn_stats": "📊 Stats",
         "btn_broadcast": "📢 Broadcast",
-        "btn_add_channel": "➕ Add mandatory sub",
-        "btn_list_channels": "📋 Mandatory subs",
-        "ask_channel": (
-            "📎 To add a channel/group:\n\n"
-            "1) Make the bot an <b>administrator</b> there.\n"
-            "2) Forward any message from it here, or send its @username or chat_id."
-        ),
-        "channel_added": "✅ \"{title}\" added to mandatory subscriptions.",
-        "channel_add_fail_not_admin": "❌ Make the bot an administrator of that channel/group first, then try again.",
-        "channel_add_fail": "❌ Couldn't detect the channel/group. Forward a message, or send its @username/ID.",
-        "channel_list_empty": "📭 No mandatory subscriptions yet.",
-        "channel_list_title": "📋 Mandatory subscriptions:",
-        "channel_removed": "🗑 Channel removed from the list.",
-        "subscribe_required": "⚠️ To use the bot, please subscribe to the following channel(s):",
+        "btn_add_channel": "➕ Add channel",
+        "btn_list_channels": "📋 Channels",
+        "ask_channel": "📎 Forward message or send username/ID:",
+        "channel_added": "✅ Added: {title}",
+        "channel_add_fail_not_admin": "❌ Make bot an admin.",
+        "channel_add_fail": "❌ Couldn't detect.",
+        "channel_list_empty": "📭 No channels.",
+        "channel_list_title": "📋 Channels:",
+        "channel_removed": "🗑 Removed.",
+        "subscribe_required": "⚠️ Subscribe to channels:",
         "check_sub_btn": "✅ Check",
-        "still_not_subscribed": "❌ You haven't subscribed to all channels yet.",
-        "now_subscribed": "✅ Thanks! You can use the bot now, send a link.",
-        "channel_type_public": "public channel/group",
+        "still_not_subscribed": "❌ Not subscribed.",
+        "now_subscribed": "✅ Thanks!",
+        "channel_type_public": "Public",
         "channel_subs_label": "{count} subs",
-        "channel_type_private": "private channel/group",
+        "channel_type_private": "Private",
     },
 }
 
@@ -537,7 +378,7 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 
 # ============================================================
-# DATABASE (PostgreSQL via asyncpg)
+# DATABASE
 # ============================================================
 async def init_db():
     global pool
@@ -632,25 +473,12 @@ async def remove_channel(channel_id: int):
         await conn.execute("DELETE FROM mandatory_channels WHERE id=$1", channel_id)
 
 
-async def get_channel(channel_id: int):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM mandatory_channels WHERE id=$1", channel_id)
-
-
 async def log_join_request(chat_id: int, user_id: int):
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO join_requests (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             chat_id, user_id,
         )
-
-
-async def has_join_request(chat_id: int, user_id: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
-        )
-        return row is not None
 
 
 async def get_channel_by_chat_id(chat_id: int):
@@ -690,14 +518,6 @@ dp.include_router(router)
 
 
 class EnsureUserRegisteredMiddleware(BaseMiddleware):
-    """
-    Registers a user in the DB the moment they interact with the bot in ANY
-    way (any message text, any button press) - not only via /start. This
-    matters for people who were already using an earlier version of this
-    bot: they won't need to press /start again, whatever they send just
-    gets them added to the users table if they're not there yet.
-    """
-
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
@@ -738,12 +558,6 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
 
 
 def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
-    """
-    Buttons shown under a sent MP3:
-    - "Lyrics" links out to a lyrics search page instead of reproducing the
-      full copyrighted lyrics text inside the bot.
-    - "Open on YouTube" links to the source video the audio came from.
-    """
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
     rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
@@ -787,7 +601,6 @@ def is_admin(user_id: int) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await add_user_if_missing(message.from_user.id)
-    await message.answer(f"<b>{BOT_DISPLAY_NAME}</b>")
     await message.answer(t("uz", "choose_lang"), reply_markup=lang_inline_kb())
 
 
@@ -796,7 +609,9 @@ async def cb_lang(call: CallbackQuery):
     lang = call.data.split(":", 1)[1]
     await set_lang(call.from_user.id, lang)
     await call.message.edit_text(t(lang, "lang_set"))
-    await call.message.answer(t(lang, "welcome", bot_name=BOT_DISPLAY_NAME))
+    me = await bot.get_me()
+    bot_username = me.username or "bot"
+    await call.message.answer(t(lang, "welcome", bot_name=BOT_DISPLAY_NAME, bot_username=bot_username))
     await call.message.answer(
         t(lang, "send_link"),
         reply_markup=user_reply_kb(lang, is_admin(call.from_user.id)),
@@ -805,7 +620,7 @@ async def cb_lang(call: CallbackQuery):
 
 
 # ============================================================
-# HANDLERS: persistent reply-keyboard buttons (user side)
+# HANDLERS: persistent reply-keyboard buttons
 # ============================================================
 @router.message(F.text.in_({v["btn_lang"] for v in TEXTS.values()}))
 async def btn_change_lang(message: Message):
@@ -889,7 +704,7 @@ async def cmd_admin(message: Message):
 
 
 # ============================================================
-# HANDLERS: admin - mandatory subscriptions (add / list / remove)
+# HANDLERS: admin - mandatory subscriptions
 # ============================================================
 @router.message(F.text.in_({v["btn_add_channel"] for v in TEXTS.values()}))
 async def btn_add_channel_ask(message: Message, state: FSMContext):
@@ -1001,20 +816,14 @@ async def cb_delete_channel(call: CallbackQuery):
     await call.answer(t(lang, "channel_removed"))
 
 
-
 # ============================================================
-# HANDLER: join requests for private mandatory channels
+# HANDLER: join requests & chat_member updates
 # ============================================================
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
 
 
-# ============================================================
-# HANDLER: track join/leave events for mandatory channels
-# (requires the bot to be an admin there - Telegram then sends
-# chat_member updates for every member change in that chat)
-# ============================================================
 @router.chat_member()
 async def on_chat_member_update(update: ChatMemberUpdated):
     channel = await get_channel_by_chat_id(update.chat.id)
@@ -1035,16 +844,7 @@ async def on_chat_member_update(update: ChatMemberUpdated):
 # ============================================================
 # MANDATORY SUBSCRIPTION CHECK
 # ============================================================
-# ============================================================
-# MANDATORY SUBSCRIPTION CHECK
-# ============================================================
 async def get_unsubscribed_channels(user_id: int):
-    """
-    A user only counts as subscribed once they are an ACTUAL member of the
-    channel/group (status member/administrator/creator). For private
-    channels this means the channel owner/admin must approve their join
-    request first - merely sending a join request is NOT enough on its own.
-    """
     channels = await list_channels()
     missing = []
     for c in channels:
@@ -1095,38 +895,18 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-# ============================================================
-# InnerTube client fallback order + po_token cache
-# ============================================================
-#
-# Railway/Docker datacenter IPs are heavily flagged by YouTube.
-# Strategy (in order):
-#   1. android_testsuite — no sig-check, usually works without cookies
-#   2. tv_embedded       — embedded TV player, no JS challenge
-#   3. web + po_token    — web client WITH proof-of-origin token (bypasses bot-check)
-#   4. ios               — Apple client, separate sig path
-#   5. android_creator   — Studio client
-#
 PLAYER_CLIENT_FALLBACKS = [
     ["android_testsuite"],
     ["tv_embedded"],
-    ["web"],           # used WITH po_token injected by _build_ydl_opts_base
+    ["web"],
     ["ios"],
     ["android_creator"],
     ["mweb"],
 ]
 
-# ---------------------------------------------------------------------------
-# po_token / visitor_data  —  Proof-of-Origin token cache
-#
-# YouTube requires a BotGuard-issued po_token for web/mweb clients on
-# server IPs. We fetch it once from the public bgutils API and cache it
-# for POTOK_TTL seconds.  If the fetch fails we fall back to no token
-# (other clients will still be tried).
-# ---------------------------------------------------------------------------
-_POT_CACHE: dict = {}           # {"visitor_data": str, "po_token": str, "ts": float}
-_POT_TTL   = 21600              # 6 hours — tokens stay valid roughly this long
-_POT_LOCK: asyncio.Lock | None = None  # created lazily inside the running event loop
+_POT_CACHE: dict = {}
+_POT_TTL = 21600
+_POT_LOCK: asyncio.Lock | None = None
 
 
 def _get_pot_lock() -> asyncio.Lock:
@@ -1135,38 +915,28 @@ def _get_pot_lock() -> asyncio.Lock:
         _POT_LOCK = asyncio.Lock()
     return _POT_LOCK
 
-# Public bgutils worker endpoint (no key required, rate-limit is generous)
-_BGUTILS_URL = "https://bgutils.kz/token"   # community-run, reliable
+
+_BGUTILS_URL = "https://bgutils.kz/token"
 
 
 async def _fetch_po_token() -> tuple[str, str] | tuple[None, None]:
-    """Fetch a fresh (visitor_data, po_token) pair from the bgutils API.
-
-    Returns (visitor_data, po_token) on success, (None, None) on failure.
-    The tokens are required for yt-dlp web/mweb clients on datacenter IPs.
-    """
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(_BGUTILS_URL) as resp:
                 if resp.status != 200:
-                    log.warning("bgutils returned HTTP %d", resp.status)
                     return None, None
                 data = await resp.json(content_type=None)
-                vd  = data.get("visitorData") or data.get("visitor_data")
-                pot = data.get("poToken")     or data.get("po_token")
+                vd = data.get("visitorData") or data.get("visitor_data")
+                pot = data.get("poToken") or data.get("po_token")
                 if vd and pot:
-                    log.info("po_token refreshed from bgutils (visitor_data=%s…)", vd[:12])
                     return vd, pot
-                log.warning("bgutils response missing fields: %s", list(data.keys()))
                 return None, None
-    except Exception as exc:
-        log.warning("po_token fetch failed: %s", exc)
+    except Exception:
         return None, None
 
 
 async def get_po_token() -> tuple[str, str] | tuple[None, None]:
-    """Return cached (visitor_data, po_token), refreshing if stale."""
     async with _get_pot_lock():
         now = time.time()
         if _POT_CACHE and now - _POT_CACHE.get("ts", 0) < _POT_TTL:
@@ -1179,31 +949,24 @@ async def get_po_token() -> tuple[str, str] | tuple[None, None]:
 
 
 def get_po_token_sync() -> tuple[str, str] | tuple[None, None]:
-    """Sync wrapper — reads cache only (no network call).
-
-    The sync download functions (run_in_executor) call this; the async
-    refresh is done by the handler before spawning the executor task.
-    """
     if _POT_CACHE and time.time() - _POT_CACHE.get("ts", 0) < _POT_TTL:
         return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
     return None, None
 
 
 def _is_bot_check_error(exc: Exception) -> bool:
-    """Detect YouTube bot-check / auth errors that are worth retrying with
-    a different InnerTube client or po_token."""
     msg = str(exc).lower()
     return any(
         phrase in msg for phrase in (
             "sign in to confirm",
             "not a bot",
-            "cookies",                      # "use --cookies-from-browser"
-            "http error 429",               # Too Many Requests
+            "cookies",
+            "http error 429",
             "too many requests",
-            "preconditionfailed",           # InnerTube 412 - client context rejected
+            "preconditionfailed",
             "vpn or proxy",
-            "error code: 152",              # InnerTube: content not available for this client
-            "this video is unavailable",    # masked bot-check on restricted IPs
+            "error code: 152",
+            "this video is unavailable",
             "video unavailable",
         )
     )
@@ -1216,28 +979,15 @@ def _raise_ytdlp_failure(last_exc: Exception | None):
     global _cookie_hint_logged
     if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
         _cookie_hint_logged = True
-        log.error(
-            "YouTube blocked every player_client fallback with a bot-check error. "
-            "This host's IP is very likely flagged - set YOUTUBE_COOKIES (or "
-            "YOUTUBE_COOKIES_B64) in the environment with a real browser's "
-            "cookies.txt content to fix this reliably. See README."
-        )
     if last_exc is None:
-        raise RuntimeError("yt-dlp: all player_client fallbacks exhausted with no specific error.")
+        raise RuntimeError("yt-dlp error")
     raise last_exc
 
 
 def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
-    """Shared yt-dlp options used across all download functions.
-
-    Automatically injects po_token + visitor_data for web/mweb clients so
-    YouTube's BotGuard accepts requests from datacenter (Railway) IPs.
-    """
-    # Clients that supply pre-signed URLs — no JS player needed
     _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded"}
     needs_player = not all(c in _no_sig_clients for c in player_clients)
 
-    # po_token is only meaningful for web / mweb clients
     _web_clients = {"web", "mweb", "web_creator", "web_embedded"}
     needs_pot = any(c in _web_clients for c in player_clients)
 
@@ -1252,8 +1002,7 @@ def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
         visitor_data, po_token = get_po_token_sync()
         if visitor_data and po_token:
             extractor_args["visitor_data"] = [visitor_data]
-            extractor_args["po_token"]     = [po_token]
-            log.debug("Injecting po_token for client %s", player_clients)
+            extractor_args["po_token"] = [po_token]
 
     opts: dict = {
         "quiet": True,
@@ -1292,16 +1041,10 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 return filename, info
         except Exception as e:
             last_exc = e
-            # Only worth retrying with a different client for the bot-check
-            # error and only for youtube urls; anything else, fail fast.
             if "youtube" not in url and "youtu.be" not in url:
                 raise
             if not _is_bot_check_error(e):
                 raise
-            log.warning(
-                "InnerTube client %s (attempt %d) blocked: %s — trying next client",
-                player_clients, attempt + 1, str(e)[:120],
-            )
             continue
     _raise_ytdlp_failure(last_exc)
 
@@ -1309,7 +1052,6 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"
-    # Pre-warm the po_token cache so the sync executor can read it without await
     await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
@@ -1326,11 +1068,11 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch1:{query}", download=True)
                 if not info:
-                    raise RuntimeError("yt-dlp returned no info for query")
+                    raise RuntimeError("No info")
                 if "entries" in info:
                     entries = [e for e in (info.get("entries") or []) if e]
                     if not entries:
-                        raise RuntimeError("yt-dlp search returned empty entries")
+                        raise RuntimeError("Empty entries")
                     info = entries[0]
                 filename = ydl.prepare_filename(info)
                 video_id = info.get("id")
@@ -1340,10 +1082,6 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]
             last_exc = e
             if not _is_bot_check_error(e):
                 raise
-            log.warning(
-                "InnerTube client %s (song search attempt %d) blocked: %s — trying next client",
-                player_clients, attempt + 1, str(e)[:120],
-            )
             continue
     _raise_ytdlp_failure(last_exc)
 
@@ -1494,8 +1232,6 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
     )
     stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
-        # No audio track in the source (e.g. a silent GIF/video) - this is a
-        # normal case, not a real error: just tell the user music wasn't found.
         if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
             return None
         raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
@@ -1504,16 +1240,13 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
 
 async def recognize_song(audio_path: str) -> dict | None:
     if Shazam is None:
-        log.warning("shazamio not installed - music recognition unavailable")
         return None
     if not audio_path or not os.path.exists(audio_path):
-        log.warning("recognize_song: audio file not found: %s", audio_path)
         return None
     try:
         shazam = Shazam()
         result = await shazam.recognize(audio_path)
-    except Exception as e:
-        log.warning("shazamio recognition error: %s", e)
+    except Exception:
         return None
     track = result.get("track")
     if not track:
@@ -1522,7 +1255,7 @@ async def recognize_song(audio_path: str) -> dict | None:
 
 
 # ============================================================
-# HANDLERS: media link
+# HANDLERS: media link & search
 # ============================================================
 @router.message(F.text.regexp(URL_RE.pattern))
 async def handle_link(message: Message):
@@ -1564,7 +1297,10 @@ async def handle_link(message: Message):
 
     token = uuid.uuid4().hex[:12]
     ext = os.path.splitext(filepath)[1].lower()
-    caption = t(lang, "caption")
+    
+    me = await bot.get_me()
+    bot_username = me.username or "bot"
+    caption = t(lang, "caption", bot_username=bot_username)
     keyboard = music_inline_kb(lang, token)
 
     try:
@@ -1654,7 +1390,6 @@ async def cb_search_action(call: CallbackQuery):
         await call.answer()
         return
 
-    # otherwise `action` is the 1..8 button - the user picked a song
     if not action.isdigit():
         await call.answer()
         return
@@ -1732,7 +1467,6 @@ async def cb_recognize_music(call: CallbackQuery):
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
             reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
         )
-        # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
             await status.delete()
         except Exception:
@@ -1744,7 +1478,6 @@ async def cb_recognize_music(call: CallbackQuery):
         except Exception:
             await call.message.answer(t(lang, "error"))
     finally:
-        # clean everything for this request right away - free-tier disk friendly
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(video_outdir, ignore_errors=True)
         FILE_CACHE.pop(token, None)
