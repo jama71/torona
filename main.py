@@ -232,9 +232,45 @@ def _setup_youtube_cookies() -> str | None:
     return None
 
 
+def _check_cookies_expiry(cookies_path: str | None) -> None:
+    """Warn if any session cookies appear to be expired (expiry < now)."""
+    if not cookies_path or not os.path.exists(cookies_path):
+        return
+    logger = logging.getLogger("bot")
+    now = int(__import__("time").time())
+    expired_count = 0
+    try:
+        with open(cookies_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) < 7:
+                    continue
+                try:
+                    exp = int(parts[4])
+                    if 0 < exp < now:
+                        expired_count += 1
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.warning("Could not check cookie expiry: %s", e)
+        return
+    if expired_count > 0:
+        logger.warning(
+            "⚠️  %d YouTube cookie(s) appear EXPIRED. "
+            "Bot may still get 'Sign in to confirm' errors. "
+            "Export fresh cookies and set YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES env var.",
+            expired_count,
+        )
+    else:
+        logger.info("YouTube cookies look valid (no expired entries found).")
+
+
 # Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
 # "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
 COOKIES_FILE = _setup_youtube_cookies()
+_check_cookies_expiry(COOKIES_FILE)
 
 # A realistic desktop User-Agent + an Android/iOS "player_client" combo is
 # currently the most reliable way to dodge YouTube's bot-check without cookies.
@@ -1063,6 +1099,7 @@ PLAYER_CLIENT_FALLBACKS = [
     ["ios"],
     ["tv_embedded", "web"],
     ["mweb"],
+    ["web_creator"],  # extra fallback - often bypasses bot-check on datacenter IPs
 ]
 
 
@@ -1074,9 +1111,9 @@ def _is_bot_check_error(exc: Exception) -> bool:
 _cookie_hint_logged = False
 
 
-def _raise_ytdlp_failure(last_exc: Exception):
+def _raise_ytdlp_failure(last_exc: Exception | None):
     global _cookie_hint_logged
-    if last_exc is not None and _is_bot_check_error(last_exc) and not COOKIES_FILE and not _cookie_hint_logged:
+    if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
         _cookie_hint_logged = True
         log.error(
             "YouTube blocked every player_client fallback with a bot-check error. "
@@ -1084,27 +1121,39 @@ def _raise_ytdlp_failure(last_exc: Exception):
             "YOUTUBE_COOKIES_B64) in the environment with a real browser's "
             "cookies.txt content to fix this reliably. See README."
         )
+    if last_exc is None:
+        raise RuntimeError("yt-dlp: all player_client fallbacks exhausted with no specific error.")
     raise last_exc
+
+
+def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
+    """Shared yt-dlp options used across all download functions."""
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "ffmpeg_location": FFMPEG_PATH,
+        "extractor_args": {"youtube": {"player_client": player_clients}},
+        "http_headers": {"User-Agent": DEFAULT_UA},
+        "geo_bypass": True,
+        "retries": 3,
+        "sleep_interval": 1,       # small delay between requests to reduce bot-check triggers
+        "max_sleep_interval": 3,
+        "socket_timeout": 30,
+    }
+    if outdir:
+        opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
 
 def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = {
-            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-            "format": "best[ext=mp4]/best",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "restrictfilenames": True,
-            "ffmpeg_location": FFMPEG_PATH,
-            "extractor_args": {"youtube": {"player_client": player_clients}},
-            "http_headers": {"User-Agent": DEFAULT_UA},
-            "geo_bypass": True,
-            "retries": 3,
-        }
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            ydl_opts["cookiefile"] = COOKIES_FILE
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "best[ext=mp4]/best"
         if use_proxy and GENERAL_PROXY:
             ydl_opts["proxy"] = GENERAL_PROXY
         try:
@@ -1136,29 +1185,21 @@ async def download_media(url: str, outdir: str, platform: str):
 def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]:
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = {
-            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-            "format": "bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "restrictfilenames": True,
-            "ffmpeg_location": FFMPEG_PATH,
-            "extractor_args": {"youtube": {"player_client": player_clients}},
-            "http_headers": {"User-Agent": DEFAULT_UA},
-            "geo_bypass": True,
-            "retries": 3,
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-            ],
-        }
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            ydl_opts["cookiefile"] = COOKIES_FILE
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ]
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+                if not info:
+                    raise RuntimeError("yt-dlp returned no info for query")
                 if "entries" in info:
-                    info = info["entries"][0]
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    if not entries:
+                        raise RuntimeError("yt-dlp search returned empty entries")
+                    info = entries[0]
                 filename = ydl.prepare_filename(info)
                 video_id = info.get("id")
                 video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
@@ -1202,18 +1243,9 @@ def format_count(n) -> str:
 def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
     last_exc = None
     for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": "in_playlist",
-            "skip_download": True,
-            "ffmpeg_location": FFMPEG_PATH,
-            "extractor_args": {"youtube": {"player_client": player_clients}},
-            "http_headers": {"User-Agent": DEFAULT_UA},
-            "geo_bypass": True,
-        }
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            ydl_opts["cookiefile"] = COOKIES_FILE
+        ydl_opts = _build_ydl_opts_base(None, player_clients)
+        ydl_opts["extract_flat"] = "in_playlist"
+        ydl_opts["skip_download"] = True
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -1248,24 +1280,11 @@ async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> li
 def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
     last_exc = None
     for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = {
-            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-            "format": "bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "restrictfilenames": True,
-            "ffmpeg_location": FFMPEG_PATH,
-            "extractor_args": {"youtube": {"player_client": player_clients}},
-            "http_headers": {"User-Agent": DEFAULT_UA},
-            "geo_bypass": True,
-            "retries": 3,
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-            ],
-        }
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            ydl_opts["cookiefile"] = COOKIES_FILE
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ]
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -1347,9 +1366,17 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
 
 async def recognize_song(audio_path: str) -> dict | None:
     if Shazam is None:
+        log.warning("shazamio not installed - music recognition unavailable")
         return None
-    shazam = Shazam()
-    result = await shazam.recognize(audio_path)
+    if not audio_path or not os.path.exists(audio_path):
+        log.warning("recognize_song: audio file not found: %s", audio_path)
+        return None
+    try:
+        shazam = Shazam()
+        result = await shazam.recognize(audio_path)
+    except Exception as e:
+        log.warning("shazamio recognition error: %s", e)
+        return None
     track = result.get("track")
     if not track:
         return None
@@ -1545,7 +1572,10 @@ async def cb_recognize_music(call: CallbackQuery):
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     video_outdir = os.path.dirname(video_path)
     try:
-        audio_sample = extract_audio_for_recognition(video_path, work_dir)
+        loop = asyncio.get_running_loop()
+        audio_sample = await loop.run_in_executor(
+            None, extract_audio_for_recognition, video_path, work_dir
+        )
         if not audio_sample:
             await status.edit_text(t(lang, "not_recognized"))
             return
