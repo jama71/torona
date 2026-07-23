@@ -30,6 +30,10 @@ from aiogram.types import (
     FSInputFile,
 )
 
+import json
+import time
+
+import aiohttp
 import yt_dlp
 
 try:
@@ -1091,44 +1095,116 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-# InnerTube client fallback order.
+# ============================================================
+# InnerTube client fallback order + po_token cache
+# ============================================================
 #
-# YouTube's InnerTube API uses different "client contexts" internally.
-# yt-dlp maps these via extractor_args["youtube"]["player_client"].
+# Railway/Docker datacenter IPs are heavily flagged by YouTube.
+# Strategy (in order):
+#   1. android_testsuite — no sig-check, usually works without cookies
+#   2. tv_embedded       — embedded TV player, no JS challenge
+#   3. web + po_token    — web client WITH proof-of-origin token (bypasses bot-check)
+#   4. ios               — Apple client, separate sig path
+#   5. android_creator   — Studio client
 #
-# Best clients for datacenter/server IPs (no real browser session):
-#   1. android_testsuite  – Google's own test client; skips sig checks entirely
-#   2. android_creator    – YouTube Studio app client; very rarely bot-blocked
-#   3. tv_embedded        – Smart TV embedded player; no JS challenge
-#   4. ios               – Apple client; different sig path than web
-#   5. web_creator        – YouTube Studio web; last resort
-#
-# "web" and "android" (plain) are intentionally placed last because they are
-# the most heavily bot-checked on cloud/datacenter IPs.
 PLAYER_CLIENT_FALLBACKS = [
-    ["android_testsuite"],           # most reliable: test client, no sig verification
-    ["android_creator", "ios"],      # Studio clients, rarely bot-checked
-    ["tv_embedded"],                 # TV embedded player, no JS challenge
-    ["ios"],                         # Apple client only
-    ["web_creator"],                 # YouTube Studio web
-    ["web_embedded"],                # embedded iframe client
-    ["android", "ios"],              # standard clients as last resort
+    ["android_testsuite"],
+    ["tv_embedded"],
+    ["web"],           # used WITH po_token injected by _build_ydl_opts_base
+    ["ios"],
+    ["android_creator"],
+    ["mweb"],
 ]
+
+# ---------------------------------------------------------------------------
+# po_token / visitor_data  —  Proof-of-Origin token cache
+#
+# YouTube requires a BotGuard-issued po_token for web/mweb clients on
+# server IPs. We fetch it once from the public bgutils API and cache it
+# for POTOK_TTL seconds.  If the fetch fails we fall back to no token
+# (other clients will still be tried).
+# ---------------------------------------------------------------------------
+_POT_CACHE: dict = {}           # {"visitor_data": str, "po_token": str, "ts": float}
+_POT_TTL   = 21600              # 6 hours — tokens stay valid roughly this long
+_POT_LOCK: asyncio.Lock | None = None  # created lazily inside the running event loop
+
+
+def _get_pot_lock() -> asyncio.Lock:
+    global _POT_LOCK
+    if _POT_LOCK is None:
+        _POT_LOCK = asyncio.Lock()
+    return _POT_LOCK
+
+# Public bgutils worker endpoint (no key required, rate-limit is generous)
+_BGUTILS_URL = "https://bgutils.kz/token"   # community-run, reliable
+
+
+async def _fetch_po_token() -> tuple[str, str] | tuple[None, None]:
+    """Fetch a fresh (visitor_data, po_token) pair from the bgutils API.
+
+    Returns (visitor_data, po_token) on success, (None, None) on failure.
+    The tokens are required for yt-dlp web/mweb clients on datacenter IPs.
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(_BGUTILS_URL) as resp:
+                if resp.status != 200:
+                    log.warning("bgutils returned HTTP %d", resp.status)
+                    return None, None
+                data = await resp.json(content_type=None)
+                vd  = data.get("visitorData") or data.get("visitor_data")
+                pot = data.get("poToken")     or data.get("po_token")
+                if vd and pot:
+                    log.info("po_token refreshed from bgutils (visitor_data=%s…)", vd[:12])
+                    return vd, pot
+                log.warning("bgutils response missing fields: %s", list(data.keys()))
+                return None, None
+    except Exception as exc:
+        log.warning("po_token fetch failed: %s", exc)
+        return None, None
+
+
+async def get_po_token() -> tuple[str, str] | tuple[None, None]:
+    """Return cached (visitor_data, po_token), refreshing if stale."""
+    async with _get_pot_lock():
+        now = time.time()
+        if _POT_CACHE and now - _POT_CACHE.get("ts", 0) < _POT_TTL:
+            return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
+        vd, pot = await _fetch_po_token()
+        if vd and pot:
+            _POT_CACHE.update({"visitor_data": vd, "po_token": pot, "ts": now})
+            return vd, pot
+        return None, None
+
+
+def get_po_token_sync() -> tuple[str, str] | tuple[None, None]:
+    """Sync wrapper — reads cache only (no network call).
+
+    The sync download functions (run_in_executor) call this; the async
+    refresh is done by the handler before spawning the executor task.
+    """
+    if _POT_CACHE and time.time() - _POT_CACHE.get("ts", 0) < _POT_TTL:
+        return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
+    return None, None
 
 
 def _is_bot_check_error(exc: Exception) -> bool:
-    """Detect YouTube bot-check / auth errors returned by InnerTube or yt-dlp."""
+    """Detect YouTube bot-check / auth errors that are worth retrying with
+    a different InnerTube client or po_token."""
     msg = str(exc).lower()
     return any(
         phrase in msg for phrase in (
             "sign in to confirm",
             "not a bot",
-            "cookies",                     # "use --cookies-from-browser"
-            "http error 429",              # Too Many Requests
+            "cookies",                      # "use --cookies-from-browser"
+            "http error 429",               # Too Many Requests
             "too many requests",
-            "this video is not available", # sometimes a masked bot-check
-            "preconditionfailed",          # InnerTube 412 - client context rejected
+            "preconditionfailed",           # InnerTube 412 - client context rejected
             "vpn or proxy",
+            "error code: 152",              # InnerTube: content not available for this client
+            "this video is unavailable",    # masked bot-check on restricted IPs
+            "video unavailable",
         )
     )
 
@@ -1154,25 +1230,30 @@ def _raise_ytdlp_failure(last_exc: Exception | None):
 def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
     """Shared yt-dlp options used across all download functions.
 
-    Uses InnerTube-specific extractor_args so yt-dlp picks the right
-    client context when talking to YouTube's internal API:
-      - player_client   : which InnerTube client identity to use
-      - skip_webpage    : skip loading the watch page (avoids JS bot-check)
-      - player_skip     : skip fetching the JS player (faster, avoids sig checks)
+    Automatically injects po_token + visitor_data for web/mweb clients so
+    YouTube's BotGuard accepts requests from datacenter (Railway) IPs.
     """
-    # Clients that don't need the JS player signature at all - skip it for speed
-    # and to avoid triggering bot-checks on the player endpoint.
-    _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded", "web_embedded"}
+    # Clients that supply pre-signed URLs — no JS player needed
+    _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded"}
     needs_player = not all(c in _no_sig_clients for c in player_clients)
+
+    # po_token is only meaningful for web / mweb clients
+    _web_clients = {"web", "mweb", "web_creator", "web_embedded"}
+    needs_pot = any(c in _web_clients for c in player_clients)
 
     extractor_args: dict = {
         "player_client": player_clients,
-        # Skip loading the HTML watch page - talk directly to InnerTube API
         "skip_webpage": ["1"],
     }
     if not needs_player:
-        # These clients use pre-signed URLs - no need to fetch+parse the JS player
         extractor_args["player_skip"] = ["webpage", "configs", "js"]
+
+    if needs_pot:
+        visitor_data, po_token = get_po_token_sync()
+        if visitor_data and po_token:
+            extractor_args["visitor_data"] = [visitor_data]
+            extractor_args["po_token"]     = [po_token]
+            log.debug("Injecting po_token for client %s", player_clients)
 
     opts: dict = {
         "quiet": True,
@@ -1227,7 +1308,9 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
-    use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
+    use_proxy = platform != "tiktok"
+    # Pre-warm the po_token cache so the sync executor can read it without await
+    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
@@ -1267,6 +1350,7 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
+    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
 
 
@@ -1326,6 +1410,7 @@ def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
 
 async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
     loop = asyncio.get_running_loop()
+    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_text_search, query, limit)
 
 
@@ -1352,6 +1437,7 @@ def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
 
 async def download_song_by_url(url: str, outdir: str) -> str:
     loop = asyncio.get_running_loop()
+    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
 
 
