@@ -1,5 +1,3 @@
-[file name]: main (14).py
-[file content begin]
 import asyncio
 import base64
 import json
@@ -1449,4 +1447,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-[file content end]
