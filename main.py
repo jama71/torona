@@ -862,7 +862,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "best[ext=mp4]/best",
+        "format": "best",
         "http_headers": {"User-Agent": DEFAULT_UA},
         "geo_bypass": True,
         "retries": 3,
