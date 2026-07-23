@@ -42,7 +42,7 @@ except ImportError:
     Shazam = None
 
 # ------------------------------------------------------------
-# ffmpeg setup
+# ffmpeg sozlamasi
 # ------------------------------------------------------------
 try:
     import imageio_ffmpeg
@@ -65,7 +65,6 @@ except Exception as e:
 
 try:
     from pydub import AudioSegment
-
     AudioSegment.converter = FFMPEG_PATH
 except Exception:
     pass
@@ -79,109 +78,6 @@ ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
-
-
-def _repair_cookie_line(line: str) -> str:
-    if line.startswith("#") or not line.strip():
-        return line
-    if line.count("\t") == 6:
-        return line
-    parts = line.split()
-    if len(parts) == 7:
-        return "\t".join(parts)
-    return line
-
-
-def _normalize_cookies_content(content: str) -> str:
-    return "\n".join(_repair_cookie_line(l) for l in content.splitlines()) + "\n"
-
-
-def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
-    data_lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
-    valid = [l for l in data_lines if l.count("\t") == 6]
-    return len(valid), len(data_lines)
-
-
-DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-# This is a generated file! Do not edit.
-
-.youtube.com\tTRUE\t/\tTRUE\t1819078132\tLOGIN_INFO\tAFmmF2swRQIhAPTjGCIxT8jRFvu-UolA342zLgu4Wa_2Zg92vp9En0f1AiAaa9qyD5ILBnLeo6OgnSGLGVRv0IKnIfpUwAlAiijq4A:QUQ3MjNmd05EeHR1Vl9DVlpmcXZpZ1dGRjRVdXdGWHlBNHdDc2Y4TnJsNkNfRmZ1Uk5IOUV2S0N0V1Y0dmZRdVgxWXpXcURnbE1Oa2VhX2JReEdWMVU4WU9kVWVmYTFPV1NOeHlocnlpV0lUQk5idzRWN2o2SWY5SWlWUlhxVkUwMWpCOHdOdXFudmxmWGdWejlTdjZUUGpQWWVfbGs0NWhB
-.youtube.com\tTRUE\t/\tTRUE\t1819369279\tPREF\tf4=4000000&f6=40000000&tz=Europe.Moscow&f5=30000&f7=100
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kpU9dZecQsB5RRO-E-fmk8QACgYKAYASARESFQHGX2Mi0g05dheS9FYBwFBrRZLvOBoVAUF8yKrYZ_w8cDPohd7oXUydNbfv0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kTUFP5u_URqr4RLf1RAc7qQACgYKAUgSARESFQHGX2MiClb-98xP_LHUjxzJnfOixRoVAUF8yKrxoHf6nlzwh5I3ZjzNT_R-0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91ksdQIslqIrxmyjfnwdSbKAwACgYKAXQSARESFQHGX2MijIy-KUAzMVhqjzBcy9BwzBoVAUF8yKpvZm8xRlFViIpBH21_SFv40076
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tHSID\tA5iCJpeoCJ2ie9azx
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSSID\tAE0d43TagniTeg68R
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tAPISID\tYj70mCU8-qbvexyA/Awam3JMJ3Wgp0rLds
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-1PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-3PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tFALSE\t1816345290\tSIDCC\tAKEyXzUolKajdTygx5UzGp4pGXctqE_D9byXYjYtllffuKdSe1NjaOizavFKxDszrKeUalQ1
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-1PSIDCC\tAKEyXzUI5fQyhfizthBUPsnSn37I3QIDpTVoXYPrT59pGCakSeV7355d1YGYXUCniqL4BzJg5A
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-3PSIDCC\tAKEyXzXRFdHWQLJ_kGcioFq7UkJSxCn8WVilfs_pqw0JdI8f3zvOJkGg2cRqTePiEx1_xKeEpQ
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_INFO1_LIVE\twgdW23KNv4Y
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_PRIVACY_METADATA\tCgJVWhIEGgAgUg%3D%3D
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-YNID\t20.YT=oKxGC8RBOKMAfttV5lr5ZRDRLG_iIJ7ZRTrVPvNR9fsfB46IlZdCHNK2hg7VEtCDypQ7szpq8_BGj_cSSQ-h9b-eY4o6N-NN1J6jO0xdIpIUoS8fUzauxWqJ50qCTG9Gd8qCYpJ8b5Bwrk2tgCQ2vvjVpTXOjm-lbYyk1yNyxCKcs08Iu_ustbrx2gEV4aTGMPCh4cIB8Pm6PrsuTl6jbT_10zse0cF83aerHzi-TNtGEl2ZRfrr78tLkJhALIFBR9ENFyoDpPzlfvb4BUKbeqvTi15fo2Sbf2nlYow_7lUCKg0IjyvmpDxa_6zrlW5p4Qxf7Kkp-H0V_2QHwENS0A
-.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tGZn2TispEpo
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-ROLLOUT_TOKEN\tCPrC1NDb5MzydhDs2-2IqOCVAxjL36TiyeiVAw%3D%3D
-"""
-
-
-def _write_cookies_file(content: str) -> str:
-    cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(cookies_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return cookies_path
-
-
-def _try_load_cookie_candidate(source: str, content: str, logger) -> str | None:
-    content = _normalize_cookies_content(content)
-    valid, total = _count_valid_cookie_lines(content)
-    if total == 0 or valid == 0:
-        return None
-    path = _write_cookies_file(content)
-    return path
-
-
-def _setup_youtube_cookies() -> str | None:
-    logger = logging.getLogger("bot")
-    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
-    path_env = os.getenv("COOKIES_FILE", "").strip()
-
-    if b64:
-        cleaned = "".join(b64.split())
-        padding = len(cleaned) % 4
-        if padding:
-            cleaned += "=" * (4 - padding)
-        try:
-            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
-            if result:
-                return result
-        except Exception:
-            pass
-
-    if raw:
-        result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
-        if result:
-            return result
-
-    if path_env and os.path.exists(path_env):
-        return path_env
-
-    return _try_load_cookie_candidate("default", DEFAULT_YOUTUBE_COOKIES, logger)
-
-
-COOKIES_FILE = _setup_youtube_cookies()
-
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
 CACHE_TTL_SECONDS = 300
@@ -207,166 +103,217 @@ SEARCH_CACHE_TTL_SECONDS = 600
 BOT_DISPLAY_NAME = "Bot"
 pool: asyncpg.Pool | None = None
 
-
 # ============================================================
-# TRANSLATIONS (Minimalistik o'zgargan matnlar)
+# TRANSLATIONS
 # ============================================================
 TEXTS = {
     "uz": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": "Texnik ishlar tugadi, /start ni bosing.",
-        "send_link": "🔗 Havola yuboring.",
-        "downloading": "⏳",
-        "caption": "✅ @{bot_username}",
-        "detect_music_btn": "🎵 Musiqa",
-        "recognizing": "🎧...",
-        "not_recognized": "😔 Musiqa topilmadi.",
-        "found_song": "🎶 {title} — {artist}",
+        "welcome": (
+            "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
+            "Menga Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini "
+            "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
+            "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
+        ),
+        "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "downloading": "⏳ Yuklanmoqda, biroz kuting...",
+        "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
+        "detect_music_btn": "🎵 Musiqani aniqlash",
+        "recognizing": "🎧 Musiqa aniqlanmoqda...",
+        "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
+        "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 YouTube",
-        "lyrics_notice": "📜 Lyrics:",
-        "tiktok_unavailable": "⚠️ TikTok ishlamayapti.",
-        "unsupported_link": "❌ Yaroqsiz havola.",
-        "error": "❌ Xatolik.",
-        "no_link": "❗️ Havola yuboring.",
-        "admin_only": "⛔ Admin uchun.",
+        "btn_youtube_link": "🔍 Manbani ochish",
+        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
+        "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
+        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
+        "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
+        "no_link": "❗️ Iltimos, media havolasini yuboring.",
+        "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
         "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Foydalanuvchilar: {count}",
-        "broadcast_ask": "✍️ Xabar matnini yuboring:",
-        "broadcast_done": "✅ Yuborildi: {count}",
-        "file_expired": "⏱ Vaqt tugadi.",
-        "lang_set": "✅ O'zbekcha",
-        "searching": "🔍...",
-        "search_no_results": "😔 Topilmadi.",
-        "search_results_range": "{start}-{end} / {total}",
-        "help": "ℹ️ Havola yuboring yoki qo'shiq nomini yozing.",
+        "stats": "📊 Statistika:\n\n👤 Jami foydalanuvchilar: {count}",
+        "broadcast_ask": "✍️ Yuboriladigan xabar matnini yuboring:",
+        "broadcast_done": "✅ Xabar {count} ta foydalanuvchiga yuborildi.",
+        "file_expired": "⏱ Vaqt tugadi, iltimos havolani qayta yuboring.",
+        "lang_set": "✅ Til o'zbekcha etib o'rnatildi.",
+        "searching": "🔍 Qidirilmoqda...",
+        "search_no_results": "😔 Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.",
+        "search_results_range": "Natijalar {start}-{end} / {total}",
+        "help": (
+            "ℹ️ <b>Yordam</b>\n\n"
+            "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
+            "2) Bot mediani yuklab beradi.\n"
+            "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
+            "MP3 shaklida yuboradi.\n"
+            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot qidirib, "
+            "ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
+            "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
+        ),
         "btn_lang": "🌐 Til",
         "btn_help": "❓ Yordam",
-        "btn_admin": "🛠 Admin",
+        "btn_admin": "🛠 Admin panel",
         "btn_back": "⬅️ Orqaga",
-        "btn_stats": "📊 Stats",
-        "btn_broadcast": "📢 Broadcast",
-        "btn_add_channel": "➕ Kanal qo'shish",
-        "btn_list_channels": "📋 Kanallar",
-        "ask_channel": "📎 Forward xabar yoki username/ID yuboring:",
-        "channel_added": "✅ Qo'shildi: {title}",
-        "channel_add_fail_not_admin": "❌ Botni admin qiling.",
-        "channel_add_fail": "❌ Aniqlanmadi.",
-        "channel_list_empty": "📭 Kanallar yo'q.",
-        "channel_list_title": "📋 Kanallar:",
-        "channel_removed": "🗑 O'chirildi.",
-        "subscribe_required": "⚠️ Kanallarga a'zo bo'ling:",
+        "btn_stats": "📊 Statistika",
+        "btn_broadcast": "📢 Xabar yuborish",
+        "btn_add_channel": "➕ Majburiy obuna qo'shish",
+        "btn_list_channels": "📋 Majburiy obunalar",
+        "ask_channel": (
+            "📎 Kanal/gurux qo'shish uchun:\n\n"
+            "1) Botni o'sha kanal/guruhga <b>administrator</b> qilib qo'ying.\n"
+            "2) Shu yerga o'sha kanal/guruhdagi istalgan xabarni forward qiling, "
+            "yoki uning @username'ini, yoki chat_id sini yuboring."
+        ),
+        "channel_added": "✅ \"{title}\" majburiy obunalar ro'yxatiga qo'shildi.",
+        "channel_add_fail_not_admin": "❌ Botni avval o'sha kanal/guruhga administrator qiling, keyin qaytadan urinib ko'ring.",
+        "channel_add_fail": "❌ Kanal/guruhni aniqlab bo'lmadi. Forward yoki @username/ID yuboring.",
+        "channel_list_empty": "📭 Hozircha majburiy obunalar yo'q.",
+        "channel_list_title": "📋 Majburiy obunalar ro'yxati:",
+        "channel_removed": "🗑 Kanal ro'yxatdan olib tashlandi.",
+        "subscribe_required": "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga a'zo bo'ling:",
         "check_sub_btn": "✅ Tekshirish",
-        "still_not_subscribed": "❌ A'zo bo'lmadingiz.",
-        "now_subscribed": "✅ Rahmat!",
-        "channel_type_public": "Ochiq",
+        "still_not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz.",
+        "now_subscribed": "✅ Rahmat! Endi botdan foydalanishingiz mumkin, havolani yuboring.",
+        "channel_type_public": "ochiq kanal/gurux",
         "channel_subs_label": "{count} a'zo",
-        "channel_type_private": "Yopiq",
+        "channel_type_private": "yopiq kanal/gurux",
     },
     "ru": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": "Технические работы завершены, нажмите /start.",
-        "send_link": "🔗 Отправьте ссылку.",
-        "downloading": "⏳",
-        "caption": "✅ @{bot_username}",
-        "detect_music_btn": "🎵 Музыка",
-        "recognizing": "🎧...",
-        "not_recognized": "😔 Музыка не найдена.",
-        "found_song": "🎶 {title} — {artist}",
+        "welcome": (
+            "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
+            "Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat — "
+            "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
+        ),
+        "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "downloading": "⏳ Загружается, подождите...",
+        "caption": "✅ Спасибо, что пользуетесь ботом!",
+        "detect_music_btn": "🎵 Распознать музыку",
+        "recognizing": "🎧 Распознаём музыку...",
+        "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
+        "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
         "song_caption": "🎵 {title} — {artist}",
-        "btn_lyrics": "📜 Текст",
-        "btn_youtube_link": "🔍 YouTube",
-        "lyrics_notice": "📜 Текст:",
-        "tiktok_unavailable": "⚠️ TikTok недоступен.",
-        "unsupported_link": "❌ Неподдерживаемая ссылка.",
-        "error": "❌ Ошибка.",
-        "no_link": "❗️ Отправьте ссылку.",
-        "admin_only": "⛔ Только для админов.",
+        "btn_lyrics": "📜 Текст песни",
+        "btn_youtube_link": "🔍 Открыть источник",
+        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
+        "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
+        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
+        "error": "❌ Произошла ошибка, попробуйте ещё раз.",
+        "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
+        "admin_only": "⛔ Эта команда только для администраторов.",
         "admin_panel": "🛠 Админ-панель",
-        "stats": "📊 Пользователей: {count}",
-        "broadcast_ask": "✍️ Отправьте текст:",
-        "broadcast_done": "✅ Отправлено: {count}",
-        "file_expired": "⏱ Время истекло.",
-        "lang_set": "✅ Русский",
-        "searching": "🔍...",
-        "search_no_results": "😔 Ничего не найдено.",
-        "search_results_range": "{start}-{end} / {total}",
-        "help": "ℹ️ Отправьте ссылку или название песни.",
+        "stats": "📊 Статистика:\n\n👤 Всего пользователей: {count}",
+        "broadcast_ask": "✍️ Отправьте текст рассылки:",
+        "broadcast_done": "✅ Сообщение отправлено {count} пользователям.",
+        "file_expired": "⏱ Время истекло, отправьте ссылку заново.",
+        "lang_set": "✅ Язык установлен: русский.",
+        "searching": "🔍 Ищем...",
+        "search_no_results": "😔 Ничего не найдено. Попробуйте другой запрос.",
+        "search_results_range": "Результаты {start}-{end} / {total}",
+        "help": (
+            "ℹ️ <b>Помощь</b>\n\n"
+            "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
+            "2) Бот скачает медиа.\n"
+            "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
+            "4) Или просто напишите название песни/исполнителя — бот найдёт трек "
+            "и пришлёт его в MP3.\n\n"
+            "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
+        ),
         "btn_lang": "🌐 Язык",
         "btn_help": "❓ Помощь",
-        "btn_admin": "🛠 Админ",
+        "btn_admin": "🛠 Админ-панель",
         "btn_back": "⬅️ Назад",
-        "btn_stats": "📊 Стат",
+        "btn_stats": "📊 Статистика",
         "btn_broadcast": "📢 Рассылка",
-        "btn_add_channel": "➕ Добавить канал",
-        "btn_list_channels": "📋 Каналы",
-        "ask_channel": "📎 Перешлите сообщение или отправьте username/ID:",
-        "channel_added": "✅ Добавлено: {title}",
-        "channel_add_fail_not_admin": "❌ Сделайте бота админом.",
-        "channel_add_fail": "❌ Не удалось определить.",
-        "channel_list_empty": "📭 Каналов нет.",
-        "channel_list_title": "📋 Каналы:",
-        "channel_removed": "🗑 Удалено.",
-        "subscribe_required": "⚠️ Подпишитесь на каналы:",
+        "btn_add_channel": "➕ Добавить обяз. подписку",
+        "btn_list_channels": "📋 Список подписок",
+        "ask_channel": (
+            "📎 Чтобы добавить канал/группу:\n\n"
+            "1) Сделайте бота <b>администратором</b> в этом канале/группе.\n"
+            "2) Перешлите сюда любое сообщение из него, либо отправьте его @username "
+            "или chat_id."
+        ),
+        "channel_added": "✅ \"{title}\" добавлен в обязательные подписки.",
+        "channel_add_fail_not_admin": "❌ Сначала сделайте бота администратором канала/группы, затем попробуйте снова.",
+        "channel_add_fail": "❌ Не удалось определить канал/группу. Перешлите сообщение или отправьте @username/ID.",
+        "channel_list_empty": "📭 Обязательных подписок пока нет.",
+        "channel_list_title": "📋 Список обязательных подписок:",
+        "channel_removed": "🗑 Канал удалён из списка.",
+        "subscribe_required": "⚠️ Чтобы пользоваться ботом, подпишитесь на следующие канал(ы):",
         "check_sub_btn": "✅ Проверить",
-        "still_not_subscribed": "❌ Вы не подписались.",
-        "now_subscribed": "✅ Спасибо!",
-        "channel_type_public": "Открытый",
-        "channel_subs_label": "{count} subs",
-        "channel_type_private": "Закрытый",
+        "still_not_subscribed": "❌ Вы ещё не подписаны на все каналы.",
+        "now_subscribed": "✅ Спасибо! Теперь вы можете пользоваться ботом, отправьте ссылку.",
+        "channel_type_public": "открытый канал/группа",
+        "channel_subs_label": "{count} подписчиков",
+        "channel_type_private": "закрытый канал/группа",
     },
     "en": {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
-        "welcome": "Technical work is complete, press /start.",
-        "send_link": "🔗 Send a link.",
-        "downloading": "⏳",
-        "caption": "✅ @{bot_username}",
-        "detect_music_btn": "🎵 Music",
-        "recognizing": "🎧...",
-        "not_recognized": "😔 Music not found.",
-        "found_song": "🎶 {title} — {artist}",
+        "welcome": (
+            "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
+            "Send me a link from Instagram, YouTube, TikTok, Pinterest or Snapchat — "
+            "I'll download the media for you. Use the button under the video to recognize "
+            "the music in it and get it as an MP3 🎵"
+        ),
+        "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "downloading": "⏳ Downloading, please wait...",
+        "caption": "✅ Thanks for using our bot!",
+        "detect_music_btn": "🎵 Recognize music",
+        "recognizing": "🎧 Recognizing the music...",
+        "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
+        "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 YouTube",
-        "lyrics_notice": "📜 Lyrics:",
-        "tiktok_unavailable": "⚠️ TikTok unavailable.",
-        "unsupported_link": "❌ Unsupported link.",
-        "error": "❌ Error.",
-        "no_link": "❗️ Send a link.",
-        "admin_only": "⛔ Admin only.",
+        "btn_youtube_link": "🔍 Open Source",
+        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
+        "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
+        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
+        "error": "❌ Something went wrong, please try again.",
+        "no_link": "❗️ Please send a media link.",
+        "admin_only": "⛔ This command is for admins only.",
         "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Users: {count}",
-        "broadcast_ask": "✍️ Send text:",
-        "broadcast_done": "✅ Sent: {count}",
-        "file_expired": "⏱ Expired.",
-        "lang_set": "✅ English",
-        "searching": "🔍...",
-        "search_no_results": "😔 Not found.",
-        "search_results_range": "{start}-{end} / {total}",
-        "help": "ℹ️ Send link or song title.",
+        "stats": "📊 Stats:\n\n👤 Total users: {count}",
+        "broadcast_ask": "✍️ Send the broadcast text:",
+        "broadcast_done": "✅ Message sent to {count} users.",
+        "file_expired": "⏱ Session expired, please send the link again.",
+        "lang_set": "✅ Language set to English.",
+        "searching": "🔍 Searching...",
+        "search_no_results": "😔 Nothing found. Try a different search term.",
+        "search_results_range": "Results {start}-{end} / {total}",
+        "help": (
+            "ℹ️ <b>Help</b>\n\n"
+            "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
+            "2) The bot downloads the media.\n"
+            "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
+            "4) Or just type a song/artist name — the bot will search and send the "
+            "track you pick as MP3.\n\n"
+            "To change language, use the \"🌐 Language\" button below."
+        ),
         "btn_lang": "🌐 Language",
         "btn_help": "❓ Help",
-        "btn_admin": "🛠 Admin",
+        "btn_admin": "🛠 Admin panel",
         "btn_back": "⬅️ Back",
         "btn_stats": "📊 Stats",
         "btn_broadcast": "📢 Broadcast",
-        "btn_add_channel": "➕ Add channel",
-        "btn_list_channels": "📋 Channels",
-        "ask_channel": "📎 Forward message or send username/ID:",
-        "channel_added": "✅ Added: {title}",
-        "channel_add_fail_not_admin": "❌ Make bot an admin.",
-        "channel_add_fail": "❌ Couldn't detect.",
-        "channel_list_empty": "📭 No channels.",
-        "channel_list_title": "📋 Channels:",
-        "channel_removed": "🗑 Removed.",
-        "subscribe_required": "⚠️ Subscribe to channels:",
+        "btn_add_channel": "➕ Add mandatory sub",
+        "btn_list_channels": "📋 Mandatory subs",
+        "ask_channel": (
+            "📎 To add a channel/group:\n\n"
+            "1) Make the bot an <b>administrator</b> there.\n"
+            "2) Forward any message from it here, or send its @username or chat_id."
+        ),
+        "channel_added": "✅ \"{title}\" added to mandatory subscriptions.",
+        "channel_add_fail_not_admin": "❌ Make the bot an administrator of that channel/group first, then try again.",
+        "channel_list_empty": "📭 No mandatory subscriptions yet.",
+        "channel_list_title": "📋 Mandatory subscriptions:",
+        "channel_removed": "🗑 Channel removed from the list.",
+        "subscribe_required": "⚠️ To use the bot, please subscribe to the following channel(s):",
         "check_sub_btn": "✅ Check",
-        "still_not_subscribed": "❌ Not subscribed.",
-        "now_subscribed": "✅ Thanks!",
-        "channel_type_public": "Public",
+        "still_not_subscribed": "❌ You haven't subscribed to all channels yet.",
+        "now_subscribed": "✅ Thanks! You can use the bot now, send a link.",
+        "channel_type_public": "public channel/group",
         "channel_subs_label": "{count} subs",
-        "channel_type_private": "Private",
+        "channel_type_private": "private channel/group",
     },
 }
 
@@ -378,7 +325,7 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 
 # ============================================================
-# DATABASE
+# DATABASE (PostgreSQL via asyncpg)
 # ============================================================
 async def init_db():
     global pool
@@ -557,12 +504,12 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     )
 
 
-def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
+def song_result_kb(lang: str, title: str, artist: str, source_url: str | None) -> InlineKeyboardMarkup:
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
     rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
-    if youtube_url:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=youtube_url)])
+    if source_url:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=source_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -601,6 +548,7 @@ def is_admin(user_id: int) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await add_user_if_missing(message.from_user.id)
+    await message.answer(f"<b>{BOT_DISPLAY_NAME}</b>")
     await message.answer(t("uz", "choose_lang"), reply_markup=lang_inline_kb())
 
 
@@ -609,9 +557,7 @@ async def cb_lang(call: CallbackQuery):
     lang = call.data.split(":", 1)[1]
     await set_lang(call.from_user.id, lang)
     await call.message.edit_text(t(lang, "lang_set"))
-    me = await bot.get_me()
-    bot_username = me.username or "bot"
-    await call.message.answer(t(lang, "welcome", bot_name=BOT_DISPLAY_NAME, bot_username=bot_username))
+    await call.message.answer(t(lang, "welcome", bot_name=BOT_DISPLAY_NAME))
     await call.message.answer(
         t(lang, "send_link"),
         reply_markup=user_reply_kb(lang, is_admin(call.from_user.id)),
@@ -620,7 +566,7 @@ async def cb_lang(call: CallbackQuery):
 
 
 # ============================================================
-# HANDLERS: persistent reply-keyboard buttons
+# HANDLERS: persistent reply-keyboard buttons (user side)
 # ============================================================
 @router.message(F.text.in_({v["btn_lang"] for v in TEXTS.values()}))
 async def btn_change_lang(message: Message):
@@ -816,9 +762,6 @@ async def cb_delete_channel(call: CallbackQuery):
     await call.answer(t(lang, "channel_removed"))
 
 
-# ============================================================
-# HANDLER: join requests & chat_member updates
-# ============================================================
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
@@ -886,7 +829,7 @@ async def cb_check_sub(call: CallbackQuery):
 
 
 # ============================================================
-# DOWNLOAD HELPERS
+# DOWNLOAD HELPERS & AUDIO SEARCH (VK Music -> Yandex Music)
 # ============================================================
 def detect_platform(url: str) -> str | None:
     for name, pattern in PLATFORM_PATTERNS.items():
@@ -895,201 +838,134 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-PLAYER_CLIENT_FALLBACKS = [
-    ["android_testsuite"],
-    ["tv_embedded"],
-    ["web"],
-    ["ios"],
-    ["android_creator"],
-    ["mweb"],
-]
-
-_POT_CACHE: dict = {}
-_POT_TTL = 21600
-_POT_LOCK: asyncio.Lock | None = None
-
-
-def _get_pot_lock() -> asyncio.Lock:
-    global _POT_LOCK
-    if _POT_LOCK is None:
-        _POT_LOCK = asyncio.Lock()
-    return _POT_LOCK
-
-
-_BGUTILS_URL = "https://bgutils.kz/token"
-
-
-async def _fetch_po_token() -> tuple[str, str] | tuple[None, None]:
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(_BGUTILS_URL) as resp:
-                if resp.status != 200:
-                    return None, None
-                data = await resp.json(content_type=None)
-                vd = data.get("visitorData") or data.get("visitor_data")
-                pot = data.get("poToken") or data.get("po_token")
-                if vd and pot:
-                    return vd, pot
-                return None, None
-    except Exception:
-        return None, None
-
-
-async def get_po_token() -> tuple[str, str] | tuple[None, None]:
-    async with _get_pot_lock():
-        now = time.time()
-        if _POT_CACHE and now - _POT_CACHE.get("ts", 0) < _POT_TTL:
-            return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
-        vd, pot = await _fetch_po_token()
-        if vd and pot:
-            _POT_CACHE.update({"visitor_data": vd, "po_token": pot, "ts": now})
-            return vd, pot
-        return None, None
-
-
-def get_po_token_sync() -> tuple[str, str] | tuple[None, None]:
-    if _POT_CACHE and time.time() - _POT_CACHE.get("ts", 0) < _POT_TTL:
-        return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
-    return None, None
-
-
-def _is_bot_check_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(
-        phrase in msg for phrase in (
-            "sign in to confirm",
-            "not a bot",
-            "cookies",
-            "http error 429",
-            "too many requests",
-            "preconditionfailed",
-            "vpn or proxy",
-            "error code: 152",
-            "this video is unavailable",
-            "video unavailable",
-        )
-    )
-
-
-_cookie_hint_logged = False
-
-
-def _raise_ytdlp_failure(last_exc: Exception | None):
-    global _cookie_hint_logged
-    if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
-        _cookie_hint_logged = True
-    if last_exc is None:
-        raise RuntimeError("yt-dlp error")
-    raise last_exc
-
-
-def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
-    _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded"}
-    needs_player = not all(c in _no_sig_clients for c in player_clients)
-
-    _web_clients = {"web", "mweb", "web_creator", "web_embedded"}
-    needs_pot = any(c in _web_clients for c in player_clients)
-
-    extractor_args: dict = {
-        "player_client": player_clients,
-        "skip_webpage": ["1"],
-    }
-    if not needs_player:
-        extractor_args["player_skip"] = ["webpage", "configs", "js"]
-
-    if needs_pot:
-        visitor_data, po_token = get_po_token_sync()
-        if visitor_data and po_token:
-            extractor_args["visitor_data"] = [visitor_data]
-            extractor_args["po_token"] = [po_token]
-
-    opts: dict = {
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
+    ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {"youtube": extractor_args},
-        "http_headers": {"User-Agent": DEFAULT_UA},
-        "geo_bypass": True,
-        "retries": 3,
-        "sleep_interval": 1,
-        "max_sleep_interval": 3,
-        "socket_timeout": 30,
+        "format": "best[ext=mp4]/best",
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
     }
-    if outdir:
-        opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-    return opts
-
-
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
-    last_exc = None
-    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "best[ext=mp4]/best"
-        if use_proxy and GENERAL_PROXY:
-            ydl_opts["proxy"] = GENERAL_PROXY
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if "entries" in info:
-                    info = info["entries"][0]
-                filename = ydl.prepare_filename(info)
-                return filename, info
-        except Exception as e:
-            last_exc = e
-            if "youtube" not in url and "youtu.be" not in url:
-                raise
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
+        filename = ydl.prepare_filename(info)
+        return filename, info
 
 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"
-    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
-def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]:
-    last_exc = None
-    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
+# ------------------------------------------------------------
+# MUSIC SEARCH ENGINE: VK Music -> Fallback: Yandex Music
+# ------------------------------------------------------------
+def _search_audio_provider(query: str, limit: int = 40) -> list[dict]:
+    """
+    VKontakte orqali qidiradi. Agarda natija bo'lmasa Yandex Music'dan qidiradi.
+    YouTube so'rovlariga umuman bog'liq emas.
+    """
+    providers = [
+        ("vksearch", "VK Music"),
+        ("ymsearch", "Yandex Music")
+    ]
+    
+    for prefix, provider_name in providers:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "ffmpeg_location": FFMPEG_PATH,
+        }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+                info = ydl.extract_info(f"{prefix}{limit}:{query}", download=False)
+                entries = [e for e in (info.get("entries") or []) if e]
+                if entries:
+                    results = []
+                    for e in entries:
+                        vid = e.get("id")
+                        results.append(
+                            {
+                                "id": vid,
+                                "title": e.get("title") or "Unknown",
+                                "uploader": e.get("uploader") or e.get("artist") or e.get("channel") or provider_name,
+                                "duration": e.get("duration"),
+                                "view_count": e.get("view_count") or 0,
+                                "url": e.get("webpage_url") or e.get("url") or f"https://vk.com/audio",
+                            }
+                        )
+                    return results
+        except Exception as e:
+            log.warning("%s qidiruvi o'xshamadi: %s", provider_name, e)
+            continue
+            
+    return []
+
+
+async def text_search_audio(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _search_audio_provider, query, limit)
+
+
+def _download_audio_from_url(url_or_query: str, outdir: str) -> tuple[str, str]:
+    """
+    URL yoki qidiruv matni bo'yicha audio faylni yuklab oladi (VK -> Yandex Music).
+    """
+    providers = [url_or_query] if url_or_query.startswith("http") else [f"vksearch1:{url_or_query}", f"ymsearch1:{url_or_query}"]
+    
+    last_exc = None
+    for target in providers:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+            "ffmpeg_location": FFMPEG_PATH,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            ],
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target, download=True)
                 if not info:
-                    raise RuntimeError("No info")
+                    continue
                 if "entries" in info:
                     entries = [e for e in (info.get("entries") or []) if e]
                     if not entries:
-                        raise RuntimeError("Empty entries")
+                        continue
                     info = entries[0]
                 filename = ydl.prepare_filename(info)
-                video_id = info.get("id")
-                video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
-                return os.path.splitext(filename)[0] + ".mp3", video_url
+                mp3_file = os.path.splitext(filename)[0] + ".mp3"
+                web_url = info.get("webpage_url") or info.get("url") or "https://vk.com"
+                return mp3_file, web_url
         except Exception as e:
             last_exc = e
-            if not _is_bot_check_error(e):
-                raise
             continue
-    _raise_ytdlp_failure(last_exc)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Audio topilmadi yoki yuklab bo'lmadi.")
 
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
-    await get_po_token()
-    return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
+    return await loop.run_in_executor(None, _download_audio_from_url, query, outdir)
+
+
+async def download_song_by_url(url: str, outdir: str) -> str:
+    loop = asyncio.get_running_loop()
+    res_file, _ = await loop.run_in_executor(None, _download_audio_from_url, url, outdir)
+    return res_file
 
 
 def format_duration(seconds) -> str:
@@ -1114,71 +990,6 @@ def format_count(n) -> str:
     return str(n)
 
 
-def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(None, player_clients)
-        ydl_opts["extract_flat"] = "in_playlist"
-        ydl_opts["skip_download"] = True
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                entries = [e for e in (info.get("entries") or []) if e]
-                results = []
-                for e in entries:
-                    vid = e.get("id")
-                    results.append(
-                        {
-                            "id": vid,
-                            "title": e.get("title") or "Unknown",
-                            "uploader": e.get("uploader") or e.get("channel") or "",
-                            "duration": e.get("duration"),
-                            "view_count": e.get("view_count"),
-                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
-                        }
-                    )
-                return results
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
-
-
-async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
-    loop = asyncio.get_running_loop()
-    await get_po_token()
-    return await loop.run_in_executor(None, _run_ytdlp_text_search, query, limit)
-
-
-def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
-
-
-async def download_song_by_url(url: str, outdir: str) -> str:
-    loop = asyncio.get_running_loop()
-    await get_po_token()
-    return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
-
-
 def render_search_page(lang: str, token: str):
     data = SEARCH_CACHE[token]
     results = data["results"]
@@ -1194,8 +1005,7 @@ def render_search_page(lang: str, token: str):
     ]
     for i, item in enumerate(page_items, start=1):
         dur = format_duration(item.get("duration"))
-        views = format_count(item.get("view_count"))
-        lines.append(f"{i}. {item['title']} — {dur} · 👁 {views}")
+        lines.append(f"{i}. {item['title']} — {item['uploader']} ({dur})")
     text = "\n".join(lines)
 
     number_rows: list[list[InlineKeyboardButton]] = []
@@ -1240,13 +1050,15 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
 
 async def recognize_song(audio_path: str) -> dict | None:
     if Shazam is None:
+        log.warning("shazamio not installed - music recognition unavailable")
         return None
     if not audio_path or not os.path.exists(audio_path):
         return None
     try:
         shazam = Shazam()
         result = await shazam.recognize(audio_path)
-    except Exception:
+    except Exception as e:
+        log.warning("shazamio recognition error: %s", e)
         return None
     track = result.get("track")
     if not track:
@@ -1255,7 +1067,7 @@ async def recognize_song(audio_path: str) -> dict | None:
 
 
 # ============================================================
-# HANDLERS: media link & search
+# HANDLERS: media link
 # ============================================================
 @router.message(F.text.regexp(URL_RE.pattern))
 async def handle_link(message: Message):
@@ -1297,10 +1109,7 @@ async def handle_link(message: Message):
 
     token = uuid.uuid4().hex[:12]
     ext = os.path.splitext(filepath)[1].lower()
-    
-    me = await bot.get_me()
-    bot_username = me.username or "bot"
-    caption = t(lang, "caption", bot_username=bot_username)
+    caption = t(lang, "caption")
     keyboard = music_inline_kb(lang, token)
 
     try:
@@ -1337,7 +1146,7 @@ async def handle_text_search(message: Message):
 
     status = await message.answer(t(lang, "searching"))
     try:
-        results = await text_search_youtube(query)
+        results = await text_search_audio(query)
     except Exception as e:
         log.warning("text search failed: %s", e)
         await status.edit_text(t(lang, "error"))
@@ -1419,7 +1228,7 @@ async def cb_search_action(call: CallbackQuery):
         except Exception:
             pass
     except Exception as e:
-        log.warning("song download (text search) failed: %s", e)
+        log.warning("song download failed: %s", e)
         try:
             await status.edit_text(t(lang, "error"))
         except Exception:
@@ -1459,13 +1268,13 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path, youtube_url = await search_and_download_song(query, work_dir)
+        mp3_path, source_url = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
-            reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], source_url),
         )
         try:
             await status.delete()
