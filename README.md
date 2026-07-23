@@ -93,6 +93,32 @@ python main.py
 5. Ro'yxatni **📋 Majburiy obunalar** tugmasidan ko'rish va ❌ orqali
    o'chirish mumkin.
 
+## Yangilanishlar (2026-07-21)
+
+- **YouTube cookies endi kodga o'rnatilgan (default)** — endi hech qanday
+  environment variable qo'ymasangiz ham, `main.py` ichidagi
+  `DEFAULT_YOUTUBE_COOKIES` degan o'zgaruvchida saqlangan cookies avtomatik
+  ishlatiladi. Agar kelajakda `YOUTUBE_COOKIES` yoki `YOUTUBE_COOKIES_B64`
+  environment variable qo'ysangiz, ular ustunlik qiladi. Cookie eskirsa,
+  shunchaki `main.py` faylidagi `DEFAULT_YOUTUBE_COOKIES` qatorini yangi
+  eksport qilingan cookies.txt matni bilan almashtiring.
+- **Majburiy obuna endi faqat haqiqiy a'zolikni hisobga oladi** — avval
+  yopiq kanalga shunchaki qo'shilish so'rovi yuborilgani botdan foydalanish
+  uchun yetarli edi. Endi bu olib tashlandi: foydalanuvchi **kanal
+  egasi/administratori tomonidan tasdiqlanib**, haqiqatan a'zo bo'lgandagina
+  botdan foydalana oladi.
+- **Foydalanuvchi endi istalgan xabar bilan ro'yxatga qo'shiladi** — avval
+  faqat `/start` bosilganda foydalanuvchi bazaga yozilardi. Endi har qanday
+  xabar yoki tugma bosilishi bilan (agar u hali bazada bo'lmasa) avtomatik
+  qo'shiladi — bu eski (oldingi koddan qolgan) obunachilar uchun ham ishlaydi.
+- **Musiqa yuborilgandan keyin ikkita tugma qo'shildi:**
+  - **📜 Lyrics** — qo'shiq matnini qidiruv sahifasiga (Genius) olib boradi.
+    Mualliflik huquqi sabab, bot to'liq qo'shiq matnini o'zi ko'rsata olmaydi
+    (bu ko'plab qo'shiqlar bo'yicha ruxsatsiz tarqatish hisoblanadi) — shu
+    sabab havola orqali qonuniy manbaga yo'naltiradi.
+  - **🔍 YouTube'da ochish** — musiqa qaysi YouTube videosidan olinganini
+    ochib beradi.
+
 ## Loglardagi xatolarga tuzatish (2026-07-19)
 
 - **`No such file or directory: 'ffmpeg'`** — `ffmpeg` endi tizimga
@@ -189,6 +215,23 @@ Cookies qo'yilmagan holatda ham bot ishlayveradi (chunki `player_client`
 fallback hali ham ba'zi hostlarda yordam beradi), lekin agar serveringiz
 IP manzili YouTube tomonidan bloklangan bo'lsa, faqat cookies muammoni
 butunlay hal qiladi.
+
+### Nusxa ko'chirishda xato bo'lsa (masalan "Invalid base64" xatosi)
+
+Agar `YOUTUBE_COOKIES_B64` qiymatini nusxalashda bir nechta belgi tushib
+qolsa (uzun matnni ko'chirishda tez-tez bo'ladi), bot endi:
+- avtomatik tozalaydi (bo'sh joy/qatorlarni olib tashlaydi) va padding'ni
+  to'g'irlashga harakat qiladi;
+- agar baribir noto'g'ri bo'lsa, xizmat **yiqilib qolmaydi** — shunchaki
+  cookies'siz davom etadi va loglarga aniq sabab yozadi (masalan "cut off
+  while copy-pasting - re-copy the FULL base64 string");
+- muvaffaqiyatli yuklansa, loglarda "YouTube cookies loaded from ... (N
+  cookie lines)" deb yozadi — shu qatorni ko'rsangiz, cookies to'g'ri
+  ishlagani tasdiqlanadi.
+
+Xato takrorlansa: cookies.txt faylini **yana bir bor to'liq** eksport
+qiling va base64 qiymatini oxirigacha (kesilmasdan) nusxalab qo'ying, yoki
+`YOUTUBE_COOKIES` orqali xom (raw) matn sifatida joylashtirib ko'ring.
 
 ## Eslatma
 
