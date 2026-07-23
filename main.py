@@ -147,80 +147,88 @@ DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
 """
 
 
+def _write_cookies_file(content: str) -> str:
+    cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    with open(cookies_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return cookies_path
+
+
+def _try_load_cookie_candidate(source: str, content: str, logger) -> str | None:
+    content = _normalize_cookies_content(content)
+    valid, total = _count_valid_cookie_lines(content)
+    if total == 0 or valid == 0:
+        logger.warning(
+            "%s does not look like a valid cookies.txt (found %d/%d usable cookie lines) - "
+            "skipping it and trying the next available source.",
+            source, valid, total,
+        )
+        return None
+    if valid < total:
+        logger.warning(
+            "%s: only %d/%d cookie lines look valid - the value may be truncated, using it anyway.",
+            source, valid, total,
+        )
+    path = _write_cookies_file(content)
+    logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
+    return path
+
+
 def _setup_youtube_cookies() -> str | None:
     """
     YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
     "Sign in to confirm you're not a bot" REGARDLESS of which player_client
     yt-dlp uses. The only reliable fix is real browser cookies.
 
-    Priority order:
-      1. YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content (env var)
-      2. YOUTUBE_COOKIES      -> raw cookies.txt content (env var, Netscape format)
-      3. COOKIES_FILE         -> path to an already-mounted cookies.txt file (env var)
-      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if none of
-         the env vars are set, so the bot works without any extra setup.
-
-    This is deliberately defensive: copy-pasting a long value into an env
-    var UI can drop characters or turn tabs into spaces. We repair what we
-    reasonably can and always log a clear, actionable line about what was
-    (or wasn't) loaded instead of failing silently.
+    Tries each source in order and FALLS THROUGH to the next one if a
+    source is set but turns out invalid/empty/truncated - a broken or
+    stale env var (e.g. left over from earlier troubleshooting) must never
+    block the built-in default from being used:
+      1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
+      2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
+      3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
+      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if nothing
+         else worked, so the bot works without any extra setup.
     """
     logger = logging.getLogger("bot")
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
-    path = os.getenv("COOKIES_FILE", "").strip()
+    path_env = os.getenv("COOKIES_FILE", "").strip()
 
-    content = None
-    source = None
     if b64:
-        # drop any whitespace/newlines a UI may have injected, then fix padding
         cleaned = "".join(b64.split())
         padding = len(cleaned) % 4
         if padding:
             cleaned += "=" * (4 - padding)
         try:
-            content = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            source = "YOUTUBE_COOKIES_B64"
+            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
+            result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
+            if result:
+                return result
         except Exception as e:
             logger.warning(
-                "YOUTUBE_COOKIES_B64 could not be decoded (%s). It was most likely cut off "
-                "while copy-pasting - re-copy the FULL base64 string (no line breaks) and "
-                "redeploy. Falling back to the code's default cookies for now.",
+                "YOUTUBE_COOKIES_B64 could not be decoded (%s) - trying the next available source.",
                 e,
             )
-    elif raw:
-        content = raw
-        source = "YOUTUBE_COOKIES"
-    elif path and os.path.exists(path):
-        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path)
-        return path
-    else:
-        content = DEFAULT_YOUTUBE_COOKIES
-        source = "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)"
 
-    if content:
-        content = _normalize_cookies_content(content)
-        valid, total = _count_valid_cookie_lines(content)
-        if total == 0 or valid == 0:
-            logger.warning(
-                "%s does not look like a valid cookies.txt (found %d/%d usable cookie "
-                "lines) - ignoring it. YouTube downloads will rely on the player_client "
-                "fallback only, which may hit the bot-check again.",
-                source, valid, total,
-            )
-        else:
-            if valid < total:
-                logger.warning(
-                    "%s: only %d/%d cookie lines look valid - the value may be truncated. "
-                    "Using it anyway; re-copy the full cookies.txt if YouTube errors persist.",
-                    source, valid, total,
-                )
-            cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-            with open(cookies_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
-            return cookies_path
+    if raw:
+        result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
+        if result:
+            return result
 
+    if path_env and os.path.exists(path_env):
+        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
+        return path_env
+
+    result = _try_load_cookie_candidate(
+        "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)",
+        DEFAULT_YOUTUBE_COOKIES,
+        logger,
+    )
+    if result:
+        return result
+
+    logger.warning("No usable YouTube cookies found anywhere - relying on player_client fallback only.")
     return None
 
 
