@@ -1,3 +1,5 @@
+[file name]: main (14).py
+[file content begin]
 import asyncio
 import base64
 import json
@@ -78,6 +80,7 @@ ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
+VK_TOKEN = os.getenv("VK_TOKEN", "").strip()  # <-- VK Music uchun token
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -117,11 +120,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
-            "Menga YouTube, Instagram, TikTok, Pinterest yoki Snapchat havolasini "
+            "Menga Instagram, TikTok, Pinterest yoki Snapchat havolasini "
             "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
             "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
         ),
-        "send_link": "🔗 Havolani yuboring (YouTube / Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Havolani yuboring (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Yuklanmoqda, biroz kuting...",
         "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
         "detect_music_btn": "🎵 Musiqani aniqlash",
@@ -131,8 +134,9 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_source_link": "🔍 Manbani ochish",
+        "youtube_unavailable": "⚠️ Kechirasiz, YouTube'dan video yuklash xizmati vaqtincha ishlamayapti. Instagram, TikTok va boshqalar ishlayveradi.",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. YouTube, Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
+        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
         "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
@@ -147,11 +151,11 @@ TEXTS = {
         "search_results_range": "Natijalar {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Yordam</b>\n\n"
-            "1) YouTube, Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
+            "1) Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
             "2) Bot mediani yuklab beradi.\n"
             "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
             "MP3 shaklida yuboradi.\n"
-            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot SoundCloud'dan "
+            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot SoundCloud va Deezer'dan "
             "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
             "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
         ),
@@ -187,10 +191,10 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
-            "Отправьте мне ссылку с YouTube, Instagram, TikTok, Pinterest или Snapchat — "
+            "Отправьте мне ссылку с Instagram, TikTok, Pinterest или Snapchat — "
             "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
         ),
-        "send_link": "🔗 Отправьте ссылку (YouTube / Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Отправьте ссылку (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Загружается, подождите...",
         "caption": "✅ Спасибо, что пользуетесь ботом!",
         "detect_music_btn": "🎵 Распознать музыку",
@@ -200,8 +204,9 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
         "btn_source_link": "🔍 Открыть источник",
+        "youtube_unavailable": "⚠️ Извините, сервис загрузки с YouTube временно не работает. Instagram, TikTok и другие продолжают работать.",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с YouTube, Instagram, TikTok, Pinterest или Snapchat.",
+        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
         "admin_only": "⛔ Эта команда только для администраторов.",
@@ -216,10 +221,10 @@ TEXTS = {
         "search_results_range": "Результаты {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Помощь</b>\n\n"
-            "1) Отправьте ссылку с YouTube, Instagram, TikTok, Pinterest или Snapchat.\n"
+            "1) Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.\n"
             "2) Бот скачает медиа.\n"
             "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
-            "4) Или просто напишите название песни/исполнителя — бот найдет на SoundCloud "
+            "4) Или просто напишите название песни/исполнителя — бот найдет на SoundCloud и Deezer "
             "и пришлёт выбранный трек в MP3.\n\n"
             "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
         ),
@@ -255,11 +260,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
-            "Send me a link from YouTube, Instagram, TikTok, Pinterest or Snapchat — "
+            "Send me a link from Instagram, TikTok, Pinterest or Snapchat — "
             "I'll download the media for you. Use the button under the video to recognize "
             "the music in it and get it as an MP3 🎵"
         ),
-        "send_link": "🔗 Send a link (YouTube / Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Send a link (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Downloading, please wait...",
         "caption": "✅ Thanks for using our bot!",
         "detect_music_btn": "🎵 Recognize music",
@@ -269,8 +274,9 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_source_link": "🔍 Open source",
+        "youtube_unavailable": "⚠️ Sorry, YouTube download service is temporarily unavailable. Instagram, TikTok, etc. work as usual.",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from YouTube, Instagram, TikTok, Pinterest or Snapchat.",
+        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, TikTok, Pinterest or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
         "admin_only": "⛔ This command is for admins only.",
@@ -285,10 +291,10 @@ TEXTS = {
         "search_results_range": "Results {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Help</b>\n\n"
-            "1) Send a link from YouTube, Instagram, TikTok, Pinterest or Snapchat.\n"
+            "1) Send a link from Instagram, TikTok, Pinterest or Snapchat.\n"
             "2) The bot downloads the media.\n"
             "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
-            "4) Or just type a song/artist name — the bot will search SoundCloud and send the "
+            "4) Or just type a song/artist name — the bot will search SoundCloud and Deezer and send the "
             "track you pick as MP3.\n\n"
             "To change language, use the \"🌐 Language\" button below."
         ),
@@ -782,7 +788,6 @@ async def cb_delete_channel(call: CallbackQuery):
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
-    # Do not auto-approve join requests on arrival; they get approved upon subscription verification
 
 
 @router.chat_member()
@@ -839,22 +844,12 @@ async def cb_check_sub(call: CallbackQuery):
     if missing:
         await call.answer(t(lang, "still_not_subscribed"), show_alert=True)
         return
-    
-    # Approve pending join requests for private channels if user is now subscribed
-    channels = await list_channels()
-    for c in channels:
-        if c["is_private"]:
-            try:
-                await bot.approve_chat_join_request(c["chat_id"], call.from_user.id)
-            except Exception:
-                pass
-
     await call.message.edit_text(t(lang, "now_subscribed"))
     await call.answer()
 
 
 # ============================================================
-# DOWNLOAD HELPERS (Media & SoundCloud Music)
+# DOWNLOAD HELPERS (Non-YouTube Media & SoundCloud/Deezer Music)
 # ============================================================
 def detect_platform(url: str) -> str | None:
     for name, pattern in PLATFORM_PATTERNS.items():
@@ -863,7 +858,7 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str):
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -876,10 +871,9 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str):
         "retries": 3,
         "socket_timeout": 30,
     }
-    if platform == "pinterest":
-        ydl_opts["http_headers"]["Referer"] = "https://www.pinterest.com/"
     if outdir:
-        ydl_opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
+        opts = ydl_opts
+        opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
 
@@ -894,10 +888,73 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str):
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"
-    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy, platform)
+    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
-# --- SoundCloud Music Helpers ---
+# --- SoundCloud, Deezer & VK Music Helpers ---
+
+def search_deezer_api(query: str, limit: int = 1) -> list[dict]:
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.deezer.com/search?q={encoded_query}&limit={limit}"
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            tracks = data.get("data", [])
+            results = []
+            for track in tracks:
+                results.append({
+                    "id": str(track.get("id")),
+                    "title": track.get("title") or "Unknown",
+                    "uploader": track.get("artist", {}).get("name", "Unknown"),
+                    "duration": track.get("duration"),
+                    "view_count": track.get("rank", 0),
+                    "url": track.get("link")
+                })
+            return results
+    except Exception as e:
+        log.warning("Deezer API search failed: %s", e)
+        return []
+
+
+def search_vk_music(query: str, limit: int = 1) -> list[dict]:
+    """VK Music orqali qidirish (zaxira manba)"""
+    if not VK_TOKEN:
+        return []
+    try:
+        url = "https://api.vk.com/method/audio.search"
+        params = {
+            "q": query,
+            "count": limit,
+            "access_token": VK_TOKEN,
+            "v": "5.131"
+        }
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(params).encode(),
+                                     headers={"User-Agent": DEFAULT_UA})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("response", {}).get("items", [])
+            results = []
+            for item in items:
+                owner_id = item.get("owner_id")
+                audio_id = item.get("id")
+                if not owner_id or not audio_id:
+                    continue
+                # VK audio'ga to'g'ridan-to'g'ri link yt-dlp orqali ishlaydi
+                audio_url = f"https://vk.com/audio{owner_id}_{audio_id}"
+                results.append({
+                    "id": str(audio_id),
+                    "title": item.get("title", "Unknown"),
+                    "uploader": item.get("artist", ""),
+                    "duration": item.get("duration"),
+                    "view_count": item.get("plays", 0),
+                    "url": audio_url
+                })
+            return results
+    except Exception as e:
+        log.warning("VK Music search failed: %s", e)
+        return []
+
 
 def _run_music_search_download(query: str, outdir: str) -> tuple[str, str]:
     ydl_opts = {
@@ -913,7 +970,7 @@ def _run_music_search_download(query: str, outdir: str) -> tuple[str, str]:
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
     }
     
-    # Strictly SoundCloud (scsearch)
+    # 1) SoundCloud
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"scsearch1:{query}", download=True)
@@ -928,9 +985,34 @@ def _run_music_search_download(query: str, outdir: str) -> tuple[str, str]:
                 if os.path.exists(mp3_file):
                     return mp3_file, web_url
     except Exception as e:
-        log.warning("SoundCloud search download failed for query '%s': %s", query, e)
+        log.warning("SoundCloud search download failed for query '%s': %s. Trying Deezer...", query, e)
 
-    raise RuntimeError(f"Music not found on SoundCloud for query: {query}")
+    # 2) Deezer
+    deezer_tracks = search_deezer_api(query, limit=1)
+    if deezer_tracks:
+        deezer_url = deezer_tracks[0]["url"]
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(deezer_url, download=True)
+                filename = ydl.prepare_filename(info)
+                mp3_file = os.path.splitext(filename)[0] + ".mp3"
+                return mp3_file, deezer_url
+        except Exception as e:
+            log.warning("Deezer download failed for URL %s: %s. Trying VK...", deezer_url, e)
+
+    # 3) VK Music (zaxira)
+    vk_tracks = search_vk_music(query, limit=1)
+    if not vk_tracks:
+        raise RuntimeError(f"Music not found on SoundCloud, Deezer, or VK for query: {query}")
+    vk_url = vk_tracks[0]["url"]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(vk_url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = os.path.splitext(filename)[0] + ".mp3"
+            return mp3_file, vk_url
+    except Exception as e:
+        raise RuntimeError(f"VK download failed for URL {vk_url}: {e}")
 
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
@@ -962,6 +1044,8 @@ def format_count(n) -> str:
 
 def _run_music_text_search(query: str, limit: int) -> list[dict]:
     results = []
+
+    # 1) SoundCloud
     try:
         ydl_opts = {
             "quiet": True,
@@ -975,17 +1059,26 @@ def _run_music_text_search(query: str, limit: int) -> list[dict]:
             entries = [e for e in (info.get("entries") or []) if e]
             for e in entries:
                 vid = e.get("id")
-                uploader_id = e.get("uploader_id") or e.get("uploader") or "unknown"
                 results.append({
                     "id": str(vid),
                     "title": e.get("title") or "Unknown",
                     "uploader": e.get("uploader") or e.get("channel") or "",
                     "duration": e.get("duration"),
                     "view_count": e.get("view_count"),
-                    "url": e.get("url") or f"https://soundcloud.com/{uploader_id}/{vid}"
+                    "url": e.get("url") or f"https://soundcloud.com/{e.get('uploader_id')}/{e.get('id')}"
                 })
     except Exception as e:
         log.warning("SoundCloud text search failed: %s", e)
+
+    # 2) Deezer
+    if len(results) < limit:
+        deezer_results = search_deezer_api(query, limit=limit - len(results))
+        results.extend(deezer_results)
+
+    # 3) VK Music
+    if len(results) < limit:
+        vk_results = search_vk_music(query, limit=limit - len(results))
+        results.extend(vk_results)
 
     return results[:limit]
 
@@ -1119,6 +1212,16 @@ async def handle_link(message: Message):
     if not platform:
         await message.answer(t(lang, "unsupported_link"))
         return
+
+    # YouTube endi to'liq qo'llab-quvvatlanadi (blok olib tashlandi)
+    # if platform == "youtube":
+    #     await message.answer(t(lang, "youtube_unavailable"))
+    #     return
+
+    if platform == "tiktok":
+        # TikTok uchun maxsus xabar, lekin yuklab olishga urinib ko'ramiz
+        # Agar xohlasangiz bu yerda ham to'xtatib qo'yishingiz mumkin, lekin hozircha davom ettiramiz
+        pass
 
     status = await message.answer(t(lang, "downloading"))
     outdir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
@@ -1346,3 +1449,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+[file content end]
