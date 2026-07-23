@@ -6,10 +6,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
 import uuid
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart, Command
@@ -111,17 +113,52 @@ def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
     return len(valid), len(data_lines)
 
 
+# Fallback YouTube cookies baked directly into the code, so the bot works
+# out of the box without requiring any env var setup. If YOUTUBE_COOKIES /
+# YOUTUBE_COOKIES_B64 / COOKIES_FILE are set in the environment, those take
+# priority over this default. When these cookies eventually expire, either
+# set one of those env vars with a fresh export, or just replace the string
+# below with a newly exported cookies.txt content.
+DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com\tTRUE\t/\tTRUE\t1819078132\tLOGIN_INFO\tAFmmF2swRQIhAPTjGCIxT8jRFvu-UolA342zLgu4Wa_2Zg92vp9En0f1AiAaa9qyD5ILBnLeo6OgnSGLGVRv0IKnIfpUwAlAiijq4A:QUQ3MjNmd05EeHR1Vl9DVlpmcXZpZ1dGRjRVdXdGWHlBNHdDc2Y4TnJsNkNfRmZ1Uk5IOUV2S0N0V1Y0dmZRdVgxWXpXcURnbE1Oa2VhX2JReEdWMVU4WU9kVWVmYTFPV1NOeHlocnlpV0lUQk5idzRWN2o2SWY5SWlWUlhxVkUwMWpCOHdOdXFudmxmWGdWejlTdjZUUGpQWWVfbGs0NWhB
+.youtube.com\tTRUE\t/\tTRUE\t1819369279\tPREF\tf4=4000000&f6=40000000&tz=Europe.Moscow&f5=30000&f7=100
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kpU9dZecQsB5RRO-E-fmk8QACgYKAYASARESFQHGX2Mi0g05dheS9FYBwFBrRZLvOBoVAUF8yKrYZ_w8cDPohd7oXUydNbfv0076
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kTUFP5u_URqr4RLf1RAc7qQACgYKAUgSARESFQHGX2MiClb-98xP_LHUjxzJnfOixRoVAUF8yKrxoHf6nlzwh5I3ZjzNT_R-0076
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91ksdQIslqIrxmyjfnwdSbKAwACgYKAXQSARESFQHGX2MijIy-KUAzMVhqjzBcy9BwzBoVAUF8yKpvZm8xRlFViIpBH21_SFv40076
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tHSID\tA5iCJpeoCJ2ie9azx
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSSID\tAE0d43TagniTeg68R
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tAPISID\tYj70mCU8-qbvexyA/Awam3JMJ3Wgp0rLds
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-1PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
+.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-3PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
+.youtube.com\tTRUE\t/\tFALSE\t1816345290\tSIDCC\tAKEyXzUolKajdTygx5UzGp4pGXctqE_D9byXYjYtllffuKdSe1NjaOizavFKxDszrKeUalQ1
+.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-1PSIDCC\tAKEyXzUI5fQyhfizthBUPsnSn37I3QIDpTVoXYPrT59pGCakSeV7355d1YGYXUCniqL4BzJg5A
+.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-3PSIDCC\tAKEyXzXRFdHWQLJ_kGcioFq7UkJSxCn8WVilfs_pqw0JdI8f3zvOJkGg2cRqTePiEx1_xKeEpQ
+.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_INFO1_LIVE\twgdW23KNv4Y
+.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_PRIVACY_METADATA\tCgJVWhIEGgAgUg%3D%3D
+.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-YNID\t20.YT=oKxGC8RBOKMAfttV5lr5ZRDRLG_iIJ7ZRTrVPvNR9fsfB46IlZdCHNK2hg7VEtCDypQ7szpq8_BGj_cSSQ-h9b-eY4o6N-NN1J6jO0xdIpIUoS8fUzauxWqJ50qCTG9Gd8qCYpJ8b5Bwrk2tgCQ2vvjVpTXOjm-lbYyk1yNyxCKcs08Iu_ustbrx2gEV4aTGMPCh4cIB8Pm6PrsuTl6jbT_10zse0cF83aerHzi-TNtGEl2ZRfrr78tLkJhALIFBR9ENFyoDpPzlfvb4BUKbeqvTi15fo2Sbf2nlYow_7lUCKg0IjyvmpDxa_6zrlW5p4Qxf7Kkp-H0V_2QHwENS0A
+.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tGZn2TispEpo
+.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-ROLLOUT_TOKEN\tCPrC1NDb5MzydhDs2-2IqOCVAxjL36TiyeiVAw%3D%3D
+"""
+
+
 def _setup_youtube_cookies() -> str | None:
     """
     YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
     "Sign in to confirm you're not a bot" REGARDLESS of which player_client
     yt-dlp uses. The only reliable fix is real browser cookies.
 
-    Easiest for Railway: paste the cookies.txt CONTENT directly into an env
-    variable (no file/volume needed) via one of:
-      - YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content
-      - YOUTUBE_COOKIES      -> raw cookies.txt content (Netscape format)
-      - COOKIES_FILE         -> path to an already-mounted cookies.txt file
+    Priority order:
+      1. YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content (env var)
+      2. YOUTUBE_COOKIES      -> raw cookies.txt content (env var, Netscape format)
+      3. COOKIES_FILE         -> path to an already-mounted cookies.txt file (env var)
+      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if none of
+         the env vars are set, so the bot works without any extra setup.
 
     This is deliberately defensive: copy-pasting a long value into an env
     var UI can drop characters or turn tabs into spaces. We repair what we
@@ -148,12 +185,18 @@ def _setup_youtube_cookies() -> str | None:
             logger.warning(
                 "YOUTUBE_COOKIES_B64 could not be decoded (%s). It was most likely cut off "
                 "while copy-pasting - re-copy the FULL base64 string (no line breaks) and "
-                "redeploy. Falling back to YOUTUBE_COOKIES / player_client fallback for now.",
+                "redeploy. Falling back to the code's default cookies for now.",
                 e,
             )
     elif raw:
         content = raw
         source = "YOUTUBE_COOKIES"
+    elif path and os.path.exists(path):
+        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path)
+        return path
+    else:
+        content = DEFAULT_YOUTUBE_COOKIES
+        source = "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)"
 
     if content:
         content = _normalize_cookies_content(content)
@@ -177,10 +220,6 @@ def _setup_youtube_cookies() -> str | None:
                 f.write(content)
             logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
             return cookies_path
-
-    if path and os.path.exists(path):
-        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path)
-        return path
 
     return None
 
@@ -247,6 +286,9 @@ TEXTS = {
         "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
         "song_caption": "🎵 {title} — {artist}",
+        "btn_lyrics": "📜 Lyrics",
+        "btn_youtube_link": "🔍 YouTube'da ochish",
+        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
@@ -314,6 +356,9 @@ TEXTS = {
         "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
         "song_caption": "🎵 {title} — {artist}",
+        "btn_lyrics": "📜 Текст песни",
+        "btn_youtube_link": "🔍 Открыть на YouTube",
+        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
@@ -381,6 +426,9 @@ TEXTS = {
         "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
         "song_caption": "🎵 {title} — {artist}",
+        "btn_lyrics": "📜 Lyrics",
+        "btn_youtube_link": "🔍 Open on YouTube",
+        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
@@ -593,6 +641,29 @@ router = Router()
 dp.include_router(router)
 
 
+class EnsureUserRegisteredMiddleware(BaseMiddleware):
+    """
+    Registers a user in the DB the moment they interact with the bot in ANY
+    way (any message text, any button press) - not only via /start. This
+    matters for people who were already using an earlier version of this
+    bot: they won't need to press /start again, whatever they send just
+    gets them added to the users table if they're not there yet.
+    """
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is not None:
+            try:
+                await add_user_if_missing(user.id)
+            except Exception:
+                pass
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(EnsureUserRegisteredMiddleware())
+dp.callback_query.outer_middleware(EnsureUserRegisteredMiddleware())
+
+
 class AdminStates(StatesGroup):
     waiting_broadcast = State()
     waiting_channel = State()
@@ -616,6 +687,21 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=t(lang, "detect_music_btn"), callback_data=f"music:{token}")]
         ]
     )
+
+
+def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
+    """
+    Buttons shown under a sent MP3:
+    - "Lyrics" links out to a lyrics search page instead of reproducing the
+      full copyrighted lyrics text inside the bot.
+    - "Open on YouTube" links to the source video the audio came from.
+    """
+    query = f"{artist} {title}".strip() or title
+    lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
+    rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
+    if youtube_url:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=youtube_url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def user_reply_kb(lang: str, is_admin: bool) -> ReplyKeyboardMarkup:
@@ -901,7 +987,16 @@ async def on_chat_member_update(update: ChatMemberUpdated):
 # ============================================================
 # MANDATORY SUBSCRIPTION CHECK
 # ============================================================
+# ============================================================
+# MANDATORY SUBSCRIPTION CHECK
+# ============================================================
 async def get_unsubscribed_channels(user_id: int):
+    """
+    A user only counts as subscribed once they are an ACTUAL member of the
+    channel/group (status member/administrator/creator). For private
+    channels this means the channel owner/admin must approve their join
+    request first - merely sending a join request is NOT enough on its own.
+    """
     channels = await list_channels()
     missing = []
     for c in channels:
@@ -916,8 +1011,6 @@ async def get_unsubscribed_channels(user_id: int):
                 subscribed = True
         except Exception:
             subscribed = False
-        if not subscribed and c["is_private"]:
-            subscribed = await has_join_request(c["chat_id"], user_id)
         if not subscribed:
             missing.append(c)
     return missing
@@ -1032,7 +1125,7 @@ async def download_media(url: str, outdir: str, platform: str):
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
-def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
+def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]:
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = {
@@ -1059,7 +1152,9 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
                 if "entries" in info:
                     info = info["entries"][0]
                 filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
+                video_id = info.get("id")
+                video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
+                return os.path.splitext(filename)[0] + ".mp3", video_url
         except Exception as e:
             last_exc = e
             if not _is_bot_check_error(e):
@@ -1069,7 +1164,7 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> str:
     _raise_ytdlp_failure(last_exc)
 
 
-async def search_and_download_song(query: str, outdir: str) -> str:
+async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
 
@@ -1409,6 +1504,7 @@ async def cb_search_action(call: CallbackQuery):
             title=title,
             performer=performer,
             caption=t(lang, "song_caption", title=title, artist=performer),
+            reply_markup=song_result_kb(lang, title, performer, entry.get("url")),
         )
         try:
             await status.delete()
@@ -1452,12 +1548,13 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path = await search_and_download_song(query, work_dir)
+        mp3_path, youtube_url = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
         )
         # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
