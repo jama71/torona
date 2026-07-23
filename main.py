@@ -1,12 +1,15 @@
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
+import urllib.request
 import uuid
 
 import asyncpg
@@ -30,9 +33,6 @@ from aiogram.types import (
     FSInputFile,
 )
 
-import json
-import time
-
 import aiohttp
 import yt_dlp
 
@@ -42,16 +42,7 @@ except ImportError:
     Shazam = None
 
 # ------------------------------------------------------------
-# ffmpeg: bundled via imageio-ffmpeg so it works on ANY host
-# (Railway/Docker/etc.) without relying on apt packages being
-# installed by the build system. This fixes:
-#   "No such file or directory: 'ffmpeg'"
-#
-# IMPORTANT: imageio-ffmpeg's binary is NOT named "ffmpeg" (e.g.
-# "ffmpeg-linux64-v4.2.2"), but shazamio/pydub always shell out to the
-# literal command name "ffmpeg". Just adding its folder to PATH is not
-# enough - we create a symlink (or copy) literally called "ffmpeg" in a
-# directory we control and put THAT directory on PATH.
+# ffmpeg setup
 # ------------------------------------------------------------
 try:
     import imageio_ffmpeg
@@ -73,218 +64,28 @@ except Exception as e:
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 try:
-    # some libraries (pydub, etc.) look at this instead of PATH
     from pydub import AudioSegment
-
     AudioSegment.converter = FFMPEG_PATH
 except Exception:
     pass
 
 # ============================================================
-# CONFIG  (only these need to be set in Railway env variables)
+# CONFIG
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
-# Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 
-
-def _repair_cookie_line(line: str) -> str:
-    """Netscape cookie lines are tab-separated (7 fields). Some copy-paste
-    paths (chat UIs, some env-var editors) can collapse tabs into spaces -
-    if that happened but the 7 fields are still intact, rejoin them with
-    real tabs so yt-dlp's cookiejar parser accepts the line."""
-    if line.startswith("#") or not line.strip():
-        return line
-    if line.count("\t") == 6:
-        return line
-    parts = line.split()
-    if len(parts) == 7:
-        return "\t".join(parts)
-    return line
-
-
-def _normalize_cookies_content(content: str) -> str:
-    return "\n".join(_repair_cookie_line(l) for l in content.splitlines()) + "\n"
-
-
-def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
-    data_lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
-    valid = [l for l in data_lines if l.count("\t") == 6]
-    return len(valid), len(data_lines)
-
-
-# Fallback YouTube cookies baked directly into the code, so the bot works
-# out of the box without requiring any env var setup. If YOUTUBE_COOKIES /
-# YOUTUBE_COOKIES_B64 / COOKIES_FILE are set in the environment, those take
-# priority over this default. When these cookies eventually expire, either
-# set one of those env vars with a fresh export, or just replace the string
-# below with a newly exported cookies.txt content.
-DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-# This is a generated file! Do not edit.
-
-.youtube.com\tTRUE\t/\tTRUE\t1819078132\tLOGIN_INFO\tAFmmF2swRQIhAPTjGCIxT8jRFvu-UolA342zLgu4Wa_2Zg92vp9En0f1AiAaa9qyD5ILBnLeo6OgnSGLGVRv0IKnIfpUwAlAiijq4A:QUQ3MjNmd05EeHR1Vl9DVlpmcXZpZ1dGRjRVdXdGWHlBNHdDc2Y4TnJsNkNfRmZ1Uk5IOUV2S0N0V1Y0dmZRdVgxWXpXcURnbE1Oa2VhX2JReEdWMVU4WU9kVWVmYTFPV1NOeHlocnlpV0lUQk5idzRWN2o2SWY5SWlWUlhxVkUwMWpCOHdOdXFudmxmWGdWejlTdjZUUGpQWWVfbGs0NWhB
-.youtube.com\tTRUE\t/\tTRUE\t1819369279\tPREF\tf4=4000000&f6=40000000&tz=Europe.Moscow&f5=30000&f7=100
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kpU9dZecQsB5RRO-E-fmk8QACgYKAYASARESFQHGX2Mi0g05dheS9FYBwFBrRZLvOBoVAUF8yKrYZ_w8cDPohd7oXUydNbfv0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kTUFP5u_URqr4RLf1RAc7qQACgYKAUgSARESFQHGX2MiClb-98xP_LHUjxzJnfOixRoVAUF8yKrxoHf6nlzwh5I3ZjzNT_R-0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91ksdQIslqIrxmyjfnwdSbKAwACgYKAXQSARESFQHGX2MijIy-KUAzMVhqjzBcy9BwzBoVAUF8yKpvZm8xRlFViIpBH21_SFv40076
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tHSID\tA5iCJpeoCJ2ie9azx
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSSID\tAE0d43TagniTeg68R
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tAPISID\tYj70mCU8-qbvexyA/Awam3JMJ3Wgp0rLds
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-1PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-3PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tFALSE\t1816345290\tSIDCC\tAKEyXzUolKajdTygx5UzGp4pGXctqE_D9byXYjYtllffuKdSe1NjaOizavFKxDszrKeUalQ1
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-1PSIDCC\tAKEyXzUI5fQyhfizthBUPsnSn37I3QIDpTVoXYPrT59pGCakSeV7355d1YGYXUCniqL4BzJg5A
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-3PSIDCC\tAKEyXzXRFdHWQLJ_kGcioFq7UkJSxCn8WVilfs_pqw0JdI8f3zvOJkGg2cRqTePiEx1_xKeEpQ
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_INFO1_LIVE\twgdW23KNv4Y
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_PRIVACY_METADATA\tCgJVWhIEGgAgUg%3D%3D
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-YNID\t20.YT=oKxGC8RBOKMAfttV5lr5ZRDRLG_iIJ7ZRTrVPvNR9fsfB46IlZdCHNK2hg7VEtCDypQ7szpq8_BGj_cSSQ-h9b-eY4o6N-NN1J6jO0xdIpIUoS8fUzauxWqJ50qCTG9Gd8qCYpJ8b5Bwrk2tgCQ2vvjVpTXOjm-lbYyk1yNyxCKcs08Iu_ustbrx2gEV4aTGMPCh4cIB8Pm6PrsuTl6jbT_10zse0cF83aerHzi-TNtGEl2ZRfrr78tLkJhALIFBR9ENFyoDpPzlfvb4BUKbeqvTi15fo2Sbf2nlYow_7lUCKg0IjyvmpDxa_6zrlW5p4Qxf7Kkp-H0V_2QHwENS0A
-.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tGZn2TispEpo
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-ROLLOUT_TOKEN\tCPrC1NDb5MzydhDs2-2IqOCVAxjL36TiyeiVAw%3D%3D
-"""
-
-
-def _write_cookies_file(content: str) -> str:
-    cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(cookies_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return cookies_path
-
-
-def _try_load_cookie_candidate(source: str, content: str, logger) -> str | None:
-    content = _normalize_cookies_content(content)
-    valid, total = _count_valid_cookie_lines(content)
-    if total == 0 or valid == 0:
-        logger.warning(
-            "%s does not look like a valid cookies.txt (found %d/%d usable cookie lines) - "
-            "skipping it and trying the next available source.",
-            source, valid, total,
-        )
-        return None
-    if valid < total:
-        logger.warning(
-            "%s: only %d/%d cookie lines look valid - the value may be truncated, using it anyway.",
-            source, valid, total,
-        )
-    path = _write_cookies_file(content)
-    logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
-    return path
-
-
-def _setup_youtube_cookies() -> str | None:
-    """
-    YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
-    "Sign in to confirm you're not a bot" REGARDLESS of which player_client
-    yt-dlp uses. The only reliable fix is real browser cookies.
-
-    Tries each source in order and FALLS THROUGH to the next one if a
-    source is set but turns out invalid/empty/truncated - a broken or
-    stale env var (e.g. left over from earlier troubleshooting) must never
-    block the built-in default from being used:
-      1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
-      2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
-      3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
-      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if nothing
-         else worked, so the bot works without any extra setup.
-    """
-    logger = logging.getLogger("bot")
-    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
-    path_env = os.getenv("COOKIES_FILE", "").strip()
-
-    if b64:
-        cleaned = "".join(b64.split())
-        padding = len(cleaned) % 4
-        if padding:
-            cleaned += "=" * (4 - padding)
-        try:
-            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(
-                "YOUTUBE_COOKIES_B64 could not be decoded (%s) - trying the next available source.",
-                e,
-            )
-
-    if raw:
-        result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
-        if result:
-            return result
-
-    if path_env and os.path.exists(path_env):
-        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
-        return path_env
-
-    result = _try_load_cookie_candidate(
-        "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)",
-        DEFAULT_YOUTUBE_COOKIES,
-        logger,
-    )
-    if result:
-        return result
-
-    logger.warning("No usable YouTube cookies found anywhere - relying on player_client fallback only.")
-    return None
-
-
-def _check_cookies_expiry(cookies_path: str | None) -> None:
-    """Warn if any session cookies appear to be expired (expiry < now)."""
-    if not cookies_path or not os.path.exists(cookies_path):
-        return
-    logger = logging.getLogger("bot")
-    now = int(__import__("time").time())
-    expired_count = 0
-    try:
-        with open(cookies_path, encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("#") or not line.strip():
-                    continue
-                parts = line.strip().split("\t")
-                if len(parts) < 7:
-                    continue
-                try:
-                    exp = int(parts[4])
-                    if 0 < exp < now:
-                        expired_count += 1
-                except ValueError:
-                    pass
-    except Exception as e:
-        logger.warning("Could not check cookie expiry: %s", e)
-        return
-    if expired_count > 0:
-        logger.warning(
-            "⚠️  %d YouTube cookie(s) appear EXPIRED. "
-            "Bot may still get 'Sign in to confirm' errors. "
-            "Export fresh cookies and set YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES env var.",
-            expired_count,
-        )
-    else:
-        logger.info("YouTube cookies look valid (no expired entries found).")
-
-
-# Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
-# "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
-COOKIES_FILE = _setup_youtube_cookies()
-_check_cookies_expiry(COOKIES_FILE)
-
-# A realistic desktop User-Agent + an Android/iOS "player_client" combo is
-# currently the most reliable way to dodge YouTube's bot-check without cookies.
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
-CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
+CACHE_TTL_SECONDS = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -298,19 +99,13 @@ PLATFORM_PATTERNS = {
     "snapchat": re.compile(r"snapchat\.com"),
 }
 
-# token -> local video path, used only for the "detect music" button
 FILE_CACHE: dict[str, str] = {}
-
-# token -> {"query": str, "results": [...], "page": int}, used for the
-# text-based music search feature (search -> pick from list -> mp3)
 SEARCH_CACHE: dict[str, dict] = {}
 SEARCH_RESULTS_PER_PAGE = 8
-SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
+SEARCH_FETCH_LIMIT = 40
 SEARCH_CACHE_TTL_SECONDS = 600
 
-# bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
-
 pool: asyncpg.Pool | None = None
 
 
@@ -322,11 +117,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
-            "Menga Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini "
+            "Menga Instagram, TikTok, Pinterest yoki Snapchat havolasini "
             "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
             "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
         ),
-        "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Havolani yuboring (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Yuklanmoqda, biroz kuting...",
         "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
         "detect_music_btn": "🎵 Musiqani aniqlash",
@@ -335,10 +130,10 @@ TEXTS = {
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 YouTube'da ochish",
-        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
+        "btn_source_link": "🔍 Manbani ochish",
+        "youtube_unavailable": "⚠️ Kechirasiz, YouTube'dan video yuklash xizmati vaqtincha ishlamayapti. Instagram, TikTok va boshqalar ishlayveradi.",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
+        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
         "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
@@ -353,11 +148,11 @@ TEXTS = {
         "search_results_range": "Natijalar {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Yordam</b>\n\n"
-            "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
+            "1) Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
             "2) Bot mediani yuklab beradi.\n"
             "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
             "MP3 shaklida yuboradi.\n"
-            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot YouTube'dan "
+            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot SoundCloud va Deezer'dan "
             "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
             "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
         ),
@@ -393,10 +188,10 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
-            "Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat — "
+            "Отправьте мне ссылку с Instagram, TikTok, Pinterest или Snapchat — "
             "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
         ),
-        "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Отправьте ссылку (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Загружается, подождите...",
         "caption": "✅ Спасибо, что пользуетесь ботом!",
         "detect_music_btn": "🎵 Распознать музыку",
@@ -405,10 +200,10 @@ TEXTS = {
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
-        "btn_youtube_link": "🔍 Открыть на YouTube",
-        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
+        "btn_source_link": "🔍 Открыть источник",
+        "youtube_unavailable": "⚠️ Извините, сервис загрузки с YouTube временно не работает. Instagram, TikTok и другие продолжают работать.",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
+        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
         "admin_only": "⛔ Эта команда только для администраторов.",
@@ -423,10 +218,10 @@ TEXTS = {
         "search_results_range": "Результаты {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Помощь</b>\n\n"
-            "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
+            "1) Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.\n"
             "2) Бот скачает медиа.\n"
             "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
-            "4) Или просто напишите название песни/исполнителя — бот найдёт на YouTube "
+            "4) Или просто напишите название песни/исполнителя — бот найдет на SoundCloud и Deezer "
             "и пришлёт выбранный трек в MP3.\n\n"
             "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
         ),
@@ -462,11 +257,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
-            "Send me a link from Instagram, YouTube, TikTok, Pinterest or Snapchat — "
+            "Send me a link from Instagram, TikTok, Pinterest or Snapchat — "
             "I'll download the media for you. Use the button under the video to recognize "
             "the music in it and get it as an MP3 🎵"
         ),
-        "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Send a link (Instagram / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Downloading, please wait...",
         "caption": "✅ Thanks for using our bot!",
         "detect_music_btn": "🎵 Recognize music",
@@ -475,10 +270,10 @@ TEXTS = {
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_youtube_link": "🔍 Open on YouTube",
-        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
+        "btn_source_link": "🔍 Open source",
+        "youtube_unavailable": "⚠️ Sorry, YouTube download service is temporarily unavailable. Instagram, TikTok, etc. work as usual.",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
+        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, TikTok, Pinterest or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
         "admin_only": "⛔ This command is for admins only.",
@@ -493,10 +288,10 @@ TEXTS = {
         "search_results_range": "Results {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Help</b>\n\n"
-            "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
+            "1) Send a link from Instagram, TikTok, Pinterest or Snapchat.\n"
             "2) The bot downloads the media.\n"
             "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
-            "4) Or just type a song/artist name — the bot will search YouTube and send the "
+            "4) Or just type a song/artist name — the bot will search SoundCloud and Deezer and send the "
             "track you pick as MP3.\n\n"
             "To change language, use the \"🌐 Language\" button below."
         ),
@@ -537,7 +332,7 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 
 # ============================================================
-# DATABASE (PostgreSQL via asyncpg)
+# DATABASE
 # ============================================================
 async def init_db():
     global pool
@@ -690,14 +485,6 @@ dp.include_router(router)
 
 
 class EnsureUserRegisteredMiddleware(BaseMiddleware):
-    """
-    Registers a user in the DB the moment they interact with the bot in ANY
-    way (any message text, any button press) - not only via /start. This
-    matters for people who were already using an earlier version of this
-    bot: they won't need to press /start again, whatever they send just
-    gets them added to the users table if they're not there yet.
-    """
-
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
@@ -737,18 +524,12 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     )
 
 
-def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
-    """
-    Buttons shown under a sent MP3:
-    - "Lyrics" links out to a lyrics search page instead of reproducing the
-      full copyrighted lyrics text inside the bot.
-    - "Open on YouTube" links to the source video the audio came from.
-    """
+def song_result_kb(lang: str, title: str, artist: str, source_url: str | None) -> InlineKeyboardMarkup:
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
     rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
-    if youtube_url:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=youtube_url)])
+    if source_url:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_source_link"), url=source_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -805,7 +586,7 @@ async def cb_lang(call: CallbackQuery):
 
 
 # ============================================================
-# HANDLERS: persistent reply-keyboard buttons (user side)
+# HANDLERS: persistent reply-keyboard buttons
 # ============================================================
 @router.message(F.text.in_({v["btn_lang"] for v in TEXTS.values()}))
 async def btn_change_lang(message: Message):
@@ -889,7 +670,7 @@ async def cmd_admin(message: Message):
 
 
 # ============================================================
-# HANDLERS: admin - mandatory subscriptions (add / list / remove)
+# HANDLERS: admin - mandatory subscriptions
 # ============================================================
 @router.message(F.text.in_({v["btn_add_channel"] for v in TEXTS.values()}))
 async def btn_add_channel_ask(message: Message, state: FSMContext):
@@ -1001,20 +782,11 @@ async def cb_delete_channel(call: CallbackQuery):
     await call.answer(t(lang, "channel_removed"))
 
 
-
-# ============================================================
-# HANDLER: join requests for private mandatory channels
-# ============================================================
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
 
 
-# ============================================================
-# HANDLER: track join/leave events for mandatory channels
-# (requires the bot to be an admin there - Telegram then sends
-# chat_member updates for every member change in that chat)
-# ============================================================
 @router.chat_member()
 async def on_chat_member_update(update: ChatMemberUpdated):
     channel = await get_channel_by_chat_id(update.chat.id)
@@ -1032,19 +804,7 @@ async def on_chat_member_update(update: ChatMemberUpdated):
         await unmark_channel_subscriber(update.chat.id, user_id)
 
 
-# ============================================================
-# MANDATORY SUBSCRIPTION CHECK
-# ============================================================
-# ============================================================
-# MANDATORY SUBSCRIPTION CHECK
-# ============================================================
 async def get_unsubscribed_channels(user_id: int):
-    """
-    A user only counts as subscribed once they are an ACTUAL member of the
-    channel/group (status member/administrator/creator). For private
-    channels this means the channel owner/admin must approve their join
-    request first - merely sending a join request is NOT enough on its own.
-    """
     channels = await list_channels()
     missing = []
     for c in channels:
@@ -1086,7 +846,7 @@ async def cb_check_sub(call: CallbackQuery):
 
 
 # ============================================================
-# DOWNLOAD HELPERS
+# DOWNLOAD HELPERS (Non-YouTube Media & SoundCloud/Deezer Music)
 # ============================================================
 def detect_platform(url: str) -> str | None:
     for name, pattern in PLATFORM_PATTERNS.items():
@@ -1095,263 +855,115 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-# ============================================================
-# InnerTube client fallback order + po_token cache
-# ============================================================
-#
-# Railway/Docker datacenter IPs are heavily flagged by YouTube.
-# Strategy (in order):
-#   1. android_testsuite — no sig-check, usually works without cookies
-#   2. tv_embedded       — embedded TV player, no JS challenge
-#   3. web + po_token    — web client WITH proof-of-origin token (bypasses bot-check)
-#   4. ios               — Apple client, separate sig path
-#   5. android_creator   — Studio client
-#
-PLAYER_CLIENT_FALLBACKS = [
-    ["android_testsuite"],
-    ["tv_embedded"],
-    ["web"],           # used WITH po_token injected by _build_ydl_opts_base
-    ["ios"],
-    ["android_creator"],
-    ["mweb"],
-]
-
-# ---------------------------------------------------------------------------
-# po_token / visitor_data  —  Proof-of-Origin token cache
-#
-# YouTube requires a BotGuard-issued po_token for web/mweb clients on
-# server IPs. We fetch it once from the public bgutils API and cache it
-# for POTOK_TTL seconds.  If the fetch fails we fall back to no token
-# (other clients will still be tried).
-# ---------------------------------------------------------------------------
-_POT_CACHE: dict = {}           # {"visitor_data": str, "po_token": str, "ts": float}
-_POT_TTL   = 21600              # 6 hours — tokens stay valid roughly this long
-_POT_LOCK: asyncio.Lock | None = None  # created lazily inside the running event loop
-
-
-def _get_pot_lock() -> asyncio.Lock:
-    global _POT_LOCK
-    if _POT_LOCK is None:
-        _POT_LOCK = asyncio.Lock()
-    return _POT_LOCK
-
-# Public bgutils worker endpoint (no key required, rate-limit is generous)
-_BGUTILS_URL = "https://bgutils.kz/token"   # community-run, reliable
-
-
-async def _fetch_po_token() -> tuple[str, str] | tuple[None, None]:
-    """Fetch a fresh (visitor_data, po_token) pair from the bgutils API.
-
-    Returns (visitor_data, po_token) on success, (None, None) on failure.
-    The tokens are required for yt-dlp web/mweb clients on datacenter IPs.
-    """
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(_BGUTILS_URL) as resp:
-                if resp.status != 200:
-                    log.warning("bgutils returned HTTP %d", resp.status)
-                    return None, None
-                data = await resp.json(content_type=None)
-                vd  = data.get("visitorData") or data.get("visitor_data")
-                pot = data.get("poToken")     or data.get("po_token")
-                if vd and pot:
-                    log.info("po_token refreshed from bgutils (visitor_data=%s…)", vd[:12])
-                    return vd, pot
-                log.warning("bgutils response missing fields: %s", list(data.keys()))
-                return None, None
-    except Exception as exc:
-        log.warning("po_token fetch failed: %s", exc)
-        return None, None
-
-
-async def get_po_token() -> tuple[str, str] | tuple[None, None]:
-    """Return cached (visitor_data, po_token), refreshing if stale."""
-    async with _get_pot_lock():
-        now = time.time()
-        if _POT_CACHE and now - _POT_CACHE.get("ts", 0) < _POT_TTL:
-            return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
-        vd, pot = await _fetch_po_token()
-        if vd and pot:
-            _POT_CACHE.update({"visitor_data": vd, "po_token": pot, "ts": now})
-            return vd, pot
-        return None, None
-
-
-def get_po_token_sync() -> tuple[str, str] | tuple[None, None]:
-    """Sync wrapper — reads cache only (no network call).
-
-    The sync download functions (run_in_executor) call this; the async
-    refresh is done by the handler before spawning the executor task.
-    """
-    if _POT_CACHE and time.time() - _POT_CACHE.get("ts", 0) < _POT_TTL:
-        return _POT_CACHE["visitor_data"], _POT_CACHE["po_token"]
-    return None, None
-
-
-def _is_bot_check_error(exc: Exception) -> bool:
-    """Detect YouTube bot-check / auth errors that are worth retrying with
-    a different InnerTube client or po_token."""
-    msg = str(exc).lower()
-    return any(
-        phrase in msg for phrase in (
-            "sign in to confirm",
-            "not a bot",
-            "cookies",                      # "use --cookies-from-browser"
-            "http error 429",               # Too Many Requests
-            "too many requests",
-            "preconditionfailed",           # InnerTube 412 - client context rejected
-            "vpn or proxy",
-            "error code: 152",              # InnerTube: content not available for this client
-            "this video is unavailable",    # masked bot-check on restricted IPs
-            "video unavailable",
-        )
-    )
-
-
-_cookie_hint_logged = False
-
-
-def _raise_ytdlp_failure(last_exc: Exception | None):
-    global _cookie_hint_logged
-    if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
-        _cookie_hint_logged = True
-        log.error(
-            "YouTube blocked every player_client fallback with a bot-check error. "
-            "This host's IP is very likely flagged - set YOUTUBE_COOKIES (or "
-            "YOUTUBE_COOKIES_B64) in the environment with a real browser's "
-            "cookies.txt content to fix this reliably. See README."
-        )
-    if last_exc is None:
-        raise RuntimeError("yt-dlp: all player_client fallbacks exhausted with no specific error.")
-    raise last_exc
-
-
-def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
-    """Shared yt-dlp options used across all download functions.
-
-    Automatically injects po_token + visitor_data for web/mweb clients so
-    YouTube's BotGuard accepts requests from datacenter (Railway) IPs.
-    """
-    # Clients that supply pre-signed URLs — no JS player needed
-    _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded"}
-    needs_player = not all(c in _no_sig_clients for c in player_clients)
-
-    # po_token is only meaningful for web / mweb clients
-    _web_clients = {"web", "mweb", "web_creator", "web_embedded"}
-    needs_pot = any(c in _web_clients for c in player_clients)
-
-    extractor_args: dict = {
-        "player_client": player_clients,
-        "skip_webpage": ["1"],
-    }
-    if not needs_player:
-        extractor_args["player_skip"] = ["webpage", "configs", "js"]
-
-    if needs_pot:
-        visitor_data, po_token = get_po_token_sync()
-        if visitor_data and po_token:
-            extractor_args["visitor_data"] = [visitor_data]
-            extractor_args["po_token"]     = [po_token]
-            log.debug("Injecting po_token for client %s", player_clients)
-
-    opts: dict = {
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
+    ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {"youtube": extractor_args},
+        "format": "best[ext=mp4]/best",
         "http_headers": {"User-Agent": DEFAULT_UA},
         "geo_bypass": True,
         "retries": 3,
-        "sleep_interval": 1,
-        "max_sleep_interval": 3,
         "socket_timeout": 30,
     }
     if outdir:
+        opts = ydl_opts
         opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-    return opts
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
 
-
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
-    last_exc = None
-    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "best[ext=mp4]/best"
-        if use_proxy and GENERAL_PROXY:
-            ydl_opts["proxy"] = GENERAL_PROXY
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if "entries" in info:
-                    info = info["entries"][0]
-                filename = ydl.prepare_filename(info)
-                return filename, info
-        except Exception as e:
-            last_exc = e
-            # Only worth retrying with a different client for the bot-check
-            # error and only for youtube urls; anything else, fail fast.
-            if "youtube" not in url and "youtu.be" not in url:
-                raise
-            if not _is_bot_check_error(e):
-                raise
-            log.warning(
-                "InnerTube client %s (attempt %d) blocked: %s — trying next client",
-                player_clients, attempt + 1, str(e)[:120],
-            )
-            continue
-    _raise_ytdlp_failure(last_exc)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
+        filename = ydl.prepare_filename(info)
+        return filename, info
 
 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"
-    # Pre-warm the po_token cache so the sync executor can read it without await
-    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
-def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]:
-    last_exc = None
-    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-                if not info:
-                    raise RuntimeError("yt-dlp returned no info for query")
+# --- SoundCloud & Deezer Music Helpers ---
+
+def search_deezer_api(query: str, limit: int = 1) -> list[dict]:
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.deezer.com/search?q={encoded_query}&limit={limit}"
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            tracks = data.get("data", [])
+            results = []
+            for track in tracks:
+                results.append({
+                    "id": str(track.get("id")),
+                    "title": track.get("title") or "Unknown",
+                    "uploader": track.get("artist", {}).get("name", "Unknown"),
+                    "duration": track.get("duration"),
+                    "view_count": track.get("rank", 0),
+                    "url": track.get("link")
+                })
+            return results
+    except Exception as e:
+        log.warning("Deezer API search failed: %s", e)
+        return []
+
+
+def _run_music_search_download(query: str, outdir: str) -> tuple[str, str]:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "ffmpeg_location": FFMPEG_PATH,
+        "format": "bestaudio/best",
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        "http_headers": {"User-Agent": DEFAULT_UA},
+        "socket_timeout": 30,
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+    }
+    
+    # 1. Try SoundCloud first
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"scsearch1:{query}", download=True)
+            if info:
                 if "entries" in info:
                     entries = [e for e in (info.get("entries") or []) if e]
-                    if not entries:
-                        raise RuntimeError("yt-dlp search returned empty entries")
-                    info = entries[0]
+                    if entries:
+                        info = entries[0]
                 filename = ydl.prepare_filename(info)
-                video_id = info.get("id")
-                video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
-                return os.path.splitext(filename)[0] + ".mp3", video_url
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            log.warning(
-                "InnerTube client %s (song search attempt %d) blocked: %s — trying next client",
-                player_clients, attempt + 1, str(e)[:120],
-            )
-            continue
-    _raise_ytdlp_failure(last_exc)
+                web_url = info.get("webpage_url") or info.get("url", "")
+                mp3_file = os.path.splitext(filename)[0] + ".mp3"
+                if os.path.exists(mp3_file):
+                    return mp3_file, web_url
+    except Exception as e:
+        log.warning("SoundCloud search download failed for query '%s': %s. Trying Deezer...", query, e)
+
+    # 2. Fallback to Deezer if SoundCloud didn't return a track
+    deezer_tracks = search_deezer_api(query, limit=1)
+    if not deezer_tracks:
+        raise RuntimeError(f"Music not found on SoundCloud or Deezer for query: {query}")
+
+    deezer_url = deezer_tracks[0]["url"]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(deezer_url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = os.path.splitext(filename)[0] + ".mp3"
+            return mp3_file, deezer_url
+    except Exception as e:
+        raise RuntimeError(f"Deezer download failed for URL {deezer_url}: {e}")
 
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
-    await get_po_token()
-    return await loop.run_in_executor(None, _run_ytdlp_audio_search_download, query, outdir)
+    return await loop.run_in_executor(None, _run_music_search_download, query, outdir)
 
 
 def format_duration(seconds) -> str:
@@ -1376,68 +988,65 @@ def format_count(n) -> str:
     return str(n)
 
 
-def _run_ytdlp_text_search(query: str, limit: int) -> list[dict]:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(None, player_clients)
-        ydl_opts["extract_flat"] = "in_playlist"
-        ydl_opts["skip_download"] = True
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                entries = [e for e in (info.get("entries") or []) if e]
-                results = []
-                for e in entries:
-                    vid = e.get("id")
-                    results.append(
-                        {
-                            "id": vid,
-                            "title": e.get("title") or "Unknown",
-                            "uploader": e.get("uploader") or e.get("channel") or "",
-                            "duration": e.get("duration"),
-                            "view_count": e.get("view_count"),
-                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
-                        }
-                    )
-                return results
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
+def _run_music_text_search(query: str, limit: int) -> list[dict]:
+    results = []
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "http_headers": {"User-Agent": DEFAULT_UA},
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+            entries = [e for e in (info.get("entries") or []) if e]
+            for e in entries:
+                vid = e.get("id")
+                results.append({
+                    "id": str(vid),
+                    "title": e.get("title") or "Unknown",
+                    "uploader": e.get("uploader") or e.get("channel") or "",
+                    "duration": e.get("duration"),
+                    "view_count": e.get("view_count"),
+                    "url": e.get("url") or f"https://soundcloud.com/{e.get('uploader_id')}/{e.get('id')}"
+                })
+    except Exception as e:
+        log.warning("SoundCloud text search failed: %s", e)
+
+    if len(results) < limit:
+        deezer_results = search_deezer_api(query, limit=limit - len(results))
+        results.extend(deezer_results)
+
+    return results[:limit]
 
 
-async def text_search_youtube(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
+async def text_search_music(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
     loop = asyncio.get_running_loop()
-    await get_po_token()
-    return await loop.run_in_executor(None, _run_ytdlp_text_search, query, limit)
+    return await loop.run_in_executor(None, _run_music_text_search, query, limit)
 
 
 def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "ffmpeg_location": FFMPEG_PATH,
+        "format": "bestaudio/best",
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        "http_headers": {"User-Agent": DEFAULT_UA},
+        "socket_timeout": 30,
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        return os.path.splitext(filename)[0] + ".mp3"
 
 
 async def download_song_by_url(url: str, outdir: str) -> str:
     loop = asyncio.get_running_loop()
-    await get_po_token()
     return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
 
 
@@ -1494,8 +1103,6 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
     )
     stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
-        # No audio track in the source (e.g. a silent GIF/video) - this is a
-        # normal case, not a real error: just tell the user music wasn't found.
         if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
             return None
         raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
@@ -1542,6 +1149,10 @@ async def handle_link(message: Message):
     platform = detect_platform(url)
     if not platform:
         await message.answer(t(lang, "unsupported_link"))
+        return
+
+    if platform == "youtube":
+        await message.answer(t(lang, "youtube_unavailable"))
         return
 
     status = await message.answer(t(lang, "downloading"))
@@ -1601,7 +1212,7 @@ async def handle_text_search(message: Message):
 
     status = await message.answer(t(lang, "searching"))
     try:
-        results = await text_search_youtube(query)
+        results = await text_search_music(query)
     except Exception as e:
         log.warning("text search failed: %s", e)
         await status.edit_text(t(lang, "error"))
@@ -1654,7 +1265,6 @@ async def cb_search_action(call: CallbackQuery):
         await call.answer()
         return
 
-    # otherwise `action` is the 1..8 button - the user picked a song
     if not action.isdigit():
         await call.answer()
         return
@@ -1724,15 +1334,14 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path, youtube_url = await search_and_download_song(query, work_dir)
+        mp3_path, source_url = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
-            reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], source_url),
         )
-        # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
             await status.delete()
         except Exception:
@@ -1744,7 +1353,6 @@ async def cb_recognize_music(call: CallbackQuery):
         except Exception:
             await call.message.answer(t(lang, "error"))
     finally:
-        # clean everything for this request right away - free-tier disk friendly
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(video_outdir, ignore_errors=True)
         FILE_CACHE.pop(token, None)
