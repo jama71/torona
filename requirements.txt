@@ -3,3 +3,4 @@ shazamio
 yt-dlp
 pydub
 requests
+asyncpg
