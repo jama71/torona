@@ -1091,21 +1091,46 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-# Fallback order of YouTube "player_client" configs. Some of these dodge the
-# "Sign in to confirm you're not a bot" check better than others depending on
-# the datacenter IP the bot is hosted on, so we try them one by one.
+# InnerTube client fallback order.
+#
+# YouTube's InnerTube API uses different "client contexts" internally.
+# yt-dlp maps these via extractor_args["youtube"]["player_client"].
+#
+# Best clients for datacenter/server IPs (no real browser session):
+#   1. android_testsuite  – Google's own test client; skips sig checks entirely
+#   2. android_creator    – YouTube Studio app client; very rarely bot-blocked
+#   3. tv_embedded        – Smart TV embedded player; no JS challenge
+#   4. ios               – Apple client; different sig path than web
+#   5. web_creator        – YouTube Studio web; last resort
+#
+# "web" and "android" (plain) are intentionally placed last because they are
+# the most heavily bot-checked on cloud/datacenter IPs.
 PLAYER_CLIENT_FALLBACKS = [
-    ["android", "web", "ios"],
-    ["ios"],
-    ["tv_embedded", "web"],
-    ["mweb"],
-    ["web_creator"],  # extra fallback - often bypasses bot-check on datacenter IPs
+    ["android_testsuite"],           # most reliable: test client, no sig verification
+    ["android_creator", "ios"],      # Studio clients, rarely bot-checked
+    ["tv_embedded"],                 # TV embedded player, no JS challenge
+    ["ios"],                         # Apple client only
+    ["web_creator"],                 # YouTube Studio web
+    ["web_embedded"],                # embedded iframe client
+    ["android", "ios"],              # standard clients as last resort
 ]
 
 
 def _is_bot_check_error(exc: Exception) -> bool:
+    """Detect YouTube bot-check / auth errors returned by InnerTube or yt-dlp."""
     msg = str(exc).lower()
-    return "sign in to confirm" in msg or "not a bot" in msg
+    return any(
+        phrase in msg for phrase in (
+            "sign in to confirm",
+            "not a bot",
+            "cookies",                     # "use --cookies-from-browser"
+            "http error 429",              # Too Many Requests
+            "too many requests",
+            "this video is not available", # sometimes a masked bot-check
+            "preconditionfailed",          # InnerTube 412 - client context rejected
+            "vpn or proxy",
+        )
+    )
 
 
 _cookie_hint_logged = False
@@ -1127,18 +1152,39 @@ def _raise_ytdlp_failure(last_exc: Exception | None):
 
 
 def _build_ydl_opts_base(outdir: str | None, player_clients: list) -> dict:
-    """Shared yt-dlp options used across all download functions."""
+    """Shared yt-dlp options used across all download functions.
+
+    Uses InnerTube-specific extractor_args so yt-dlp picks the right
+    client context when talking to YouTube's internal API:
+      - player_client   : which InnerTube client identity to use
+      - skip_webpage    : skip loading the watch page (avoids JS bot-check)
+      - player_skip     : skip fetching the JS player (faster, avoids sig checks)
+    """
+    # Clients that don't need the JS player signature at all - skip it for speed
+    # and to avoid triggering bot-checks on the player endpoint.
+    _no_sig_clients = {"android_testsuite", "android_creator", "tv_embedded", "web_embedded"}
+    needs_player = not all(c in _no_sig_clients for c in player_clients)
+
+    extractor_args: dict = {
+        "player_client": player_clients,
+        # Skip loading the HTML watch page - talk directly to InnerTube API
+        "skip_webpage": ["1"],
+    }
+    if not needs_player:
+        # These clients use pre-signed URLs - no need to fetch+parse the JS player
+        extractor_args["player_skip"] = ["webpage", "configs", "js"]
+
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {"youtube": {"player_client": player_clients}},
+        "extractor_args": {"youtube": extractor_args},
         "http_headers": {"User-Agent": DEFAULT_UA},
         "geo_bypass": True,
         "retries": 3,
-        "sleep_interval": 1,       # small delay between requests to reduce bot-check triggers
+        "sleep_interval": 1,
         "max_sleep_interval": 3,
         "socket_timeout": 30,
     }
@@ -1171,7 +1217,10 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 raise
             if not _is_bot_check_error(e):
                 raise
-            log.warning("yt-dlp attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
+            log.warning(
+                "InnerTube client %s (attempt %d) blocked: %s — trying next client",
+                player_clients, attempt + 1, str(e)[:120],
+            )
             continue
     _raise_ytdlp_failure(last_exc)
 
@@ -1208,7 +1257,10 @@ def _run_ytdlp_audio_search_download(query: str, outdir: str) -> tuple[str, str]
             last_exc = e
             if not _is_bot_check_error(e):
                 raise
-            log.warning("song search attempt %d failed (%s), trying next player_client", attempt + 1, player_clients)
+            log.warning(
+                "InnerTube client %s (song search attempt %d) blocked: %s — trying next client",
+                player_clients, attempt + 1, str(e)[:120],
+            )
             continue
     _raise_ytdlp_failure(last_exc)
 
