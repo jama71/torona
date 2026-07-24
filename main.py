@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import urllib.parse
+import urllib.request
 import uuid
 import zipfile
 
@@ -1408,6 +1409,35 @@ def _build_ydl_opts_base(outdir, player_clients):
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
+def _download_instagram_photo_fallback(url: str, outdir: str):
+    """Instagram photo-only posts have no video formats, so yt-dlp's normal
+    download raises 'No video formats found!'. This grabs the highest-res
+    display image directly instead."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "http_headers": {"User-Agent": DEFAULT_UA},
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if "entries" in info:
+        info = info["entries"][0]
+    thumbs = info.get("thumbnails") or []
+    img_url = None
+    if thumbs:
+        img_url = max(thumbs, key=lambda th: (th.get("width") or 0) * (th.get("height") or 0)).get("url")
+    if not img_url:
+        img_url = info.get("thumbnail")
+    if not img_url:
+        return None
+    filepath = os.path.join(outdir, f"{info.get('id') or 'photo'}.jpg")
+    req = urllib.request.Request(img_url, headers={"User-Agent": DEFAULT_UA})
+    with urllib.request.urlopen(req, timeout=30) as resp, open(filepath, "wb") as f:
+        f.write(resp.read())
+    return filepath, info
+
+
 def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
@@ -1424,6 +1454,11 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 return filename, info
         except Exception as e:
             last_exc = e
+            if "no video formats found" in str(e).lower() and "instagram" in url.lower():
+                result = _download_instagram_photo_fallback(url, outdir)
+                if result:
+                    return result
+                raise
             if "youtube" not in url and "youtu.be" not in url:
                 raise
             if not _is_bot_check_error(e):
