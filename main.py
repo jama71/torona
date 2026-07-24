@@ -307,8 +307,8 @@ PLATFORM_PATTERNS = {
     "snapchat": re.compile(r"snapchat\.com"),
 }
 
-# token -> local video path, used only for the "detect music" button
-FILE_CACHE: dict[str, str] = {}
+# token -> {"filepath": str, "source_url": str}, used for the "detect music" button
+FILE_CACHE: dict[str, dict] = {}
 
 # token -> {"query": str, "results": [...], "page": int}, used for the
 # text-based music search feature (search -> pick from list -> mp3)
@@ -316,6 +316,11 @@ SEARCH_CACHE: dict[str, dict] = {}
 SEARCH_RESULTS_PER_PAGE = 8
 SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
 SEARCH_CACHE_TTL_SECONDS = 600
+
+# token -> artist name, used for the "🔍 search by artist" button shown
+# after a song is recognized (callback_data has a 64-byte limit, so the
+# artist name itself can't always go directly in the callback data)
+ARTIST_SEARCH_CACHE: dict[str, str] = {}
 
 # bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
@@ -345,6 +350,7 @@ TEXTS = {
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
+        "btn_artist_search": "🔍 Rassom bo'yicha qidirish",
         "btn_youtube_link": "🔍 SoundCloud'da ochish",
         "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
@@ -426,6 +432,7 @@ TEXTS = {
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
+        "btn_artist_search": "🔍 Поиск по исполнителю",
         "btn_youtube_link": "🔍 Открыть в SoundCloud",
         "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
@@ -507,6 +514,7 @@ TEXTS = {
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
+        "btn_artist_search": "🔍 Search by artist",
         "btn_youtube_link": "🔍 Open on SoundCloud",
         "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
@@ -824,6 +832,40 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=t(lang, "detect_music_btn"), callback_data=f"music:{token}")]
         ]
     )
+
+
+def build_media_caption(source_url: str) -> str:
+    """"BotName | Shazam | source" line shown under a downloaded video/photo
+    (see reference screenshot), before music recognition is triggered."""
+    bot_link = f"https://t.me/{BOT_USERNAME}?start=video" if BOT_USERNAME else ""
+    bot_part = f'<a href="{bot_link}">{BOT_DISPLAY_NAME}</a>' if bot_link else BOT_DISPLAY_NAME
+    shazam_part = '<a href="https://www.shazam.com">Shazam</a>'
+    source_part = f'<a href="{source_url}">source</a>' if source_url else "source"
+    return f"{bot_part} | {shazam_part} | {source_part}"
+
+
+def build_recognized_caption(title: str, artist: str, source_url: str) -> str:
+    """Caption the video is edited to once music recognition succeeds
+    (see reference screenshot): song title line, blank line, then the
+    same "BotName | Shazam | source" row as before."""
+    header = f"{title} — {artist}".strip(" —") or title
+    return f"{header}\n\n{build_media_caption(source_url)}"
+
+
+def recognized_song_kb(lang: str, title: str, artist: str, artist_token: str) -> InlineKeyboardMarkup:
+    """Buttons shown on the video after recognition (see reference
+    screenshot): a row of quick-search links, plus a "search by artist"
+    button that re-runs our own song search using the recognized artist."""
+    query = urllib.parse.quote(f"{artist} {title}".strip())
+    rows = [
+        [
+            InlineKeyboardButton(text="Google", url=f"https://www.google.com/search?q={query}"),
+            InlineKeyboardButton(text="YouTube Music", url=f"https://music.youtube.com/search?q={query}"),
+            InlineKeyboardButton(text="Spotify", url=f"https://open.spotify.com/search/{query}"),
+        ],
+        [InlineKeyboardButton(text=t(lang, "btn_artist_search"), callback_data=f"asearch:{artist_token}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_song_caption(song_link: str | None) -> str:
@@ -1894,7 +1936,7 @@ async def handle_link(message: Message):
 
     token = uuid.uuid4().hex[:12]
     ext = os.path.splitext(filepath)[1].lower()
-    caption = t(lang, "caption")
+    caption = build_media_caption(url)
     keyboard = music_inline_kb(lang, token)
 
     try:
@@ -1902,7 +1944,7 @@ async def handle_link(message: Message):
             await message.answer_photo(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
         else:
             await message.answer_video(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
-        FILE_CACHE[token] = filepath
+        FILE_CACHE[token] = {"filepath": filepath, "source_url": url}
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
         log.warning("send failed: %s", e)
@@ -2034,7 +2076,9 @@ async def cb_search_action(call: CallbackQuery):
 async def cb_recognize_music(call: CallbackQuery):
     lang = await get_user_lang(call.from_user.id)
     token = call.data.split(":", 1)[1]
-    video_path = FILE_CACHE.get(token)
+    entry = FILE_CACHE.get(token)
+    video_path = entry.get("filepath") if entry else None
+    source_url = entry.get("source_url", "") if entry else ""
     if not video_path or not os.path.exists(video_path):
         await call.answer(t(lang, "file_expired"), show_alert=True)
         return
@@ -2056,7 +2100,19 @@ async def cb_recognize_music(call: CallbackQuery):
             await status.edit_text(t(lang, "not_recognized"))
             return
 
-        await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
+        # edit the video's own caption/keyboard to show the recognized song
+        # (see reference screenshot) before downloading the mp3 itself
+        artist_token = uuid.uuid4().hex[:10]
+        ARTIST_SEARCH_CACHE[artist_token] = song["artist"]
+        asyncio.create_task(_expire_artist_cache(artist_token, delay=SEARCH_CACHE_TTL_SECONDS))
+        try:
+            await call.message.edit_caption(
+                caption=build_recognized_caption(song["title"], song["artist"], source_url),
+                reply_markup=recognized_song_kb(lang, song["title"], song["artist"], artist_token),
+            )
+        except Exception as e:
+            log.warning("could not edit video caption: %s", e)
+
         query = f"{song['artist']} {song['title']}"
         mp3_path, song_link = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
@@ -2082,6 +2138,39 @@ async def cb_recognize_music(call: CallbackQuery):
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(video_outdir, ignore_errors=True)
         FILE_CACHE.pop(token, None)
+
+
+async def _expire_artist_cache(token: str, delay: int):
+    await asyncio.sleep(delay)
+    ARTIST_SEARCH_CACHE.pop(token, None)
+
+
+@router.callback_query(F.data.startswith("asearch:"))
+async def cb_artist_search(call: CallbackQuery):
+    lang = await get_user_lang(call.from_user.id)
+    token = call.data.split(":", 1)[1]
+    artist = ARTIST_SEARCH_CACHE.get(token)
+    if not artist:
+        await call.answer(t(lang, "file_expired"), show_alert=True)
+        return
+
+    await call.answer()
+    status = await call.message.answer(t(lang, "searching"))
+    try:
+        results = await text_search_songs(artist)
+    except Exception as e:
+        log.warning("artist search failed: %s", e)
+        await status.edit_text(t(lang, "error"))
+        return
+    if not results:
+        await status.edit_text(t(lang, "search_no_results"))
+        return
+
+    search_token = uuid.uuid4().hex[:12]
+    SEARCH_CACHE[search_token] = {"query": artist, "results": results, "page": 0}
+    asyncio.create_task(_expire_search_cache(search_token, delay=SEARCH_CACHE_TTL_SECONDS))
+    text, kb = render_search_page(lang, search_token)
+    await status.edit_text(text, reply_markup=kb)
 
 
 # ============================================================
