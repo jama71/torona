@@ -1543,7 +1543,9 @@ async def download_media(url: str, outdir: str, platform: str):
 # ============================================================
 
 def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] | None:
-    """Search+download the first SoundCloud result. Returns (mp3_path, webpage_url) or None."""
+    """Search SoundCloud and download the first playable result, skipping
+    any DRM-protected (Go+) tracks it can't fetch. Returns (mp3_path,
+    webpage_url) or None if nothing playable was found."""
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
@@ -1560,25 +1562,39 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
     }
     if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
         ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
+
+    # Fetch several candidates up front (flat, no download) so a DRM-blocked
+    # top result doesn't kill the whole search - just move to the next one.
+    flat_opts = dict(ydl_opts)
+    flat_opts["extract_flat"] = "in_playlist"
+    flat_opts.pop("postprocessors", None)
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"scsearch1:{query}", download=True)
-            if not info:
-                return None
-            if "entries" in info:
-                entries = [e for e in (info.get("entries") or []) if e]
-                if not entries:
-                    return None
-                info = entries[0]
-            filename = ydl.prepare_filename(info)
-            mp3_path = os.path.splitext(filename)[0] + ".mp3"
-            if not os.path.exists(mp3_path):
-                return None
-            webpage_url = info.get("webpage_url") or info.get("url") or ""
-            return mp3_path, webpage_url
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            info = ydl.extract_info(f"scsearch5:{query}", download=False)
+            candidates = [e for e in (info.get("entries") or []) if e and e.get("url")]
     except Exception as e:
         log.warning("SoundCloud search failed for '%s': %s", query, e)
         return None
+
+    for cand in candidates:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                dl_info = ydl.extract_info(cand["url"], download=True)
+                if "entries" in dl_info:
+                    entries = [e for e in (dl_info.get("entries") or []) if e]
+                    if not entries:
+                        continue
+                    dl_info = entries[0]
+                filename = ydl.prepare_filename(dl_info)
+                mp3_path = os.path.splitext(filename)[0] + ".mp3"
+                if not os.path.exists(mp3_path):
+                    continue
+                webpage_url = dl_info.get("webpage_url") or dl_info.get("url") or ""
+                return mp3_path, webpage_url
+        except Exception as e:
+            log.warning("SoundCloud candidate skipped for '%s': %s", query, e)
+            continue
+    return None
 
 
 # --- VK Music (fallback) ---------------------------------------------------
@@ -1586,13 +1602,20 @@ _VK_API_VERSION = "5.131"
 _VK_CLIENT_ID = "2685278"          # Kate Mobile public client id
 _VK_CLIENT_SECRET = "lxhD8OD7dMsqtXIm5IUY"  # Kate Mobile public client secret
 _vk_token_cache: dict = {}
+_VK_AUTH_COOLDOWN_SECONDS = 1800  # 30 min - avoid retrying login repeatedly and getting locked out
+_vk_auth_cooldown_until = 0.0
 
 
 async def _vk_get_token() -> str | None:
+    global _vk_auth_cooldown_until
     if _vk_token_cache.get("token"):
         return _vk_token_cache["token"]
     if not VK_LOGIN or not VK_PASSWORD:
         log.warning("VK fallback skipped: VK_LOGIN/VK_PASSWORD not set in environment")
+        return None
+    now = time.time()
+    if now < _vk_auth_cooldown_until:
+        log.info("VK fallback skipped: auth in cooldown for %d more sec", int(_vk_auth_cooldown_until - now))
         return None
     params = {
         "grant_type": "password",
@@ -1611,10 +1634,12 @@ async def _vk_get_token() -> str | None:
                 data = await resp.json(content_type=None)
     except Exception as e:
         log.warning("VK auth request failed: %s", e)
+        _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
         return None
     token = data.get("access_token")
     if not token:
         log.warning("VK auth failed: %s", data.get("error_description") or data)
+        _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
         return None
     _vk_token_cache["token"] = token
     return token
@@ -2042,12 +2067,21 @@ async def cb_search_action(call: CallbackQuery):
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
         source = entry.get("source", "soundcloud")
-        mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
         title = entry.get("title") or "Unknown"
         performer = entry.get("uploader") or ""
-        # VK's stored "url" is a raw direct-stream link, not a shareable page -
-        # don't show it as a "source" button, only SoundCloud page links make sense there.
-        link_for_button = entry.get("url") if source == "soundcloud" else None
+        try:
+            mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
+            link_for_button = entry.get("url") if source == "soundcloud" else None
+        except Exception as e:
+            if source == "soundcloud" and "drm protected" in str(e).lower():
+                # this specific track is Go+/DRM-locked - fall back to a
+                # fresh SoundCloud->VK search using its title/artist instead
+                log.info("picked track is DRM-protected, falling back to search: %s", title)
+                mp3_path, link_for_button = await search_and_download_song(
+                    f"{performer} {title}".strip(), work_dir
+                )
+            else:
+                raise
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=title,
