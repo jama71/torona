@@ -282,6 +282,9 @@ def _check_cookies_expiry(path):
     else:
         log.info("✅ YouTube cookies amal qilmoqda.")
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("bot")
+
 _check_cookies_expiry(COOKIES_FILE)
 
 # A realistic desktop User-Agent + an Android/iOS "player_client" combo is
@@ -293,9 +296,6 @@ DEFAULT_UA = (
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
 CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("bot")
 
 URL_RE = re.compile(r"(https?://\S+)")
 PLATFORM_PATTERNS = {
