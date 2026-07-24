@@ -101,6 +101,12 @@ GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 SOUNDCLOUD_COOKIES_FILE = os.getenv("SOUNDCLOUD_COOKIES_FILE", "").strip() or None
 VK_LOGIN = os.getenv("VK_LOGIN", "").strip()
 VK_PASSWORD = os.getenv("VK_PASSWORD", "").strip()
+# Preferred: a long-lived token obtained once via the Kate Mobile OAuth
+# implicit flow (oauth.vk.com/authorize?...&response_type=token). When set,
+# this is used directly and VK_LOGIN/VK_PASSWORD password-grant auth (which
+# can trigger VK security checks / captcha and lock out for 30 min) is
+# skipped entirely.
+VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip() or None
 
 
 def _repair_cookie_line(line: str) -> str:
@@ -1608,6 +1614,11 @@ _vk_auth_cooldown_until = 0.0
 
 async def _vk_get_token() -> str | None:
     global _vk_auth_cooldown_until
+    # Preferred path: a long-lived token obtained once via the Kate Mobile
+    # OAuth implicit flow. No network call, no password-grant risk, no
+    # cooldown - just use it directly every time.
+    if VK_ACCESS_TOKEN:
+        return VK_ACCESS_TOKEN
     if _vk_token_cache.get("token"):
         return _vk_token_cache["token"]
     if not VK_LOGIN or not VK_PASSWORD:
