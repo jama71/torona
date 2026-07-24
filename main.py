@@ -1,16 +1,15 @@
 import asyncio
 import base64
-import json
+import io
 import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import time
 import urllib.parse
-import urllib.request
 import uuid
+import zipfile
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
@@ -33,6 +32,9 @@ from aiogram.types import (
     FSInputFile,
 )
 
+import json
+import time
+
 import aiohttp
 import yt_dlp
 
@@ -42,7 +44,16 @@ except ImportError:
     Shazam = None
 
 # ------------------------------------------------------------
-# ffmpeg setup
+# ffmpeg: bundled via imageio-ffmpeg so it works on ANY host
+# (Railway/Docker/etc.) without relying on apt packages being
+# installed by the build system. This fixes:
+#   "No such file or directory: 'ffmpeg'"
+#
+# IMPORTANT: imageio-ffmpeg's binary is NOT named "ffmpeg" (e.g.
+# "ffmpeg-linux64-v4.2.2"), but shazamio/pydub always shell out to the
+# literal command name "ffmpeg". Just adding its folder to PATH is not
+# enough - we create a symlink (or copy) literally called "ffmpeg" in a
+# directory we control and put THAT directory on PATH.
 # ------------------------------------------------------------
 try:
     import imageio_ffmpeg
@@ -64,29 +75,224 @@ except Exception as e:
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 try:
+    # some libraries (pydub, etc.) look at this instead of PATH
     from pydub import AudioSegment
+
     AudioSegment.converter = FFMPEG_PATH
 except Exception:
     pass
 
 # ============================================================
-# CONFIG
+# CONFIG  (only these need to be set in Railway env variables)
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
+# Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
-VK_TOKEN = os.getenv("VK_TOKEN", "").strip()  # <-- VK Music uchun token
 
+# Song search (text search + Shazam recognition) uses SoundCloud first, then
+# VK Music as a fallback for tracks that are copyright-blocked or missing on
+# SoundCloud. YouTube is NOT used for song search anymore - only for
+# downloading video when the user pastes an actual YouTube link.
+SOUNDCLOUD_COOKIES_FILE = os.getenv("SOUNDCLOUD_COOKIES_FILE", "").strip() or None
+VK_LOGIN = os.getenv("VK_LOGIN", "").strip()
+VK_PASSWORD = os.getenv("VK_PASSWORD", "").strip()
+
+
+def _repair_cookie_line(line: str) -> str:
+    """Netscape cookie lines are tab-separated (7 fields). Some copy-paste
+    paths (chat UIs, some env-var editors) can collapse tabs into spaces -
+    if that happened but the 7 fields are still intact, rejoin them with
+    real tabs so yt-dlp's cookiejar parser accepts the line."""
+    if line.startswith("#") or not line.strip():
+        return line
+    if line.count("\t") == 6:
+        return line
+    parts = line.split()
+    if len(parts) == 7:
+        return "\t".join(parts)
+    return line
+
+
+def _normalize_cookies_content(content: str) -> str:
+    return "\n".join(_repair_cookie_line(l) for l in content.splitlines()) + "\n"
+
+
+def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
+    data_lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
+    valid = [l for l in data_lines if l.count("\t") == 6]
+    return len(valid), len(data_lines)
+
+
+# Fallback YouTube cookies baked directly into the code, so the bot works
+# out of the box without requiring any env var setup. If YOUTUBE_COOKIES /
+# YOUTUBE_COOKIES_B64 / COOKIES_FILE are set in the environment, those take
+# priority over this default. When these cookies eventually expire, either
+# set one of those env vars with a fresh export, or just replace the string
+# below with a newly exported cookies.txt content.
+DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com\tTRUE\t/\tTRUE\t1819078132\tLOGIN_INFO\tAFmmF2swRQIhAPTjGCIxT8jRFvu-UolA342zLgu4Wa_2Zg92vp9En0f1AiAaa9qyD5ILBnLeo6OgnSGLGVRv0IKnIfpUwAlAiijq4A:QUQ3MjNmd05EeHR1Vl9DVlpmcXZpZ1dGRjRVdXdGWHlBNHdDc2Y4TnJsNkNfRmZ1Uk5IOUV2S0N0V1Y0dmZRdVgxWXpXcURnbE1Oa2VhX2JReEdWMVU4WU9kVWVmYTFPV1NOeHlocnlpV0lUQk5idzRWN2o2SWY5SWlWUlhxVkUwMWpCOHdOdXFudmxmWGdWejlTdjZUUGpQWWVfbGs0NWhB
+.youtube.com\tTRUE\t/\tTRUE\t1819369279\tPREF\tf4=4000000&f6=40000000&tz=Europe.Moscow&f5=30000&f7=100
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kpU9dZecQsB5RRO-E-fmk8QACgYKAYASARESFQHGX2Mi0g05dheS9FYBwFBrRZLvOBoVAUF8yKrYZ_w8cDPohd7oXUydNbfv0076
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kTUFP5u_URqr4RLf1RAc7qQACgYKAUgSARESFQHGX2MiClb-98xP_LHUjxzJnfOixRoVAUF8yKrxoHf6nlzwh5I3ZjzNT_R-0076
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91ksdQIslqIrxmyjfnwdSbKAwACgYKAXQSARESFQHGX2MijIy-KUAzMVhqjzBcy9BwzBoVAUF8yKpvZm8xRlFViIpBH21_SFv40076
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tHSID\tA5iCJpeoCJ2ie9azx
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSSID\tAE0d43TagniTeg68R
+.youtube.com\tTRUE\t/\tFALSE\t1819216487\tAPISID\tYj70mCU8-qbvexyA/Awam3JMJ3Wgp0rLds
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
+.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-1PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
+.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-3PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
+.youtube.com\tTRUE\t/\tFALSE\t1816345290\tSIDCC\tAKEyXzUolKajdTygx5UzGp4pGXctqE_D9byXYjYtllffuKdSe1NjaOizavFKxDszrKeUalQ1
+.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-1PSIDCC\tAKEyXzUI5fQyhfizthBUPsnSn37I3QIDpTVoXYPrT59pGCakSeV7355d1YGYXUCniqL4BzJg5A
+.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-3PSIDCC\tAKEyXzXRFdHWQLJ_kGcioFq7UkJSxCn8WVilfs_pqw0JdI8f3zvOJkGg2cRqTePiEx1_xKeEpQ
+.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_INFO1_LIVE\twgdW23KNv4Y
+.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_PRIVACY_METADATA\tCgJVWhIEGgAgUg%3D%3D
+.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-YNID\t20.YT=oKxGC8RBOKMAfttV5lr5ZRDRLG_iIJ7ZRTrVPvNR9fsfB46IlZdCHNK2hg7VEtCDypQ7szpq8_BGj_cSSQ-h9b-eY4o6N-NN1J6jO0xdIpIUoS8fUzauxWqJ50qCTG9Gd8qCYpJ8b5Bwrk2tgCQ2vvjVpTXOjm-lbYyk1yNyxCKcs08Iu_ustbrx2gEV4aTGMPCh4cIB8Pm6PrsuTl6jbT_10zse0cF83aerHzi-TNtGEl2ZRfrr78tLkJhALIFBR9ENFyoDpPzlfvb4BUKbeqvTi15fo2Sbf2nlYow_7lUCKg0IjyvmpDxa_6zrlW5p4Qxf7Kkp-H0V_2QHwENS0A
+.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tGZn2TispEpo
+.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-ROLLOUT_TOKEN\tCPrC1NDb5MzydhDs2-2IqOCVAxjL36TiyeiVAw%3D%3D
+"""
+
+
+def _write_cookies_file(content: str) -> str:
+    cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    with open(cookies_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return cookies_path
+
+
+def _try_load_cookie_candidate(source: str, content: str, logger) -> str | None:
+    content = _normalize_cookies_content(content)
+    valid, total = _count_valid_cookie_lines(content)
+    if total == 0 or valid == 0:
+        logger.warning(
+            "%s does not look like a valid cookies.txt (found %d/%d usable cookie lines) - "
+            "skipping it and trying the next available source.",
+            source, valid, total,
+        )
+        return None
+    if valid < total:
+        logger.warning(
+            "%s: only %d/%d cookie lines look valid - the value may be truncated, using it anyway.",
+            source, valid, total,
+        )
+    path = _write_cookies_file(content)
+    logger.info("YouTube cookies loaded from %s (%d cookie lines).", source, valid)
+    return path
+
+
+def _setup_youtube_cookies() -> str | None:
+    """
+    YouTube increasingly blocks cloud/datacenter IPs (Railway included) with
+    "Sign in to confirm you're not a bot" REGARDLESS of which player_client
+    yt-dlp uses. The only reliable fix is real browser cookies.
+
+    Tries each source in order and FALLS THROUGH to the next one if a
+    source is set but turns out invalid/empty/truncated - a broken or
+    stale env var (e.g. left over from earlier troubleshooting) must never
+    block the built-in default from being used:
+      1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
+      2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
+      3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
+      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if nothing
+         else worked, so the bot works without any extra setup.
+    """
+    logger = logging.getLogger("bot")
+    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    path_env = os.getenv("COOKIES_FILE", "").strip()
+
+    if b64:
+        cleaned = "".join(b64.split())
+        padding = len(cleaned) % 4
+        if padding:
+            cleaned += "=" * (4 - padding)
+        try:
+            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
+            result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(
+                "YOUTUBE_COOKIES_B64 could not be decoded (%s) - trying the next available source.",
+                e,
+            )
+
+    if raw:
+        result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
+        if result:
+            return result
+
+    if path_env and os.path.exists(path_env):
+        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
+        return path_env
+
+    result = _try_load_cookie_candidate(
+        "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)",
+        DEFAULT_YOUTUBE_COOKIES,
+        logger,
+    )
+    if result:
+        return result
+
+    logger.warning("No usable YouTube cookies found anywhere - relying on player_client fallback only.")
+    return None
+
+
+# Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
+# "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
+COOKIES_FILE = _setup_youtube_cookies()
+
+
+def _check_cookies_expiry(path):
+    """Startup da cookie muddatini tekshiradi va ogohlantiradi."""
+    if not path or not os.path.exists(path):
+        return
+    now = int(time.time())
+    expired = 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) >= 5:
+                    try:
+                        exp = int(parts[4])
+                        if 0 < exp < now:
+                            expired += 1
+                    except ValueError:
+                        pass
+    except Exception:
+        return
+    if expired:
+        log.warning(
+            "⚠️  %d YouTube cookie(s) MUDDATI O\'TGAN! "
+            "Bot 'Sign in to confirm' xatosini beradi. "
+            "Yangi cookies eksport qilib YOUTUBE_COOKIES_B64 ga qo\'ying.",
+            expired,
+        )
+    else:
+        log.info("✅ YouTube cookies amal qilmoqda.")
+
+_check_cookies_expiry(COOKIES_FILE)
+
+# A realistic desktop User-Agent + an Android/iOS "player_client" combo is
+# currently the most reliable way to dodge YouTube's bot-check without cookies.
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
-CACHE_TTL_SECONDS = 300
+CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -100,13 +306,19 @@ PLATFORM_PATTERNS = {
     "snapchat": re.compile(r"snapchat\.com"),
 }
 
+# token -> local video path, used only for the "detect music" button
 FILE_CACHE: dict[str, str] = {}
+
+# token -> {"query": str, "results": [...], "page": int}, used for the
+# text-based music search feature (search -> pick from list -> mp3)
 SEARCH_CACHE: dict[str, dict] = {}
 SEARCH_RESULTS_PER_PAGE = 8
-SEARCH_FETCH_LIMIT = 40
+SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
 SEARCH_CACHE_TTL_SECONDS = 600
 
+# bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
+
 pool: asyncpg.Pool | None = None
 
 
@@ -118,11 +330,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
-            "Menga Instagram, TikTok, Pinterest yoki Snapchat havolasini "
+            "Menga Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini "
             "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
             "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
         ),
-        "send_link": "🔗 Havolani yuboring (Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Yuklanmoqda, biroz kuting...",
         "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
         "detect_music_btn": "🎵 Musiqani aniqlash",
@@ -131,10 +343,10 @@ TEXTS = {
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_source_link": "🔍 Manbani ochish",
-        "youtube_unavailable": "⚠️ Kechirasiz, YouTube'dan video yuklash xizmati vaqtincha ishlamayapti. Instagram, TikTok va boshqalar ishlayveradi.",
+        "btn_youtube_link": "🔍 SoundCloud'da ochish",
+        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
+        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
         "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
@@ -149,11 +361,11 @@ TEXTS = {
         "search_results_range": "Natijalar {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Yordam</b>\n\n"
-            "1) Instagram, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
+            "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
             "2) Bot mediani yuklab beradi.\n"
             "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
             "MP3 shaklida yuboradi.\n"
-            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot SoundCloud va Deezer'dan "
+            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot YouTube'dan "
             "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
             "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
         ),
@@ -165,6 +377,17 @@ TEXTS = {
         "btn_broadcast": "📢 Xabar yuborish",
         "btn_add_channel": "➕ Majburiy obuna qo'shish",
         "btn_list_channels": "📋 Majburiy obunalar",
+        "btn_clear_cache": "🗑 Cache tozalash",
+        "btn_db_export": "📤 DB export",
+        "btn_db_import": "📥 DB import",
+        "cache_cleared": "✅ Vaqtinchalik cache tozalandi ({count} ta yozuv).",
+        "db_export_empty": "📭 Bazada foydalanuvchilar topilmadi.",
+        "db_export_caption": "📦 DB export — {count} ta foydalanuvchi (.vk fayllar zip ichida).",
+        "db_export_fail": "❌ DB export qilishda xatolik yuz berdi.",
+        "db_import_ask": "📥 Import qilish uchun avval yuborilgan .zip yoki .vk fayl(lar)ni yuboring.",
+        "db_import_done": "✅ Import tugadi: {added} ta qo'shildi, {updated} ta yangilandi, {failed} ta xato.",
+        "db_import_fail": "❌ Faylni o'qib bo'lmadi. To'g'ri .zip yoki .vk fayl yuboring.",
+        "db_import_no_file": "❗️ Iltimos, .zip yoki .vk fayl yuboring.",
         "ask_channel": (
             "📎 Kanal/gurux qo'shish uchun:\n\n"
             "1) Botni o'sha kanal/guruhga <b>administrator</b> qilib qo'ying.\n"
@@ -189,10 +412,10 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
-            "Отправьте мне ссылку с Instagram, TikTok, Pinterest или Snapchat — "
+            "Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat — "
             "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
         ),
-        "send_link": "🔗 Отправьте ссылку (Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Загружается, подождите...",
         "caption": "✅ Спасибо, что пользуетесь ботом!",
         "detect_music_btn": "🎵 Распознать музыку",
@@ -201,10 +424,10 @@ TEXTS = {
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
-        "btn_source_link": "🔍 Открыть источник",
-        "youtube_unavailable": "⚠️ Извините, сервис загрузки с YouTube временно не работает. Instagram, TikTok и другие продолжают работать.",
+        "btn_youtube_link": "🔍 Открыть в SoundCloud",
+        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.",
+        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
         "admin_only": "⛔ Эта команда только для администраторов.",
@@ -219,10 +442,10 @@ TEXTS = {
         "search_results_range": "Результаты {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Помощь</b>\n\n"
-            "1) Отправьте ссылку с Instagram, TikTok, Pinterest или Snapchat.\n"
+            "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
             "2) Бот скачает медиа.\n"
             "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
-            "4) Или просто напишите название песни/исполнителя — бот найдет на SoundCloud и Deezer "
+            "4) Или просто напишите название песни/исполнителя — бот найдёт на YouTube "
             "и пришлёт выбранный трек в MP3.\n\n"
             "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
         ),
@@ -234,6 +457,17 @@ TEXTS = {
         "btn_broadcast": "📢 Рассылка",
         "btn_add_channel": "➕ Добавить обяз. подписку",
         "btn_list_channels": "📋 Список подписок",
+        "btn_clear_cache": "🗑 Очистить кэш",
+        "btn_db_export": "📤 Экспорт БД",
+        "btn_db_import": "📥 Импорт БД",
+        "cache_cleared": "✅ Временный кэш очищен ({count} записей).",
+        "db_export_empty": "📭 Пользователи в базе не найдены.",
+        "db_export_caption": "📦 Экспорт БД — {count} пользователей (.vk файлы в zip).",
+        "db_export_fail": "❌ Ошибка при экспорте БД.",
+        "db_import_ask": "📥 Для импорта отправьте ранее выгруженный .zip или .vk файл(ы).",
+        "db_import_done": "✅ Импорт завершён: добавлено {added}, обновлено {updated}, ошибок {failed}.",
+        "db_import_fail": "❌ Не удалось прочитать файл. Отправьте корректный .zip или .vk файл.",
+        "db_import_no_file": "❗️ Пожалуйста, отправьте .zip или .vk файл.",
         "ask_channel": (
             "📎 Чтобы добавить канал/группу:\n\n"
             "1) Сделайте бота <b>администратором</b> в этом канале/группе.\n"
@@ -258,11 +492,11 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
         "welcome": (
             "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
-            "Send me a link from Instagram, TikTok, Pinterest or Snapchat — "
+            "Send me a link from Instagram, YouTube, TikTok, Pinterest or Snapchat — "
             "I'll download the media for you. Use the button under the video to recognize "
             "the music in it and get it as an MP3 🎵"
         ),
-        "send_link": "🔗 Send a link (Instagram / TikTok / Pinterest / Snapchat).",
+        "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Downloading, please wait...",
         "caption": "✅ Thanks for using our bot!",
         "detect_music_btn": "🎵 Recognize music",
@@ -271,10 +505,10 @@ TEXTS = {
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
-        "btn_source_link": "🔍 Open source",
-        "youtube_unavailable": "⚠️ Sorry, YouTube download service is temporarily unavailable. Instagram, TikTok, etc. work as usual.",
+        "btn_youtube_link": "🔍 Open on SoundCloud",
+        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, TikTok, Pinterest or Snapchat.",
+        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
         "admin_only": "⛔ This command is for admins only.",
@@ -289,10 +523,10 @@ TEXTS = {
         "search_results_range": "Results {start}-{end} / {total}",
         "help": (
             "ℹ️ <b>Help</b>\n\n"
-            "1) Send a link from Instagram, TikTok, Pinterest or Snapchat.\n"
+            "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
             "2) The bot downloads the media.\n"
             "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
-            "4) Or just type a song/artist name — the bot will search SoundCloud and Deezer and send the "
+            "4) Or just type a song/artist name — the bot will search YouTube and send the "
             "track you pick as MP3.\n\n"
             "To change language, use the \"🌐 Language\" button below."
         ),
@@ -304,6 +538,17 @@ TEXTS = {
         "btn_broadcast": "📢 Broadcast",
         "btn_add_channel": "➕ Add mandatory sub",
         "btn_list_channels": "📋 Mandatory subs",
+        "btn_clear_cache": "🗑 Clear cache",
+        "btn_db_export": "📤 DB export",
+        "btn_db_import": "📥 DB import",
+        "cache_cleared": "✅ Temporary cache cleared ({count} entries).",
+        "db_export_empty": "📭 No users found in the database.",
+        "db_export_caption": "📦 DB export — {count} users (.vk files inside a zip).",
+        "db_export_fail": "❌ DB export failed.",
+        "db_import_ask": "📥 To import, send a previously exported .zip or .vk file(s).",
+        "db_import_done": "✅ Import finished: {added} added, {updated} updated, {failed} failed.",
+        "db_import_fail": "❌ Could not read the file. Send a valid .zip or .vk file.",
+        "db_import_no_file": "❗️ Please send a .zip or .vk file.",
         "ask_channel": (
             "📎 To add a channel/group:\n\n"
             "1) Make the bot an <b>administrator</b> there.\n"
@@ -333,7 +578,7 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 
 # ============================================================
-# DATABASE
+# DATABASE (PostgreSQL via asyncpg)
 # ============================================================
 async def init_db():
     global pool
@@ -476,6 +721,51 @@ async def count_channel_subscribers(chat_id: int) -> int:
         )
 
 
+async def get_all_users_export() -> list[dict]:
+    """One record per user, including which mandatory channels they're
+    subscribed to - used to build the .vk export files."""
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id, lang, joined_at FROM users ORDER BY user_id")
+        subs = await conn.fetch("SELECT chat_id, user_id FROM channel_subscribers")
+    by_user: dict[int, list[int]] = {}
+    for r in subs:
+        by_user.setdefault(r["user_id"], []).append(r["chat_id"])
+    records = []
+    for u in users:
+        records.append(
+            {
+                "user_id": u["user_id"],
+                "lang": u["lang"],
+                "joined_at": u["joined_at"].isoformat() if u["joined_at"] else None,
+                "subscribed_channels": by_user.get(u["user_id"], []),
+            }
+        )
+    return records
+
+
+async def upsert_user_export(record: dict) -> bool:
+    """Insert or update a single user record from a .vk import file.
+    Returns True if this was a brand-new row, False if it updated an
+    existing one."""
+    user_id = int(record["user_id"])
+    lang = record.get("lang") or "uz"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO users (user_id, lang) VALUES ($1, $2)
+               ON CONFLICT (user_id) DO UPDATE SET lang = EXCLUDED.lang
+               RETURNING (xmax = 0) AS inserted""",
+            user_id, lang,
+        )
+        inserted = bool(row["inserted"]) if row else False
+        for chat_id in record.get("subscribed_channels") or []:
+            await conn.execute(
+                "INSERT INTO channel_subscribers (chat_id, user_id) VALUES ($1, $2) "
+                "ON CONFLICT DO NOTHING",
+                int(chat_id), user_id,
+            )
+    return inserted
+
+
 # ============================================================
 # BOT / DISPATCHER
 # ============================================================
@@ -486,6 +776,14 @@ dp.include_router(router)
 
 
 class EnsureUserRegisteredMiddleware(BaseMiddleware):
+    """
+    Registers a user in the DB the moment they interact with the bot in ANY
+    way (any message text, any button press) - not only via /start. This
+    matters for people who were already using an earlier version of this
+    bot: they won't need to press /start again, whatever they send just
+    gets them added to the users table if they're not there yet.
+    """
+
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
@@ -503,6 +801,7 @@ dp.callback_query.outer_middleware(EnsureUserRegisteredMiddleware())
 class AdminStates(StatesGroup):
     waiting_broadcast = State()
     waiting_channel = State()
+    waiting_db_import = State()
 
 
 def lang_inline_kb() -> InlineKeyboardMarkup:
@@ -525,12 +824,18 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     )
 
 
-def song_result_kb(lang: str, title: str, artist: str, source_url: str | None) -> InlineKeyboardMarkup:
+def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
+    """
+    Buttons shown under a sent MP3:
+    - "Lyrics" links out to a lyrics search page instead of reproducing the
+      full copyrighted lyrics text inside the bot.
+    - "Open on YouTube" links to the source video the audio came from.
+    """
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
     rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
-    if source_url:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_source_link"), url=source_url)])
+    if youtube_url:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=youtube_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -548,6 +853,8 @@ def admin_reply_kb(lang: str) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=t(lang, "btn_stats")), KeyboardButton(text=t(lang, "btn_broadcast"))],
             [KeyboardButton(text=t(lang, "btn_add_channel"))],
             [KeyboardButton(text=t(lang, "btn_list_channels"))],
+            [KeyboardButton(text=t(lang, "btn_clear_cache")), KeyboardButton(text=t(lang, "btn_db_export"))],
+            [KeyboardButton(text=t(lang, "btn_db_import"))],
             [KeyboardButton(text=t(lang, "btn_back"))],
         ],
         resize_keyboard=True,
@@ -587,7 +894,7 @@ async def cb_lang(call: CallbackQuery):
 
 
 # ============================================================
-# HANDLERS: persistent reply-keyboard buttons
+# HANDLERS: persistent reply-keyboard buttons (user side)
 # ============================================================
 @router.message(F.text.in_({v["btn_lang"] for v in TEXTS.values()}))
 async def btn_change_lang(message: Message):
@@ -652,6 +959,145 @@ async def do_broadcast(message: Message, state: FSMContext):
     await message.answer(t(lang, "broadcast_done", count=count), reply_markup=admin_reply_kb(lang))
 
 
+# ============================================================
+# HANDLERS: admin - clear in-memory cache
+# ============================================================
+@router.message(F.text.in_({v["btn_clear_cache"] for v in TEXTS.values()}))
+async def btn_clear_cache(message: Message):
+    lang = await get_user_lang(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
+    count = len(SEARCH_CACHE) + len(FILE_CACHE)
+    SEARCH_CACHE.clear()
+    FILE_CACHE.clear()
+    _vk_token_cache.clear()
+    # best-effort: remove any leftover temp download folders from this bot
+    try:
+        for name in os.listdir(DOWNLOAD_ROOT):
+            path = os.path.join(DOWNLOAD_ROOT, name)
+            if os.path.isdir(path) and (name.startswith("tmp") or "torona" in name.lower()):
+                shutil.rmtree(path, ignore_errors=True)
+    except Exception as e:
+        log.warning("cache dir cleanup skipped: %s", e)
+    await message.answer(t(lang, "cache_cleared", count=count), reply_markup=admin_reply_kb(lang))
+
+
+# ============================================================
+# HANDLERS: admin - DB export (zip of one .vk file per user)
+# ============================================================
+@router.message(F.text.in_({v["btn_db_export"] for v in TEXTS.values()}))
+async def btn_db_export(message: Message):
+    lang = await get_user_lang(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        records = await get_all_users_export()
+    except Exception as e:
+        log.warning("DB export failed: %s", e)
+        await message.answer(t(lang, "db_export_fail"), reply_markup=admin_reply_kb(lang))
+        return
+    if not records:
+        await message.answer(t(lang, "db_export_empty"), reply_markup=admin_reply_kb(lang))
+        return
+
+    export_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
+    zip_path = os.path.join(export_dir, f"db_export_{int(time.time())}.zip")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rec in records:
+                zf.writestr(f"{rec['user_id']}.vk", json.dumps(rec, ensure_ascii=False, indent=2))
+        await message.answer_document(
+            FSInputFile(zip_path, filename=os.path.basename(zip_path)),
+            caption=t(lang, "db_export_caption", count=len(records)),
+            reply_markup=admin_reply_kb(lang),
+        )
+    except Exception as e:
+        log.warning("DB export zip/send failed: %s", e)
+        await message.answer(t(lang, "db_export_fail"), reply_markup=admin_reply_kb(lang))
+    finally:
+        shutil.rmtree(export_dir, ignore_errors=True)
+
+
+# ============================================================
+# HANDLERS: admin - DB import (admin resends exported .zip / .vk files)
+# ============================================================
+@router.message(F.text.in_({v["btn_db_import"] for v in TEXTS.values()}))
+async def btn_db_import_ask(message: Message, state: FSMContext):
+    lang = await get_user_lang(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(t(lang, "db_import_ask"))
+    await state.set_state(AdminStates.waiting_db_import)
+
+
+def _parse_vk_records_from_bytes(filename: str, raw: bytes) -> list[dict]:
+    """Returns a list of user record dicts found in one uploaded file.
+    Supports a .zip full of .vk files, or a single .vk/.json file."""
+    records = []
+    if filename.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith((".vk", ".json")):
+                    continue
+                try:
+                    records.append(json.loads(zf.read(name).decode("utf-8")))
+                except Exception as e:
+                    log.warning("skip bad entry %s in zip: %s", name, e)
+    else:
+        records.append(json.loads(raw.decode("utf-8")))
+    return records
+
+
+@router.message(AdminStates.waiting_db_import, F.document)
+async def do_db_import(message: Message, state: FSMContext):
+    lang = await get_user_lang(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    doc = message.document
+    filename = doc.file_name or "upload.vk"
+    if not filename.lower().endswith((".zip", ".vk", ".json")):
+        await message.answer(t(lang, "db_import_no_file"))
+        return
+
+    added = updated = failed = 0
+    try:
+        file = await bot.get_file(doc.file_id)
+        buf = await bot.download_file(file.file_path)
+        raw = buf.read()
+        records = _parse_vk_records_from_bytes(filename, raw)
+        for rec in records:
+            try:
+                is_new = await upsert_user_export(rec)
+                if is_new:
+                    added += 1
+                else:
+                    updated += 1
+            except Exception as e:
+                log.warning("import: bad record skipped: %s", e)
+                failed += 1
+    except Exception as e:
+        log.warning("DB import failed: %s", e)
+        await message.answer(t(lang, "db_import_fail"), reply_markup=admin_reply_kb(lang))
+        await state.clear()
+        return
+
+    await message.answer(
+        t(lang, "db_import_done", added=added, updated=updated, failed=failed),
+        reply_markup=admin_reply_kb(lang),
+    )
+    # stay in waiting_db_import state so the admin can send more files in a
+    # row (e.g. several .vk files one after another); "⬅️ Orqaga" exits it
+    # via the generic btn_back_to_user handler registered earlier.
+
+
+@router.message(AdminStates.waiting_db_import)
+async def db_import_wrong_content(message: Message):
+    lang = await get_user_lang(message.from_user.id)
+    await message.answer(t(lang, "db_import_no_file"))
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     lang = await get_user_lang(message.from_user.id)
@@ -671,7 +1117,7 @@ async def cmd_admin(message: Message):
 
 
 # ============================================================
-# HANDLERS: admin - mandatory subscriptions
+# HANDLERS: admin - mandatory subscriptions (add / list / remove)
 # ============================================================
 @router.message(F.text.in_({v["btn_add_channel"] for v in TEXTS.values()}))
 async def btn_add_channel_ask(message: Message, state: FSMContext):
@@ -783,11 +1229,27 @@ async def cb_delete_channel(call: CallbackQuery):
     await call.answer(t(lang, "channel_removed"))
 
 
+
+# ============================================================
+# HANDLER: join requests for private mandatory channels
+#
+# IMPORTANT: this only LOGS the request. It never calls
+# bot.approve_chat_join_request() or decline_chat_join_request() - the
+# channel owner/admin must approve requests manually in Telegram.
+# The bot treats a user as "subscribed" only after Telegram reports them
+# as an actual channel member (see get_unsubscribed_channels below),
+# never just because they sent a join request.
+# ============================================================
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
     await log_join_request(update.chat.id, update.from_user.id)
 
 
+# ============================================================
+# HANDLER: track join/leave events for mandatory channels
+# (requires the bot to be an admin there - Telegram then sends
+# chat_member updates for every member change in that chat)
+# ============================================================
 @router.chat_member()
 async def on_chat_member_update(update: ChatMemberUpdated):
     channel = await get_channel_by_chat_id(update.chat.id)
@@ -805,7 +1267,19 @@ async def on_chat_member_update(update: ChatMemberUpdated):
         await unmark_channel_subscriber(update.chat.id, user_id)
 
 
+# ============================================================
+# MANDATORY SUBSCRIPTION CHECK
+# ============================================================
+# ============================================================
+# MANDATORY SUBSCRIPTION CHECK
+# ============================================================
 async def get_unsubscribed_channels(user_id: int):
+    """
+    A user only counts as subscribed once they are an ACTUAL member of the
+    channel/group (status member/administrator/creator). For private
+    channels this means the channel owner/admin must approve their join
+    request first - merely sending a join request is NOT enough on its own.
+    """
     channels = await list_channels()
     missing = []
     for c in channels:
@@ -847,7 +1321,7 @@ async def cb_check_sub(call: CallbackQuery):
 
 
 # ============================================================
-# DOWNLOAD HELPERS (Non-YouTube Media & SoundCloud/Deezer Music)
+# DOWNLOAD HELPERS
 # ============================================================
 def detect_platform(url: str) -> str | None:
     for name, pattern in PLATFORM_PATTERNS.items():
@@ -856,166 +1330,264 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
-    ydl_opts = {
+# Fallback order of YouTube "player_client" configs. Some of these dodge the
+# "Sign in to confirm you're not a bot" check better than others depending on
+# the datacenter IP the bot is hosted on, so we try them one by one.
+PLAYER_CLIENT_FALLBACKS = [
+    ["android", "web", "ios"],
+    ["ios"],
+    ["tv_embedded", "web"],
+    ["mweb"],
+]
+
+
+def _is_bot_check_error(exc: Exception) -> bool:
+    """Detect bot-check / auth errors worth retrying with another InnerTube client."""
+    msg = str(exc).lower()
+    return any(p in msg for p in (
+        "sign in to confirm",
+        "not a bot",
+        "cookies",           # "use --cookies-from-browser"
+        "http error 429",    # Too Many Requests
+        "too many requests",
+        "preconditionfailed",# InnerTube 412
+        "error code: 152",   # client context rejected
+        "video unavailable", # sometimes a masked bot-check
+    ))
+
+
+_cookie_hint_logged = False
+
+
+def _raise_ytdlp_failure(last_exc):
+    global _cookie_hint_logged
+    if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
+        _cookie_hint_logged = True
+        log.error(
+            "YouTube is blocking all requests from this IP (Railway datacenter). "
+            "Fix: export fresh cookies from your browser and set YOUTUBE_COOKIES_B64 "
+            "in Railway environment variables. See instructions below the code."
+        )
+    if last_exc is None:
+        raise RuntimeError("yt-dlp: all InnerTube client fallbacks exhausted.")
+    raise last_exc
+
+
+def _build_ydl_opts_base(outdir, player_clients):
+    """Shared yt-dlp options for all download functions.
+
+    - skip_webpage : talk directly to InnerTube API, skip the watch page
+    - player_skip  : for clients with pre-signed URLs, skip JS player fetch
+    With valid cookies these settings make requests pass bot-check on Railway.
+    """
+    _no_sig = {"android_testsuite", "android_creator", "tv_embedded"}
+    needs_player = not all(c in _no_sig for c in player_clients)
+
+    extractor_args = {
+        "player_client": player_clients,
+        "skip_webpage": ["1"],
+    }
+    if not needs_player:
+        extractor_args["player_skip"] = ["webpage", "configs", "js"]
+
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "best",
+        "extractor_args": {"youtube": extractor_args},
         "http_headers": {"User-Agent": DEFAULT_UA},
         "geo_bypass": True,
         "retries": 3,
         "socket_timeout": 30,
     }
     if outdir:
-        opts = ydl_opts
         opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
-    if use_proxy and GENERAL_PROXY:
-        ydl_opts["proxy"] = GENERAL_PROXY
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-        filename = ydl.prepare_filename(info)
-        return filename, info
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
+    last_exc = None
+    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "best[ext=mp4]/best"
+        if use_proxy and GENERAL_PROXY:
+            ydl_opts["proxy"] = GENERAL_PROXY
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if "entries" in info:
+                    info = info["entries"][0]
+                filename = ydl.prepare_filename(info)
+                return filename, info
+        except Exception as e:
+            last_exc = e
+            if "youtube" not in url and "youtu.be" not in url:
+                raise
+            if not _is_bot_check_error(e):
+                raise
+            log.warning(
+                "InnerTube client %s (attempt %d) blocked — trying next client",
+                player_clients, attempt + 1,
+            )
+            continue
+    _raise_ytdlp_failure(last_exc)
 
 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
-    use_proxy = platform != "tiktok"
+    use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
     return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
-# --- SoundCloud, Deezer & VK Music Helpers ---
+# ============================================================
+# SONG SEARCH: SoundCloud (primary) + VK Music (fallback)
+#
+# YouTube is deliberately NOT used here - Railway's datacenter IP gets
+# permanently bot-checked by YouTube regardless of client/cookies tricks.
+# SoundCloud has no such bot-check for public tracks. VK Music is used only
+# when a track is missing/copyright-blocked on SoundCloud, and requires a
+# real VK account (VK_LOGIN + VK_PASSWORD env vars) to authorize search.
+# ============================================================
 
-def search_deezer_api(query: str, limit: int = 1) -> list[dict]:
-    try:
-        encoded_query = urllib.parse.quote(query)
-        url = f"https://api.deezer.com/search?q={encoded_query}&limit={limit}"
-        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            tracks = data.get("data", [])
-            results = []
-            for track in tracks:
-                results.append({
-                    "id": str(track.get("id")),
-                    "title": track.get("title") or "Unknown",
-                    "uploader": track.get("artist", {}).get("name", "Unknown"),
-                    "duration": track.get("duration"),
-                    "view_count": track.get("rank", 0),
-                    "url": track.get("link")
-                })
-            return results
-    except Exception as e:
-        log.warning("Deezer API search failed: %s", e)
-        return []
-
-
-def search_vk_music(query: str, limit: int = 1) -> list[dict]:
-    """VK Music orqali qidirish (zaxira manba)"""
-    if not VK_TOKEN:
-        return []
-    try:
-        url = "https://api.vk.com/method/audio.search"
-        params = {
-            "q": query,
-            "count": limit,
-            "access_token": VK_TOKEN,
-            "v": "5.131"
-        }
-        req = urllib.request.Request(url, data=urllib.parse.urlencode(params).encode(),
-                                     headers={"User-Agent": DEFAULT_UA})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("response", {}).get("items", [])
-            results = []
-            for item in items:
-                owner_id = item.get("owner_id")
-                audio_id = item.get("id")
-                if not owner_id or not audio_id:
-                    continue
-                # VK audio'ga to'g'ridan-to'g'ri link yt-dlp orqali ishlaydi
-                audio_url = f"https://vk.com/audio{owner_id}_{audio_id}"
-                results.append({
-                    "id": str(audio_id),
-                    "title": item.get("title", "Unknown"),
-                    "uploader": item.get("artist", ""),
-                    "duration": item.get("duration"),
-                    "view_count": item.get("plays", 0),
-                    "url": audio_url
-                })
-            return results
-    except Exception as e:
-        log.warning("VK Music search failed: %s", e)
-        return []
-
-
-def _run_music_search_download(query: str, outdir: str) -> tuple[str, str]:
+def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] | None:
+    """Search+download the first SoundCloud result. Returns (mp3_path, webpage_url) or None."""
     ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        "http_headers": {"User-Agent": DEFAULT_UA},
         "socket_timeout": 30,
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "retries": 3,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
     }
-    
-    # 1) SoundCloud
+    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
+        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"scsearch1:{query}", download=True)
-            if info:
-                if "entries" in info:
-                    entries = [e for e in (info.get("entries") or []) if e]
-                    if entries:
-                        info = entries[0]
-                filename = ydl.prepare_filename(info)
-                web_url = info.get("webpage_url") or info.get("url", "")
-                mp3_file = os.path.splitext(filename)[0] + ".mp3"
-                if os.path.exists(mp3_file):
-                    return mp3_file, web_url
-    except Exception as e:
-        log.warning("SoundCloud search download failed for query '%s': %s. Trying Deezer...", query, e)
-
-    # 2) Deezer
-    deezer_tracks = search_deezer_api(query, limit=1)
-    if deezer_tracks:
-        deezer_url = deezer_tracks[0]["url"]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(deezer_url, download=True)
-                filename = ydl.prepare_filename(info)
-                mp3_file = os.path.splitext(filename)[0] + ".mp3"
-                return mp3_file, deezer_url
-        except Exception as e:
-            log.warning("Deezer download failed for URL %s: %s. Trying VK...", deezer_url, e)
-
-    # 3) VK Music (zaxira)
-    vk_tracks = search_vk_music(query, limit=1)
-    if not vk_tracks:
-        raise RuntimeError(f"Music not found on SoundCloud, Deezer, or VK for query: {query}")
-    vk_url = vk_tracks[0]["url"]
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(vk_url, download=True)
+            if not info:
+                return None
+            if "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    return None
+                info = entries[0]
             filename = ydl.prepare_filename(info)
-            mp3_file = os.path.splitext(filename)[0] + ".mp3"
-            return mp3_file, vk_url
+            mp3_path = os.path.splitext(filename)[0] + ".mp3"
+            if not os.path.exists(mp3_path):
+                return None
+            webpage_url = info.get("webpage_url") or info.get("url") or ""
+            return mp3_path, webpage_url
     except Exception as e:
-        raise RuntimeError(f"VK download failed for URL {vk_url}: {e}")
+        log.warning("SoundCloud search failed for '%s': %s", query, e)
+        return None
+
+
+# --- VK Music (fallback) ---------------------------------------------------
+_VK_API_VERSION = "5.131"
+_VK_CLIENT_ID = "2685278"          # Kate Mobile public client id
+_VK_CLIENT_SECRET = "lxhD8OD7dMsqtXIm5IUY"  # Kate Mobile public client secret
+_vk_token_cache: dict = {}
+
+
+async def _vk_get_token() -> str | None:
+    if _vk_token_cache.get("token"):
+        return _vk_token_cache["token"]
+    if not VK_LOGIN or not VK_PASSWORD:
+        log.warning("VK fallback skipped: VK_LOGIN/VK_PASSWORD not set in environment")
+        return None
+    params = {
+        "grant_type": "password",
+        "client_id": _VK_CLIENT_ID,
+        "client_secret": _VK_CLIENT_SECRET,
+        "username": VK_LOGIN,
+        "password": VK_PASSWORD,
+        "v": _VK_API_VERSION,
+        "2fa_supported": 1,
+        "scope": "audio,offline",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://oauth.vk.com/token", params=params) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("VK auth request failed: %s", e)
+        return None
+    token = data.get("access_token")
+    if not token:
+        log.warning("VK auth failed: %s", data.get("error_description") or data)
+        return None
+    _vk_token_cache["token"] = token
+    return token
+
+
+async def _vk_search_tracks(query: str, count: int = 1) -> list[dict]:
+    token = await _vk_get_token()
+    if not token:
+        return []
+    params = {"q": query, "count": count, "access_token": token, "v": _VK_API_VERSION}
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.vk.com/method/audio.search", params=params) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("VK search request failed: %s", e)
+        return []
+    if "error" in data:
+        log.warning("VK search error: %s", data["error"].get("error_msg"))
+        return []
+    return (data.get("response") or {}).get("items") or []
+
+
+async def _vk_download_track(track: dict, outdir: str) -> tuple[str, str | None] | None:
+    url = track.get("url")
+    if not url:
+        return None
+    filename = os.path.join(outdir, f"vk_{uuid.uuid4().hex}.mp3")
+    try:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                with open(filename, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        f.write(chunk)
+    except Exception as e:
+        log.warning("VK track download failed: %s", e)
+        return None
+    # No public webpage link to show (VK audio requires login to view) - return None.
+    return filename, None
+
+
+async def vk_search_and_download(query: str, outdir: str) -> tuple[str, str] | None:
+    tracks = await _vk_search_tracks(query, count=1)
+    if not tracks:
+        return None
+    return await _vk_download_track(tracks[0], outdir)
 
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
+    """Search order: SoundCloud -> VK Music. Raises RuntimeError if both fail."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _run_music_search_download, query, outdir)
+    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
+    if result:
+        return result
+    log.info("SoundCloud had no usable result for '%s' - trying VK Music", query)
+    result = await vk_search_and_download(query, outdir)
+    if result:
+        return result
+    raise RuntimeError(f"'{query}' uchun SoundCloud yoki VK Music'da hech narsa topilmadi")
 
 
 def format_duration(seconds) -> str:
@@ -1040,74 +1612,115 @@ def format_count(n) -> str:
     return str(n)
 
 
-def _run_music_text_search(query: str, limit: int) -> list[dict]:
-    results = []
-
-    # 1) SoundCloud
+def _run_soundcloud_list_search(query: str, limit: int) -> list[dict]:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "socket_timeout": 30,
+    }
+    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
+        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": "in_playlist",
-            "skip_download": True,
-            "http_headers": {"User-Agent": DEFAULT_UA},
-        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
             entries = [e for e in (info.get("entries") or []) if e]
-            for e in entries:
-                vid = e.get("id")
-                results.append({
-                    "id": str(vid),
-                    "title": e.get("title") or "Unknown",
-                    "uploader": e.get("uploader") or e.get("channel") or "",
-                    "duration": e.get("duration"),
-                    "view_count": e.get("view_count"),
-                    "url": e.get("url") or f"https://soundcloud.com/{e.get('uploader_id')}/{e.get('id')}"
-                })
     except Exception as e:
-        log.warning("SoundCloud text search failed: %s", e)
+        log.warning("SoundCloud list search failed for '%s': %s", query, e)
+        entries = []
 
-    # 2) Deezer
-    if len(results) < limit:
-        deezer_results = search_deezer_api(query, limit=limit - len(results))
-        results.extend(deezer_results)
+    results = []
+    for e in entries:
+        results.append(
+            {
+                "id": e.get("id"),
+                "title": e.get("title") or "Unknown",
+                "uploader": e.get("uploader") or "",
+                "duration": e.get("duration"),
+                "view_count": e.get("view_count") or e.get("play_count"),
+                "url": e.get("url") or e.get("webpage_url"),
+                "source": "soundcloud",
+            }
+        )
+    return results
 
-    # 3) VK Music
-    if len(results) < limit:
-        vk_results = search_vk_music(query, limit=limit - len(results))
-        results.extend(vk_results)
 
-    return results[:limit]
+async def _vk_list_search(query: str, limit: int) -> list[dict]:
+    tracks = await _vk_search_tracks(query, count=min(limit, 20))
+    results = []
+    for tr in tracks:
+        artist = tr.get("artist", "")
+        title = tr.get("title", "")
+        results.append(
+            {
+                "id": f"{tr.get('owner_id')}_{tr.get('id')}",
+                "title": title or "Unknown",
+                "uploader": artist,
+                "duration": tr.get("duration"),
+                "view_count": None,
+                "url": tr.get("url"),  # direct mp3 link, stored for download
+                "source": "vk",
+            }
+        )
+    return results
 
 
-async def text_search_music(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
+async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
+    """Search order: SoundCloud first; if empty, also try VK Music."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _run_music_text_search, query, limit)
+    results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
+    if not results:
+        log.info("SoundCloud list search empty for '%s' - trying VK Music", query)
+        results = await _vk_list_search(query, limit)
+    return results
 
 
-def _run_ytdlp_download_audio_url(url: str, outdir: str) -> str:
+# Kept for backward-compat with existing handler code.
+text_search_youtube = text_search_songs
+
+
+def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
     ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        "http_headers": {"User-Agent": DEFAULT_UA},
         "socket_timeout": 30,
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "retries": 3,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
     }
+    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
+        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
         return os.path.splitext(filename)[0] + ".mp3"
 
 
-async def download_song_by_url(url: str, outdir: str) -> str:
+async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud") -> str:
+    """Downloads a track picked from the search list. `source` tells us
+    whether `url` is a SoundCloud page URL (needs yt-dlp) or a direct VK
+    mp3 link (plain HTTP GET)."""
+    if source == "vk":
+        filename = os.path.join(outdir, f"vk_{uuid.uuid4().hex}.mp3")
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"VK download HTTP {resp.status}")
+                with open(filename, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        f.write(chunk)
+        return filename
+
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _run_ytdlp_download_audio_url, url, outdir)
+    return await loop.run_in_executor(None, _run_soundcloud_download_by_url, url, outdir)
 
 
 def render_search_page(lang: str, token: str):
@@ -1163,6 +1776,8 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
     )
     stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
+        # No audio track in the source (e.g. a silent GIF/video) - this is a
+        # normal case, not a real error: just tell the user music wasn't found.
         if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
             return None
         raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
@@ -1171,7 +1786,7 @@ def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
 
 async def recognize_song(audio_path: str) -> dict | None:
     if Shazam is None:
-        log.warning("shazamio not installed - music recognition unavailable")
+        log.warning("shazamio not installed — music recognition unavailable")
         return None
     if not audio_path or not os.path.exists(audio_path):
         log.warning("recognize_song: audio file not found: %s", audio_path)
@@ -1180,7 +1795,7 @@ async def recognize_song(audio_path: str) -> dict | None:
         shazam = Shazam()
         result = await shazam.recognize(audio_path)
     except Exception as e:
-        log.warning("shazamio recognition error: %s", e)
+        log.warning("shazamio error: %s", e)
         return None
     track = result.get("track")
     if not track:
@@ -1210,16 +1825,6 @@ async def handle_link(message: Message):
     if not platform:
         await message.answer(t(lang, "unsupported_link"))
         return
-
-    # YouTube endi to'liq qo'llab-quvvatlanadi (blok olib tashlandi)
-    # if platform == "youtube":
-    #     await message.answer(t(lang, "youtube_unavailable"))
-    #     return
-
-    if platform == "tiktok":
-        # TikTok uchun maxsus xabar, lekin yuklab olishga urinib ko'ramiz
-        # Agar xohlasangiz bu yerda ham to'xtatib qo'yishingiz mumkin, lekin hozircha davom ettiramiz
-        pass
 
     status = await message.answer(t(lang, "downloading"))
     outdir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
@@ -1278,7 +1883,7 @@ async def handle_text_search(message: Message):
 
     status = await message.answer(t(lang, "searching"))
     try:
-        results = await text_search_music(query)
+        results = await text_search_youtube(query)
     except Exception as e:
         log.warning("text search failed: %s", e)
         await status.edit_text(t(lang, "error"))
@@ -1331,6 +1936,7 @@ async def cb_search_action(call: CallbackQuery):
         await call.answer()
         return
 
+    # otherwise `action` is the 1..8 button - the user picked a song
     if not action.isdigit():
         await call.answer()
         return
@@ -1345,15 +1951,19 @@ async def cb_search_action(call: CallbackQuery):
     status = await call.message.answer(t(lang, "downloading"))
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
-        mp3_path = await download_song_by_url(entry["url"], work_dir)
+        source = entry.get("source", "soundcloud")
+        mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
         title = entry.get("title") or "Unknown"
         performer = entry.get("uploader") or ""
+        # VK's stored "url" is a raw direct-stream link, not a shareable page -
+        # don't show it as a "source" button, only SoundCloud page links make sense there.
+        link_for_button = entry.get("url") if source == "soundcloud" else None
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=title,
             performer=performer,
             caption=t(lang, "song_caption", title=title, artist=performer),
-            reply_markup=song_result_kb(lang, title, performer, entry.get("url")),
+            reply_markup=song_result_kb(lang, title, performer, link_for_button),
         )
         try:
             await status.delete()
@@ -1400,14 +2010,15 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path, source_url = await search_and_download_song(query, work_dir)
+        mp3_path, youtube_url = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
             caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
-            reply_markup=song_result_kb(lang, song["title"], song["artist"], source_url),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
         )
+        # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
             await status.delete()
         except Exception:
@@ -1419,6 +2030,7 @@ async def cb_recognize_music(call: CallbackQuery):
         except Exception:
             await call.message.answer(t(lang, "error"))
     finally:
+        # clean everything for this request right away - free-tier disk friendly
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(video_outdir, ignore_errors=True)
         FILE_CACHE.pop(token, None)
