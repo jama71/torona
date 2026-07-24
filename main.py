@@ -319,6 +319,7 @@ SEARCH_CACHE_TTL_SECONDS = 600
 
 # bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
+BOT_USERNAME = ""
 
 pool: asyncpg.Pool | None = None
 
@@ -825,19 +826,31 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     )
 
 
-def song_result_kb(lang: str, title: str, artist: str, youtube_url: str | None) -> InlineKeyboardMarkup:
+def build_song_caption(song_link: str | None) -> str:
+    """"@botusername | info" line shown under the sent MP3 (see reference
+    screenshot). Tapping @botusername opens the bot and triggers /start
+    via the deep-link start parameter; tapping "info" opens the song's
+    source page (SoundCloud), when we have one."""
+    bot_link = f"https://t.me/{BOT_USERNAME}?start=song" if BOT_USERNAME else ""
+    bot_part = f'<a href="{bot_link}">@{BOT_USERNAME}</a>' if bot_link else f"@{BOT_USERNAME}"
+    if song_link:
+        return f'{bot_part} | <a href="{song_link}">info</a>'
+    return bot_part
+
+
+def song_result_kb(lang: str, title: str, artist: str, song_link: str | None) -> InlineKeyboardMarkup:
     """
-    Buttons shown under a sent MP3:
-    - "Lyrics" links out to a lyrics search page instead of reproducing the
-      full copyrighted lyrics text inside the bot.
-    - "Open on YouTube" links to the source video the audio came from.
+    Single row under the sent MP3 (see reference screenshot):
+    - wide "Lyrics" button links out to a lyrics search page instead of
+      reproducing the full copyrighted lyrics text inside the bot.
+    - narrow 🔍 icon-only button opens the song's source page.
     """
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
-    rows = [[InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]]
-    if youtube_url:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_youtube_link"), url=youtube_url)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    row = [InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]
+    if song_link:
+        row.append(InlineKeyboardButton(text="🔍", url=song_link))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def user_reply_kb(lang: str, is_admin: bool) -> ReplyKeyboardMarkup:
@@ -1997,7 +2010,7 @@ async def cb_search_action(call: CallbackQuery):
             FSInputFile(mp3_path),
             title=title,
             performer=performer,
-            caption=t(lang, "song_caption", title=title, artist=performer),
+            caption=build_song_caption(link_for_button),
             reply_markup=song_result_kb(lang, title, performer, link_for_button),
         )
         try:
@@ -2045,13 +2058,13 @@ async def cb_recognize_music(call: CallbackQuery):
 
         await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
         query = f"{song['artist']} {song['title']}"
-        mp3_path, youtube_url = await search_and_download_song(query, work_dir)
+        mp3_path, song_link = await search_and_download_song(query, work_dir)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
             performer=song["artist"],
-            caption=t(lang, "song_caption", title=song["title"], artist=song["artist"]),
-            reply_markup=song_result_kb(lang, song["title"], song["artist"], youtube_url),
+            caption=build_song_caption(song_link),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
         )
         # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
@@ -2075,7 +2088,7 @@ async def cb_recognize_music(call: CallbackQuery):
 # ENTRYPOINT
 # ============================================================
 async def main():
-    global BOT_DISPLAY_NAME
+    global BOT_DISPLAY_NAME, BOT_USERNAME
 
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set!")
@@ -2086,6 +2099,7 @@ async def main():
 
     me = await bot.get_me()
     BOT_DISPLAY_NAME = me.first_name or me.username or "Bot"
+    BOT_USERNAME = me.username or ""
     log.info("Bot started as @%s (%s)", me.username, BOT_DISPLAY_NAME)
 
     await bot.delete_webhook(drop_pending_updates=True)
