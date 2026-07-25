@@ -144,27 +144,27 @@ DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
 # https://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file! Do not edit.
 
-.youtube.com\tTRUE\t/\tTRUE\t1819078132\tLOGIN_INFO\tAFmmF2swRQIhAPTjGCIxT8jRFvu-UolA342zLgu4Wa_2Zg92vp9En0f1AiAaa9qyD5ILBnLeo6OgnSGLGVRv0IKnIfpUwAlAiijq4A:QUQ3MjNmd05EeHR1Vl9DVlpmcXZpZ1dGRjRVdXdGWHlBNHdDc2Y4TnJsNkNfRmZ1Uk5IOUV2S0N0V1Y0dmZRdVgxWXpXcURnbE1Oa2VhX2JReEdWMVU4WU9kVWVmYTFPV1NOeHlocnlpV0lUQk5idzRWN2o2SWY5SWlWUlhxVkUwMWpCOHdOdXFudmxmWGdWejlTdjZUUGpQWWVfbGs0NWhB
-.youtube.com\tTRUE\t/\tTRUE\t1819369279\tPREF\tf4=4000000&f6=40000000&tz=Europe.Moscow&f5=30000&f7=100
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kpU9dZecQsB5RRO-E-fmk8QACgYKAYASARESFQHGX2Mi0g05dheS9FYBwFBrRZLvOBoVAUF8yKrYZ_w8cDPohd7oXUydNbfv0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91kTUFP5u_URqr4RLf1RAc7qQACgYKAUgSARESFQHGX2MiClb-98xP_LHUjxzJnfOixRoVAUF8yKrxoHf6nlzwh5I3ZjzNT_R-0076
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PSID\tg.a000AgnbyEYzMLHllQZOkmYXPdAq3Dj1fAf0VctQAtC_gUXab91ksdQIslqIrxmyjfnwdSbKAwACgYKAXQSARESFQHGX2MijIy-KUAzMVhqjzBcy9BwzBoVAUF8yKpvZm8xRlFViIpBH21_SFv40076
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tHSID\tA5iCJpeoCJ2ie9azx
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSSID\tAE0d43TagniTeg68R
-.youtube.com\tTRUE\t/\tFALSE\t1819216487\tAPISID\tYj70mCU8-qbvexyA/Awam3JMJ3Wgp0rLds
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\tSAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-1PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1819216487\t__Secure-3PAPISID\t6u-tLv5mRDPMRq0F/A2ikLOYfuqU5tsRvO
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-1PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tTRUE\t1816345286\t__Secure-3PSIDTS\tsidts-CjEBPWEu2bFKuCrVKitykAS1Yg9RNO8ni3OR_Kp5Pi2ARUSTM3oMEvBYciM5MnETLkTOEAA
-.youtube.com\tTRUE\t/\tFALSE\t1816345290\tSIDCC\tAKEyXzUolKajdTygx5UzGp4pGXctqE_D9byXYjYtllffuKdSe1NjaOizavFKxDszrKeUalQ1
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-1PSIDCC\tAKEyXzUI5fQyhfizthBUPsnSn37I3QIDpTVoXYPrT59pGCakSeV7355d1YGYXUCniqL4BzJg5A
-.youtube.com\tTRUE\t/\tTRUE\t1816345290\t__Secure-3PSIDCC\tAKEyXzXRFdHWQLJ_kGcioFq7UkJSxCn8WVilfs_pqw0JdI8f3zvOJkGg2cRqTePiEx1_xKeEpQ
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_INFO1_LIVE\twgdW23KNv4Y
-.youtube.com\tTRUE\t/\tTRUE\t1800361290\tVISITOR_PRIVACY_METADATA\tCgJVWhIEGgAgUg%3D%3D
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-YNID\t20.YT=oKxGC8RBOKMAfttV5lr5ZRDRLG_iIJ7ZRTrVPvNR9fsfB46IlZdCHNK2hg7VEtCDypQ7szpq8_BGj_cSSQ-h9b-eY4o6N-NN1J6jO0xdIpIUoS8fUzauxWqJ50qCTG9Gd8qCYpJ8b5Bwrk2tgCQ2vvjVpTXOjm-lbYyk1yNyxCKcs08Iu_ustbrx2gEV4aTGMPCh4cIB8Pm6PrsuTl6jbT_10zse0cF83aerHzi-TNtGEl2ZRfrr78tLkJhALIFBR9ENFyoDpPzlfvb4BUKbeqvTi15fo2Sbf2nlYow_7lUCKg0IjyvmpDxa_6zrlW5p4Qxf7Kkp-H0V_2QHwENS0A
-.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tGZn2TispEpo
-.youtube.com\tTRUE\t/\tTRUE\t1800361253\t__Secure-ROLLOUT_TOKEN\tCPrC1NDb5MzydhDs2-2IqOCVAxjL36TiyeiVAw%3D%3D
+.youtube.com	TRUE	/	TRUE	1817791305	LOGIN_INFO	AFmmF2swRQIgDRcYQVPgbRJ3vlWPkVMGISXb1xaVY1b9YMthPmOsnmkCIQCbARuqv7F1U5KfUsmBpDZsdyXlIaj4Ui0OfJ6flInlEQ:QUQ3MjNmeW5DTVRzOGVVeGxDVjJwbVU2UGl6MGtzdXJQdXdUX24tbXJYOXhTVC0xVkFRRUFzeWhMVHVnTkQ3aHhQMVNvYjdoMUs5SkxmUHg1QW16amNobUNJZDVoVlZlRVp6TkltSVdmZHBNUlpzbGU5R1Q4R3VObE42anl4OTdycm9FZFh3andVUURXU3k2SWVQLVE2ZWgwcW1RT1RzSUxR
+.youtube.com	TRUE	/	TRUE	1819210321	PREF	f4=4000000&f6=40000000&tz=Europe.Moscow&f7=100
+.youtube.com	TRUE	/	FALSE	1818302039	SID	g.a000_wjb2itD8UniVFK63J_juHnl6kTl_n6g5E7SR_5GQnE8L_KWad4xOqrMEkvRDp5VU_pbaAACgYKAdYSARUSFQHGX2MiXepK2Nhchqzp6ZZlXnmaPxoVAUF8yKpzLoS7sQ_6VAmXo-9_hGGv0076
+.youtube.com	TRUE	/	TRUE	1818302039	__Secure-1PSID	g.a000_wjb2itD8UniVFK63J_juHnl6kTl_n6g5E7SR_5GQnE8L_KWNAN45L6tvZlNeuwjk2XZjwACgYKAQgSARUSFQHGX2Mi5-araboty0w1E86o3_NE8BoVAUF8yKrfg7-0lLXE35XVrv3SvV7E0076
+.youtube.com	TRUE	/	TRUE	1818302039	__Secure-3PSID	g.a000_wjb2itD8UniVFK63J_juHnl6kTl_n6g5E7SR_5GQnE8L_KWUKAYmkGqbbNuW4L1MPJDdQACgYKAZcSARUSFQHGX2MiObgWLIn3eS-irdi-pmZlfBoVAUF8yKqN_6gOHzOFITjtYb1sqZyA0076
+.youtube.com	TRUE	/	FALSE	1818302039	HSID	ATXHu8uSmp5ws1G6X
+.youtube.com	TRUE	/	TRUE	1818302039	SSID	AYA4p499iZj4LZY_N
+.youtube.com	TRUE	/	FALSE	1818302039	APISID	UymPtvX_CiM_SJ7A/AGcDbcKxOKKppoiQ1
+.youtube.com	TRUE	/	TRUE	1818302039	SAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
+.youtube.com	TRUE	/	TRUE	1818302039	__Secure-1PAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
+.youtube.com	TRUE	/	TRUE	1818302039	__Secure-3PAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
+.youtube.com	TRUE	/	TRUE	1816186315	__Secure-1PSIDTS	sidts-CjEBPWEu2adLGZa6ly8z0ApkwKBuKwVut77QLATAX1JBn6dzfIO88cyurXH6P5mE31xZEAA
+.youtube.com	TRUE	/	TRUE	1816186315	__Secure-3PSIDTS	sidts-CjEBPWEu2adLGZa6ly8z0ApkwKBuKwVut77QLATAX1JBn6dzfIO88cyurXH6P5mE31xZEAA
+.youtube.com	TRUE	/	FALSE	1816186325	SIDCC	AKEyXzUdwBQA1QZw04WkIzf0xFykaKlalpeC3d9Y_YMFAKKR6pax2_pJtjd1aQ7hInqy-aLvBBc
+.youtube.com	TRUE	/	TRUE	1816186325	__Secure-1PSIDCC	AKEyXzWrrEEfO4vxcUs4-HH2tbIAws6M4fFI2hK-r7lNhyyr1xgA9uA5KqHdoLoiOER8RXe4ag
+.youtube.com	TRUE	/	TRUE	1816186325	__Secure-3PSIDCC	AKEyXzUlyfMgzv1x7kkeLIT2mXXj25RDrZLet8fUbOMclAKjx89OLK84LkwHnQVy3Kj5lc27aUg
+.youtube.com	TRUE	/	TRUE	1800202325	VISITOR_INFO1_LIVE	CHiAqyiszTA
+.youtube.com	TRUE	/	TRUE	1800202325	VISITOR_PRIVACY_METADATA	CgJVWhIEGgAgVg%3D%3D
+.youtube.com	TRUE	/	TRUE	1800201650	__Secure-YNID	20.YT=BHkOxqP94uUnKJNmuv2p_BZfFMjVb2FQ1bj_Nl9vr1e7HwdKJ4eHGI0_Tu3UR2xboZfDjClKrf36H8sWJuSXMDlbfKB5R_KWC0dZuaK1rrWRnvulCpdyyuODAdoMPpvs-xVUvv5nlYauAc2lqdyC8V_jMoH07aSn8C_kwoNH27m42F3fIqcUREJQYu5fVCDORai0Lg4iTPAL6F_TW4ddr_Ap_WKmKYy1PywQW8EHfJktwDnb93b7mV1-GWNCKkuGzAIvtMiMvXAz2_RBRtW20o7rLBKPuX5M7YKRRrcRMThUGyZnGRxkx7FcZZffNR3cyQP_ui8IPiK5CfXitmI_Hw
+.youtube.com	TRUE	/	TRUE	0	YSC	ajR75e84PfM
+.youtube.com	TRUE	/	TRUE	1800201650	__Secure-ROLLOUT_TOKEN	CIPE9cDPxoH_zgEQ1aejoe66lQMYvsaxm_fjlQM%3D
 """
 
 
@@ -354,6 +354,7 @@ TEXTS = {
         "recognizing": "🎧 Musiqa aniqlanmoqda...",
         "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
         "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
+        "download_failed_yt_link": "❌ Musiqani yuklab bo'lmadi.\nQuyidagi havola orqali topishingiz mumkin:\n{link}",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Rassom bo'yicha qidirish",
@@ -436,6 +437,7 @@ TEXTS = {
         "recognizing": "🎧 Распознаём музыку...",
         "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
         "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
+        "download_failed_yt_link": "❌ Не удалось скачать музыку.\nВы можете найти её по этой ссылке:\n{link}",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
         "btn_artist_search": "🔍 Поиск по исполнителю",
@@ -518,6 +520,7 @@ TEXTS = {
         "recognizing": "🎧 Recognizing the music...",
         "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
         "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
+        "download_failed_yt_link": "❌ Could not download the music.\nYou can find it via this link:\n{link}",
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Search by artist",
@@ -1396,10 +1399,12 @@ def detect_platform(url: str) -> str | None:
 # "Sign in to confirm you're not a bot" check better than others depending on
 # the datacenter IP the bot is hosted on, so we try them one by one.
 PLAYER_CLIENT_FALLBACKS = [
-    ["android", "web", "ios"],
-    ["ios"],
-    ["tv_embedded", "web"],
-    ["mweb"],
+    ["android_testsuite"],   # no sig-check, best with cookies on server IPs
+    ["ios"],                 # Apple client, separate sig path
+    ["tv_embedded"],         # embedded TV player, no JS challenge
+    ["android_creator"],     # Studio app client
+    ["web"],                 # standard web
+    ["mweb"],                # mobile web, last resort
 ]
 
 
@@ -1503,7 +1508,13 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "best[ext=mp4]/best"
+        # Prefer merging the best separate video+audio streams (ffmpeg does
+        # the merge) for real quality; fall back to a single progressive
+        # mp4/best file if a merge isn't possible for this video.
+        ydl_opts["format"] = (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        )
+        ydl_opts["merge_output_format"] = "mp4"
         if use_proxy and GENERAL_PROXY:
             ydl_opts["proxy"] = GENERAL_PROXY
         try:
@@ -1512,6 +1523,10 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 if "entries" in info:
                     info = info["entries"][0]
                 filename = ydl.prepare_filename(info)
+                # merged output is renamed to merge_output_format's extension
+                merged = os.path.splitext(filename)[0] + ".mp4"
+                if os.path.exists(merged):
+                    filename = merged
                 return filename, info
         except Exception as e:
             last_exc = e
@@ -1994,6 +2009,83 @@ async def _expire_cache(token: str, outdir: str, delay: int):
     shutil.rmtree(outdir, ignore_errors=True)
 
 
+# ============================================================
+# HANDLER: user's own video / voice / audio message (not a link)
+#
+# Recognizes the music in it via Shazam, tells the user the title/artist,
+# then tries to fetch a clean copy from SoundCloud/VK. If that fails, we
+# fall back to giving a YouTube search link instead of a bare error.
+# ============================================================
+@router.message(F.video | F.voice | F.audio | F.video_note)
+async def handle_own_media(message: Message):
+    lang = await get_user_lang(message.from_user.id)
+
+    missing = await get_unsubscribed_channels(message.from_user.id)
+    if missing:
+        await message.answer(t(lang, "subscribe_required"), reply_markup=subscribe_kb(lang, missing))
+        return
+
+    media = message.video or message.voice or message.audio or message.video_note
+    if not media:
+        return
+
+    status = await message.answer(t(lang, "recognizing"))
+    outdir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
+    try:
+        file = await bot.get_file(media.file_id)
+        ext = os.path.splitext(file.file_path or "")[1] or ".bin"
+        src_path = os.path.join(outdir, f"input{ext}")
+        buf = await bot.download_file(file.file_path)
+        with open(src_path, "wb") as f:
+            f.write(buf.read())
+
+        loop = asyncio.get_running_loop()
+        audio_sample = await loop.run_in_executor(None, extract_audio_for_recognition, src_path, outdir)
+        if not audio_sample:
+            await status.edit_text(t(lang, "not_recognized"))
+            return
+        song = await recognize_song(audio_sample)
+        if not song:
+            await status.edit_text(t(lang, "not_recognized"))
+            return
+
+        # tell the user what we found right away, before trying to fetch it
+        await status.edit_text(t(lang, "found_song", title=song["title"], artist=song["artist"]))
+
+        query = f"{song['artist']} {song['title']}"
+        try:
+            mp3_path, song_link = await search_and_download_song(query, outdir)
+        except Exception as e:
+            log.info("own-media song download failed, falling back to YouTube link: %s", e)
+            yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+            text = t(lang, "download_failed_yt_link", link=yt_link)
+            try:
+                await status.edit_text(text)
+            except Exception:
+                await message.answer(text)
+            return
+
+        await message.answer_audio(
+            FSInputFile(mp3_path),
+            title=song["title"],
+            performer=song["artist"],
+            caption=build_song_caption(song_link),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("own media recognition failed: %s", e)
+        try:
+            await status.edit_text(t(lang, "error"))
+        except Exception:
+            await message.answer(t(lang, "error"))
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
 @router.message(F.text & ~F.text.regexp(URL_RE.pattern) & ~F.text.startswith("/"))
 async def handle_text_search(message: Message):
     lang = await get_user_lang(message.from_user.id)
@@ -2105,9 +2197,12 @@ async def cb_search_action(call: CallbackQuery):
         except Exception:
             pass
     except Exception as e:
-        log.warning("song download (text search) failed: %s", e)
+        log.info("song download (text search) failed, falling back to YouTube link: %s", e)
+        query = f"{entry.get('uploader', '')} {entry.get('title', '')}".strip()
+        yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+        text = t(lang, "download_failed_yt_link", link=yt_link)
         try:
-            await status.edit_text(t(lang, "error"))
+            await status.edit_text(text)
         except Exception:
             pass
     finally:
@@ -2159,7 +2254,17 @@ async def cb_recognize_music(call: CallbackQuery):
             log.warning("could not edit video caption: %s", e)
 
         query = f"{song['artist']} {song['title']}"
-        mp3_path, song_link = await search_and_download_song(query, work_dir)
+        try:
+            mp3_path, song_link = await search_and_download_song(query, work_dir)
+        except Exception as e:
+            log.info("music download failed, falling back to YouTube link: %s", e)
+            yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+            text = t(lang, "download_failed_yt_link", link=yt_link)
+            try:
+                await status.edit_text(text)
+            except Exception:
+                await call.message.answer(text)
+            return
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=song["title"],
