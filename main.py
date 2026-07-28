@@ -358,7 +358,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Rassom bo'yicha qidirish",
-        "btn_youtube_link": "🔍 Manbada ochish",
+        "btn_youtube_link": "🔍 SoundCloud'da ochish",
         "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
@@ -441,7 +441,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
         "btn_artist_search": "🔍 Поиск по исполнителю",
-        "btn_youtube_link": "🔍 Открыть источник",
+        "btn_youtube_link": "🔍 Открыть в SoundCloud",
         "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
@@ -524,7 +524,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Search by artist",
-        "btn_youtube_link": "🔍 Open source",
+        "btn_youtube_link": "🔍 Open on SoundCloud",
         "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
@@ -1504,109 +1504,7 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     return filepath, info
 
 
-def _probe_video_stream(input_path: str) -> tuple[str, str]:
-    """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner (no
-    ffprobe binary is bundled, only imageio-ffmpeg's ffmpeg)."""
-    try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-i", input_path], capture_output=True, text=True, timeout=20
-        )
-    except subprocess.TimeoutExpired:
-        return "", ""
-    stderr = proc.stderr or ""
-    vcodec = pix_fmt = ""
-    m = re.search(r"Video:\s*([a-zA-Z0-9_]+)", stderr)
-    if m:
-        vcodec = m.group(1).lower()
-    m = re.search(r"Video:.*?,\s*(yuv[jJ]?\d{3}p(?:10le)?)", stderr)
-    if m:
-        pix_fmt = m.group(1).lower()
-    return vcodec, pix_fmt
-
-
-def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
-    """Make a downloaded video play correctly on Telegram-iOS.
-
-    Why this is needed: Instagram (and some other platforms) often serve a
-    single progressive stream that yt-dlp passes through untouched, and
-    that stream can be HEVC or have the moov atom at the end of the file.
-    Android/desktop Telegram decode/stream that fine, but iOS's
-    VideoToolbox decoder is much stricter about codec/profile compliance
-    and needs a front-loaded moov to start progressive playback - when it
-    can't, it just shows the first frame while the (separately-decoded,
-    more tolerant) AAC audio keeps playing.
-
-    Two paths, in order of preference:
-    1. If the video is ALREADY H.264/yuv420p (the common case for
-       Instagram), just remux it (-c copy, stream copy) - this only
-       rewrites the container to move moov to the front and costs almost
-       no time/CPU/memory, with zero quality loss.
-    2. Only if the codec itself is incompatible (HEVC/VP9/AV1/etc.) do we
-       pay for a real re-encode - and even then at a quality-first CRF
-       since this path is now the rare exception, not the common case.
-
-    Returns (output_path, width, height, duration_seconds), parsed from
-    ffmpeg's own stderr banner (no ffprobe binary is bundled).
-    """
-    output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
-    vcodec, pix_fmt = _probe_video_stream(input_path)
-    is_already_compatible = vcodec in ("h264", "avc1") and pix_fmt.startswith("yuv420")
-    size_mb = os.path.getsize(input_path) / (1024 * 1024) if os.path.exists(input_path) else 0
-    MAX_REENCODE_MB = 60  # protects against OOM-killing the re-encode on Railway
-
-    if is_already_compatible or size_mb > MAX_REENCODE_MB:
-        # Fast path: lossless remux, just fixes the moov position. Also used
-        # as the safe fallback for oversized incompatible-codec files -
-        # a real re-encode of those risks an OOM kill, so we settle for
-        # "faststart fixed, codec left as-is" rather than crashing.
-        if not is_already_compatible:
-            log.info("skipping re-encode for %.1fMB non-H264 file (OOM risk) - remuxing only", size_mb)
-        cmd = [
-            FFMPEG_PATH, "-y", "-i", input_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-    else:
-        # Slow path: the codec itself isn't iOS-safe, a real re-encode is
-        # unavoidable - but keep quality high since this is now the rare case.
-        cmd = [
-            FFMPEG_PATH, "-y", "-i", input_path,
-            # only cap truly oversized video, never touch normal Reels/Stories res
-            "-vf", "scale='min(1920,iw)':'-2'",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "20",
-            "-profile:v", "high", "-level", "4.1",
-            "-pix_fmt", "yuv420p",
-            "-x264-params", "rc-lookahead=20:ref=3",
-            "-threads", "2",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
-    stderr = proc.stderr or ""
-    if proc.returncode != 0 or not os.path.exists(output_path):
-        killed = " (likely OOM-killed by the host - out of memory)" if proc.returncode == -9 else ""
-        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}){killed}: {stderr[-500:]}")
-
-    width = height = duration = 0
-    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
-    if m:
-        width, height = int(m.group(1)), int(m.group(2))
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
-    if m:
-        h, mnt, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-        duration = int(h * 3600 + mnt * 60 + s)
-    return output_path, width, height, duration
-
-
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | None = None):
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = _build_ydl_opts_base(outdir, player_clients)
@@ -1629,22 +1527,6 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                 merged = os.path.splitext(filename)[0] + ".mp4"
                 if os.path.exists(merged):
                     filename = merged
-
-                ext = os.path.splitext(filename)[1].lower()
-                # Instagram in particular frequently serves a single
-                # progressive stream that never goes through ffmpeg at all
-                # (see docstring above) - normalize it for iOS. The function
-                # itself picks a fast lossless remux when possible, and only
-                # falls back to a real re-encode when the codec genuinely
-                # needs it (and stays within a safe size for that).
-                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
-                    try:
-                        norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
-                        os.remove(filename)
-                        filename = norm_path
-                        info["width"], info["height"], info["duration"] = w, h, dur
-                    except Exception as e:
-                        log.warning("iOS normalize failed, sending original file instead: %s", e)
                 return filename, info
         except Exception as e:
             last_exc = e
@@ -1668,7 +1550,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
-    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy, platform)
+    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
 
 
 # ============================================================
@@ -1836,58 +1718,17 @@ async def vk_search_and_download(query: str, outdir: str) -> tuple[str, str] | N
     return await _vk_download_track(tracks[0], outdir)
 
 
-def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | None:
-    """Search YouTube (via our cookie-authenticated InnerTube clients) and
-    download the first playable result's audio. Returns (mp3_path, watch_url)
-    or None - never raises, since this is a fallback step in the search chain."""
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-                if not info:
-                    return None
-                if "entries" in info:
-                    entries = [e for e in (info.get("entries") or []) if e]
-                    if not entries:
-                        return None
-                    info = entries[0]
-                filename = ydl.prepare_filename(info)
-                mp3_path = os.path.splitext(filename)[0] + ".mp3"
-                if not os.path.exists(mp3_path):
-                    return None
-                video_id = info.get("id")
-                watch_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
-                return mp3_path, watch_url
-        except Exception as e:
-            if not _is_bot_check_error(e):
-                log.warning("YouTube search failed for '%s': %s", query, e)
-                return None
-            log.warning("InnerTube client %s blocked for search '%s' — trying next client", player_clients, query)
-            continue
-    return None
-
-
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> YouTube -> VK Music. Raises RuntimeError
-    if all three fail."""
+    """Search order: SoundCloud -> VK Music. Raises RuntimeError if both fail."""
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
     if result:
         return result
-    log.info("SoundCloud had no usable result for '%s' - trying YouTube", query)
-    result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
-    if result:
-        return result
-    log.info("YouTube had no usable result for '%s' - trying VK Music", query)
+    log.info("SoundCloud had no usable result for '%s' - trying VK Music", query)
     result = await vk_search_and_download(query, outdir)
     if result:
         return result
-    raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
+    raise RuntimeError(f"'{query}' uchun SoundCloud yoki VK Music'da hech narsa topilmadi")
 
 
 def format_duration(seconds) -> str:
@@ -1966,47 +1807,12 @@ async def _vk_list_search(query: str, limit: int) -> list[dict]:
     return results
 
 
-def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(None, player_clients)
-        ydl_opts["extract_flat"] = "in_playlist"
-        ydl_opts["skip_download"] = True
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                entries = [e for e in (info.get("entries") or []) if e]
-                results = []
-                for e in entries:
-                    vid = e.get("id")
-                    results.append(
-                        {
-                            "id": vid,
-                            "title": e.get("title") or "Unknown",
-                            "uploader": e.get("uploader") or e.get("channel") or "",
-                            "duration": e.get("duration"),
-                            "view_count": e.get("view_count"),
-                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
-                            "source": "youtube",
-                        }
-                    )
-                return results
-        except Exception as e:
-            if not _is_bot_check_error(e):
-                log.warning("YouTube list search failed for '%s': %s", query, e)
-                return []
-            continue
-    return []
-
-
 async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
-    """Search order: SoundCloud -> YouTube -> VK Music."""
+    """Search order: SoundCloud first; if empty, also try VK Music."""
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
     if not results:
-        log.info("SoundCloud list search empty for '%s' - trying YouTube", query)
-        results = await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
-    if not results:
-        log.info("YouTube list search empty for '%s' - trying VK Music", query)
+        log.info("SoundCloud list search empty for '%s' - trying VK Music", query)
         results = await _vk_list_search(query, limit)
     return results
 
@@ -2038,31 +1844,10 @@ def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
         return os.path.splitext(filename)[0] + ".mp3"
 
 
-def _run_youtube_audio_download_by_url(url: str, outdir: str) -> str:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
-
-
 async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud") -> str:
     """Downloads a track picked from the search list. `source` tells us
-    whether `url` is a SoundCloud/YouTube page URL (needs yt-dlp) or a
-    direct VK mp3 link (plain HTTP GET)."""
+    whether `url` is a SoundCloud page URL (needs yt-dlp) or a direct VK
+    mp3 link (plain HTTP GET)."""
     if source == "vk":
         filename = os.path.join(outdir, f"vk_{uuid.uuid4().hex}.mp3")
         timeout = aiohttp.ClientTimeout(total=60)
@@ -2076,8 +1861,6 @@ async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud"
         return filename
 
     loop = asyncio.get_running_loop()
-    if source == "youtube":
-        return await loop.run_in_executor(None, _run_youtube_audio_download_by_url, url, outdir)
     return await loop.run_in_executor(None, _run_soundcloud_download_by_url, url, outdir)
 
 
@@ -2211,15 +1994,7 @@ async def handle_link(message: Message):
         if ext in (".jpg", ".jpeg", ".png", ".webp"):
             await message.answer_photo(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
         else:
-            await message.answer_video(
-                FSInputFile(filepath),
-                caption=caption,
-                reply_markup=keyboard,
-                supports_streaming=True,
-                width=info.get("width") or None,
-                height=info.get("height") or None,
-                duration=info.get("duration") or None,
-            )
+            await message.answer_video(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
         FILE_CACHE[token] = {"filepath": filepath, "source_url": url}
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
@@ -2399,7 +2174,7 @@ async def cb_search_action(call: CallbackQuery):
         performer = entry.get("uploader") or ""
         try:
             mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
-            link_for_button = entry.get("url") if source in ("soundcloud", "youtube") else None
+            link_for_button = entry.get("url") if source == "soundcloud" else None
         except Exception as e:
             if source == "soundcloud" and "drm protected" in str(e).lower():
                 # this specific track is Go+/DRM-locked - fall back to a
