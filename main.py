@@ -1526,16 +1526,30 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
     output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
     cmd = [
         FFMPEG_PATH, "-y", "-i", input_path,
-        "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+        # Cap resolution at 1280px on the long side - most Reels/Stories are
+        # already <=1080p, but this protects against the rare huge upload
+        # blowing up encoder memory. "-2" keeps the other dimension even
+        # (required by yuv420p).
+        "-vf", "scale='min(1280,iw)':'-2'",
+        "-c:v", "libx264",
+        "-preset", "veryfast",   # "medium" (the ffmpeg default) needs far
+        "-crf", "26",            # more RAM/CPU for lookahead+refs than this
+        "-profile:v", "high", "-level", "4.0",
         "-pix_fmt", "yuv420p",
+        "-x264-params", "rc-lookahead=10:ref=2",  # cuts encoder RAM use a lot
+        "-threads", "2",         # avoid multi-thread memory blowup on small containers
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-movflags", "+faststart",
         output_path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
     stderr = proc.stderr or ""
     if proc.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}): {stderr[-500:]}")
+        killed = " (likely OOM-killed by the host - out of memory)" if proc.returncode == -9 else ""
+        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}){killed}: {stderr[-500:]}")
 
     width = height = duration = 0
     m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
@@ -1575,8 +1589,12 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                 ext = os.path.splitext(filename)[1].lower()
                 # Instagram in particular frequently serves a single
                 # progressive stream that never goes through ffmpeg at all
-                # (see docstring above) - always normalize it for iOS.
-                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
+                # (see docstring above) - normalize it for iOS, but skip
+                # oversized files since re-encoding them risks an OOM kill
+                # on Railway's constrained containers (better to send the
+                # original than crash the whole request).
+                size_mb = os.path.getsize(filename) / (1024 * 1024) if os.path.exists(filename) else 0
+                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm") and size_mb <= 60:
                     try:
                         norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
                         os.remove(filename)
@@ -1584,6 +1602,8 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                         info["width"], info["height"], info["duration"] = w, h, dur
                     except Exception as e:
                         log.warning("iOS normalize failed, sending original file instead: %s", e)
+                elif platform == "instagram" and size_mb > 60:
+                    log.info("skipping iOS normalize for %.1fMB file (too large, OOM risk)", size_mb)
                 return filename, info
         except Exception as e:
             last_exc = e
