@@ -1504,44 +1504,88 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     return filepath, info
 
 
+def _probe_video_stream(input_path: str) -> tuple[str, str]:
+    """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner (no
+    ffprobe binary is bundled, only imageio-ffmpeg's ffmpeg)."""
+    try:
+        proc = subprocess.run(
+            [FFMPEG_PATH, "-i", input_path], capture_output=True, text=True, timeout=20
+        )
+    except subprocess.TimeoutExpired:
+        return "", ""
+    stderr = proc.stderr or ""
+    vcodec = pix_fmt = ""
+    m = re.search(r"Video:\s*([a-zA-Z0-9_]+)", stderr)
+    if m:
+        vcodec = m.group(1).lower()
+    m = re.search(r"Video:.*?,\s*(yuv[jJ]?\d{3}p(?:10le)?)", stderr)
+    if m:
+        pix_fmt = m.group(1).lower()
+    return vcodec, pix_fmt
+
+
 def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
-    """Re-encode a downloaded video into an iPhone/Telegram-iOS-compatible
-    MP4: H.264 High profile + yuv420p + AAC + moov-front (+faststart).
+    """Make a downloaded video play correctly on Telegram-iOS.
 
     Why this is needed: Instagram (and some other platforms) often serve a
-    single progressive stream that yt-dlp passes through untouched (no
-    merge -> no ffmpeg call at all), and that stream can be HEVC or have
-    the moov atom at the end of the file. Android/desktop Telegram clients
-    decode/stream that fine, but iOS's VideoToolbox decoder is much
-    stricter about codec/profile compliance and requires a front-loaded
-    moov to start progressive playback - when it can't decode/seek it
-    just shows the first frame while the (separately-decoded, more
-    tolerant) AAC audio keeps playing. Forcing H.264/yuv420p/AAC/faststart
-    here removes all of those failure modes.
+    single progressive stream that yt-dlp passes through untouched, and
+    that stream can be HEVC or have the moov atom at the end of the file.
+    Android/desktop Telegram decode/stream that fine, but iOS's
+    VideoToolbox decoder is much stricter about codec/profile compliance
+    and needs a front-loaded moov to start progressive playback - when it
+    can't, it just shows the first frame while the (separately-decoded,
+    more tolerant) AAC audio keeps playing.
 
-    Returns (output_path, width, height, duration_seconds). No ffprobe
-    binary is bundled (only imageio-ffmpeg's ffmpeg), so width/height/
-    duration are parsed straight out of ffmpeg's own stderr banner.
+    Two paths, in order of preference:
+    1. If the video is ALREADY H.264/yuv420p (the common case for
+       Instagram), just remux it (-c copy, stream copy) - this only
+       rewrites the container to move moov to the front and costs almost
+       no time/CPU/memory, with zero quality loss.
+    2. Only if the codec itself is incompatible (HEVC/VP9/AV1/etc.) do we
+       pay for a real re-encode - and even then at a quality-first CRF
+       since this path is now the rare exception, not the common case.
+
+    Returns (output_path, width, height, duration_seconds), parsed from
+    ffmpeg's own stderr banner (no ffprobe binary is bundled).
     """
     output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
-    cmd = [
-        FFMPEG_PATH, "-y", "-i", input_path,
-        # Cap resolution at 1280px on the long side - most Reels/Stories are
-        # already <=1080p, but this protects against the rare huge upload
-        # blowing up encoder memory. "-2" keeps the other dimension even
-        # (required by yuv420p).
-        "-vf", "scale='min(1280,iw)':'-2'",
-        "-c:v", "libx264",
-        "-preset", "veryfast",   # "medium" (the ffmpeg default) needs far
-        "-crf", "26",            # more RAM/CPU for lookahead+refs than this
-        "-profile:v", "high", "-level", "4.0",
-        "-pix_fmt", "yuv420p",
-        "-x264-params", "rc-lookahead=10:ref=2",  # cuts encoder RAM use a lot
-        "-threads", "2",         # avoid multi-thread memory blowup on small containers
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-movflags", "+faststart",
-        output_path,
-    ]
+    vcodec, pix_fmt = _probe_video_stream(input_path)
+    is_already_compatible = vcodec in ("h264", "avc1") and pix_fmt.startswith("yuv420")
+    size_mb = os.path.getsize(input_path) / (1024 * 1024) if os.path.exists(input_path) else 0
+    MAX_REENCODE_MB = 60  # protects against OOM-killing the re-encode on Railway
+
+    if is_already_compatible or size_mb > MAX_REENCODE_MB:
+        # Fast path: lossless remux, just fixes the moov position. Also used
+        # as the safe fallback for oversized incompatible-codec files -
+        # a real re-encode of those risks an OOM kill, so we settle for
+        # "faststart fixed, codec left as-is" rather than crashing.
+        if not is_already_compatible:
+            log.info("skipping re-encode for %.1fMB non-H264 file (OOM risk) - remuxing only", size_mb)
+        cmd = [
+            FFMPEG_PATH, "-y", "-i", input_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        # Slow path: the codec itself isn't iOS-safe, a real re-encode is
+        # unavoidable - but keep quality high since this is now the rare case.
+        cmd = [
+            FFMPEG_PATH, "-y", "-i", input_path,
+            # only cap truly oversized video, never touch normal Reels/Stories res
+            "-vf", "scale='min(1920,iw)':'-2'",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-profile:v", "high", "-level", "4.1",
+            "-pix_fmt", "yuv420p",
+            "-x264-params", "rc-lookahead=20:ref=3",
+            "-threads", "2",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     except subprocess.TimeoutExpired:
@@ -1589,12 +1633,11 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                 ext = os.path.splitext(filename)[1].lower()
                 # Instagram in particular frequently serves a single
                 # progressive stream that never goes through ffmpeg at all
-                # (see docstring above) - normalize it for iOS, but skip
-                # oversized files since re-encoding them risks an OOM kill
-                # on Railway's constrained containers (better to send the
-                # original than crash the whole request).
-                size_mb = os.path.getsize(filename) / (1024 * 1024) if os.path.exists(filename) else 0
-                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm") and size_mb <= 60:
+                # (see docstring above) - normalize it for iOS. The function
+                # itself picks a fast lossless remux when possible, and only
+                # falls back to a real re-encode when the codec genuinely
+                # needs it (and stays within a safe size for that).
+                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
                     try:
                         norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
                         os.remove(filename)
@@ -1602,8 +1645,6 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                         info["width"], info["height"], info["duration"] = w, h, dur
                     except Exception as e:
                         log.warning("iOS normalize failed, sending original file instead: %s", e)
-                elif platform == "instagram" and size_mb > 60:
-                    log.info("skipping iOS normalize for %.1fMB file (too large, OOM risk)", size_mb)
                 return filename, info
         except Exception as e:
             last_exc = e
