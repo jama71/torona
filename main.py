@@ -358,7 +358,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Rassom bo'yicha qidirish",
-        "btn_youtube_link": "🔍 SoundCloud'da ochish",
+        "btn_youtube_link": "🔍 Manbada ochish",
         "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
@@ -441,7 +441,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Текст песни",
         "btn_artist_search": "🔍 Поиск по исполнителю",
-        "btn_youtube_link": "🔍 Открыть в SoundCloud",
+        "btn_youtube_link": "🔍 Открыть источник",
         "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
@@ -524,7 +524,7 @@ TEXTS = {
         "song_caption": "🎵 {title} — {artist}",
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Search by artist",
-        "btn_youtube_link": "🔍 Open on SoundCloud",
+        "btn_youtube_link": "🔍 Open source",
         "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
@@ -1504,7 +1504,51 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     return filepath, info
 
 
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
+def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
+    """Re-encode a downloaded video into an iPhone/Telegram-iOS-compatible
+    MP4: H.264 High profile + yuv420p + AAC + moov-front (+faststart).
+
+    Why this is needed: Instagram (and some other platforms) often serve a
+    single progressive stream that yt-dlp passes through untouched (no
+    merge -> no ffmpeg call at all), and that stream can be HEVC or have
+    the moov atom at the end of the file. Android/desktop Telegram clients
+    decode/stream that fine, but iOS's VideoToolbox decoder is much
+    stricter about codec/profile compliance and requires a front-loaded
+    moov to start progressive playback - when it can't decode/seek it
+    just shows the first frame while the (separately-decoded, more
+    tolerant) AAC audio keeps playing. Forcing H.264/yuv420p/AAC/faststart
+    here removes all of those failure modes.
+
+    Returns (output_path, width, height, duration_seconds). No ffprobe
+    binary is bundled (only imageio-ffmpeg's ffmpeg), so width/height/
+    duration are parsed straight out of ffmpeg's own stderr banner.
+    """
+    output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
+    cmd = [
+        FFMPEG_PATH, "-y", "-i", input_path,
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    stderr = proc.stderr or ""
+    if proc.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}): {stderr[-500:]}")
+
+    width = height = duration = 0
+    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
+    if m:
+        width, height = int(m.group(1)), int(m.group(2))
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+    if m:
+        h, mnt, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        duration = int(h * 3600 + mnt * 60 + s)
+    return output_path, width, height, duration
+
+
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | None = None):
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = _build_ydl_opts_base(outdir, player_clients)
@@ -1527,6 +1571,19 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
                 merged = os.path.splitext(filename)[0] + ".mp4"
                 if os.path.exists(merged):
                     filename = merged
+
+                ext = os.path.splitext(filename)[1].lower()
+                # Instagram in particular frequently serves a single
+                # progressive stream that never goes through ffmpeg at all
+                # (see docstring above) - always normalize it for iOS.
+                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
+                    try:
+                        norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
+                        os.remove(filename)
+                        filename = norm_path
+                        info["width"], info["height"], info["duration"] = w, h, dur
+                    except Exception as e:
+                        log.warning("iOS normalize failed, sending original file instead: %s", e)
                 return filename, info
         except Exception as e:
             last_exc = e
@@ -1550,7 +1607,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool):
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
-    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy)
+    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy, platform)
 
 
 # ============================================================
@@ -1718,17 +1775,58 @@ async def vk_search_and_download(query: str, outdir: str) -> tuple[str, str] | N
     return await _vk_download_track(tracks[0], outdir)
 
 
+def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | None:
+    """Search YouTube (via our cookie-authenticated InnerTube clients) and
+    download the first playable result's audio. Returns (mp3_path, watch_url)
+    or None - never raises, since this is a fallback step in the search chain."""
+    for player_clients in PLAYER_CLIENT_FALLBACKS:
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ]
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+                if not info:
+                    return None
+                if "entries" in info:
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    if not entries:
+                        return None
+                    info = entries[0]
+                filename = ydl.prepare_filename(info)
+                mp3_path = os.path.splitext(filename)[0] + ".mp3"
+                if not os.path.exists(mp3_path):
+                    return None
+                video_id = info.get("id")
+                watch_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
+                return mp3_path, watch_url
+        except Exception as e:
+            if not _is_bot_check_error(e):
+                log.warning("YouTube search failed for '%s': %s", query, e)
+                return None
+            log.warning("InnerTube client %s blocked for search '%s' — trying next client", player_clients, query)
+            continue
+    return None
+
+
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> VK Music. Raises RuntimeError if both fail."""
+    """Search order: SoundCloud -> YouTube -> VK Music. Raises RuntimeError
+    if all three fail."""
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
     if result:
         return result
-    log.info("SoundCloud had no usable result for '%s' - trying VK Music", query)
+    log.info("SoundCloud had no usable result for '%s' - trying YouTube", query)
+    result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
+    if result:
+        return result
+    log.info("YouTube had no usable result for '%s' - trying VK Music", query)
     result = await vk_search_and_download(query, outdir)
     if result:
         return result
-    raise RuntimeError(f"'{query}' uchun SoundCloud yoki VK Music'da hech narsa topilmadi")
+    raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
 
 
 def format_duration(seconds) -> str:
@@ -1807,12 +1905,47 @@ async def _vk_list_search(query: str, limit: int) -> list[dict]:
     return results
 
 
+def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
+    for player_clients in PLAYER_CLIENT_FALLBACKS:
+        ydl_opts = _build_ydl_opts_base(None, player_clients)
+        ydl_opts["extract_flat"] = "in_playlist"
+        ydl_opts["skip_download"] = True
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                entries = [e for e in (info.get("entries") or []) if e]
+                results = []
+                for e in entries:
+                    vid = e.get("id")
+                    results.append(
+                        {
+                            "id": vid,
+                            "title": e.get("title") or "Unknown",
+                            "uploader": e.get("uploader") or e.get("channel") or "",
+                            "duration": e.get("duration"),
+                            "view_count": e.get("view_count"),
+                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
+                            "source": "youtube",
+                        }
+                    )
+                return results
+        except Exception as e:
+            if not _is_bot_check_error(e):
+                log.warning("YouTube list search failed for '%s': %s", query, e)
+                return []
+            continue
+    return []
+
+
 async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
-    """Search order: SoundCloud first; if empty, also try VK Music."""
+    """Search order: SoundCloud -> YouTube -> VK Music."""
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
     if not results:
-        log.info("SoundCloud list search empty for '%s' - trying VK Music", query)
+        log.info("SoundCloud list search empty for '%s' - trying YouTube", query)
+        results = await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
+    if not results:
+        log.info("YouTube list search empty for '%s' - trying VK Music", query)
         results = await _vk_list_search(query, limit)
     return results
 
@@ -1844,10 +1977,31 @@ def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
         return os.path.splitext(filename)[0] + ".mp3"
 
 
+def _run_youtube_audio_download_by_url(url: str, outdir: str) -> str:
+    last_exc = None
+    for player_clients in PLAYER_CLIENT_FALLBACKS:
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ]
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                return os.path.splitext(filename)[0] + ".mp3"
+        except Exception as e:
+            last_exc = e
+            if not _is_bot_check_error(e):
+                raise
+            continue
+    _raise_ytdlp_failure(last_exc)
+
+
 async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud") -> str:
     """Downloads a track picked from the search list. `source` tells us
-    whether `url` is a SoundCloud page URL (needs yt-dlp) or a direct VK
-    mp3 link (plain HTTP GET)."""
+    whether `url` is a SoundCloud/YouTube page URL (needs yt-dlp) or a
+    direct VK mp3 link (plain HTTP GET)."""
     if source == "vk":
         filename = os.path.join(outdir, f"vk_{uuid.uuid4().hex}.mp3")
         timeout = aiohttp.ClientTimeout(total=60)
@@ -1861,6 +2015,8 @@ async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud"
         return filename
 
     loop = asyncio.get_running_loop()
+    if source == "youtube":
+        return await loop.run_in_executor(None, _run_youtube_audio_download_by_url, url, outdir)
     return await loop.run_in_executor(None, _run_soundcloud_download_by_url, url, outdir)
 
 
@@ -1994,7 +2150,15 @@ async def handle_link(message: Message):
         if ext in (".jpg", ".jpeg", ".png", ".webp"):
             await message.answer_photo(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
         else:
-            await message.answer_video(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
+            await message.answer_video(
+                FSInputFile(filepath),
+                caption=caption,
+                reply_markup=keyboard,
+                supports_streaming=True,
+                width=info.get("width") or None,
+                height=info.get("height") or None,
+                duration=info.get("duration") or None,
+            )
         FILE_CACHE[token] = {"filepath": filepath, "source_url": url}
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
@@ -2174,7 +2338,7 @@ async def cb_search_action(call: CallbackQuery):
         performer = entry.get("uploader") or ""
         try:
             mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
-            link_for_button = entry.get("url") if source == "soundcloud" else None
+            link_for_button = entry.get("url") if source in ("soundcloud", "youtube") else None
         except Exception as e:
             if source == "soundcloud" and "drm protected" in str(e).lower():
                 # this specific track is Go+/DRM-locked - fall back to a
