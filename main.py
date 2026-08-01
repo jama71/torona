@@ -1827,12 +1827,16 @@ _VK_AUTH_COOLDOWN_SECONDS = 1800  # 30 min - avoid retrying login repeatedly and
 _vk_auth_cooldown_until = 0.0
 
 
+_vk_hardcoded_token_invalid = False  # set True once VK confirms VK_ACCESS_TOKEN itself is bad
+
+
 async def _vk_get_token() -> str | None:
     global _vk_auth_cooldown_until
     # Preferred path: a long-lived token obtained once via the Kate Mobile
     # OAuth implicit flow. No network call, no password-grant risk, no
-    # cooldown - just use it directly every time.
-    if VK_ACCESS_TOKEN:
+    # cooldown - just use it directly every time, UNLESS VK itself has
+    # already told us this exact token is invalid/expired this session.
+    if VK_ACCESS_TOKEN and not _vk_hardcoded_token_invalid:
         return VK_ACCESS_TOKEN
     if _vk_token_cache.get("token"):
         return _vk_token_cache["token"]
@@ -1872,6 +1876,7 @@ async def _vk_get_token() -> str | None:
 
 
 async def _vk_search_tracks(query: str, count: int = 1) -> list[dict]:
+    global _vk_hardcoded_token_invalid
     token = await _vk_get_token()
     if not token:
         return []
@@ -1885,7 +1890,18 @@ async def _vk_search_tracks(query: str, count: int = 1) -> list[dict]:
         log.warning("VK search request failed: %s", e)
         return []
     if "error" in data:
-        log.warning("VK search error: %s", data["error"].get("error_msg"))
+        err = data["error"]
+        log.warning("VK search error: %s", err.get("error_msg"))
+        # error_code 4 / 5 = invalid or expired access_token. If this was
+        # our hardcoded VK_ACCESS_TOKEN, stop using it and fall back to
+        # VK_LOGIN/VK_PASSWORD (if set) on the next call instead of
+        # failing forever with the same dead token.
+        if err.get("error_code") in (4, 5) and token == VK_ACCESS_TOKEN and not _vk_hardcoded_token_invalid:
+            _vk_hardcoded_token_invalid = True
+            log.error(
+                "VK_ACCESS_TOKEN is invalid/expired (VK rejected it) - ignoring it from now on. "
+                "Get a fresh token, or set VK_LOGIN/VK_PASSWORD as a fallback."
+            )
         return []
     return (data.get("response") or {}).get("items") or []
 
@@ -2243,10 +2259,22 @@ async def recognize_song(audio_path: str) -> dict | None:
     return {"title": track.get("title", "Unknown"), "artist": track.get("subtitle", "Unknown")}
 
 
+def _has_url(message: Message) -> bool:
+    """True if a URL appears ANYWHERE in the message text.
+
+    aiogram's F.text.regexp() uses re.match() under the hood, which only
+    checks from the very start of the string. That misses URLs buried
+    inside a longer pasted block (e.g. a video player's debug/stats text
+    that happens to contain a link) - such messages would otherwise fall
+    through to the song-search handler and get searched for verbatim.
+    """
+    return bool(URL_RE.search(message.text or ""))
+
+
 # ============================================================
 # HANDLERS: media link
 # ============================================================
-@router.message(F.text.regexp(URL_RE.pattern))
+@router.message(F.func(_has_url))
 async def handle_link(message: Message):
     lang = await get_user_lang(message.from_user.id)
 
@@ -2393,7 +2421,7 @@ async def handle_own_media(message: Message):
         shutil.rmtree(outdir, ignore_errors=True)
 
 
-@router.message(F.text & ~F.text.regexp(URL_RE.pattern) & ~F.text.startswith("/"))
+@router.message(F.text & ~F.func(_has_url) & ~F.text.startswith("/"))
 async def handle_text_search(message: Message):
     lang = await get_user_lang(message.from_user.id)
 
