@@ -109,11 +109,15 @@ VK_PASSWORD = os.getenv("VK_PASSWORD", "").strip()
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip() or None
 
 
-def _repair_cookie_line(line: str) -> str:
+def _repair_cookie_line(line: str) -> str | None:
     """Netscape cookie lines are tab-separated (7 fields). Some copy-paste
-    paths (chat UIs, some env-var editors) can collapse tabs into spaces -
-    if that happened but the 7 fields are still intact, rejoin them with
-    real tabs so yt-dlp's cookiejar parser accepts the line."""
+    paths (chat UIs, some env-var editors) can collapse tabs into spaces,
+    or mangle a comment line (e.g. drop its leading '#') - if that
+    happened but the 7 fields are still intact, rejoin them with real
+    tabs. Comment/blank lines pass through untouched. Anything else that
+    still can't be parsed as a cookie line is dropped (returns None)
+    instead of being handed to yt-dlp's cookiejar parser broken, which
+    would otherwise just print its own warning and skip it anyway."""
     if line.startswith("#") or not line.strip():
         return line
     if line.count("\t") == 6:
@@ -121,11 +125,12 @@ def _repair_cookie_line(line: str) -> str:
     parts = line.split()
     if len(parts) == 7:
         return "\t".join(parts)
-    return line
+    return None
 
 
 def _normalize_cookies_content(content: str) -> str:
-    return "\n".join(_repair_cookie_line(l) for l in content.splitlines()) + "\n"
+    repaired = (_repair_cookie_line(l) for l in content.splitlines())
+    return "\n".join(l for l in repaired if l is not None) + "\n"
 
 
 def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
@@ -415,6 +420,7 @@ TEXTS = {
         "btn_youtube_link": "🔍 Manbada ochish",
         "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
+        "link_not_found": "❌ Bu post topilmadi — o'chirilgan, yopiq (private) yoki linkda xatolik bo'lishi mumkin.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
@@ -498,6 +504,7 @@ TEXTS = {
         "btn_youtube_link": "🔍 Открыть источник",
         "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
+        "link_not_found": "❌ Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
@@ -581,6 +588,7 @@ TEXTS = {
         "btn_youtube_link": "🔍 Open source",
         "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
+        "link_not_found": "❌ Post not found — it may have been deleted, made private, or the link is wrong.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
@@ -2300,8 +2308,12 @@ async def handle_link(message: Message):
         filepath, info = await download_media(url, outdir, platform)
     except Exception as e:
         shutil.rmtree(outdir, ignore_errors=True)
+        err_msg = str(e).lower()
         if platform == "tiktok":
             await status.edit_text(t(lang, "tiktok_unavailable"))
+        elif "404" in err_msg or "not found" in err_msg or "private" in err_msg:
+            log.info("link not found/private/deleted: %s", e)
+            await status.edit_text(t(lang, "link_not_found"))
         else:
             log.warning("download failed: %s", e)
             await status.edit_text(t(lang, "error"))
