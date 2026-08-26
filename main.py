@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import contextlib
 import io
 import logging
 import os
 import re
+import resource
 import shutil
 import subprocess
 import tempfile
@@ -11,6 +13,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from collections import OrderedDict
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
@@ -93,6 +96,34 @@ ADMIN_IDS = {
 }
 # Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
+
+# ------------------------------------------------------------
+# Reliability / memory-safety knobs (all optional, sane defaults below).
+# See the OOM/leak fixes this controls:
+#   FFMPEG_TIMEOUT_SECONDS - base timeout for a single ffmpeg subprocess
+#     call (probing, mp3 extraction, etc). The iOS-normalize re-encode is
+#     the one operation allowed to run longer, since a real re-encode of a
+#     large video legitimately takes more time - it uses this value * 8
+#     (30s default -> 240s ceiling) as its own timeout.
+#   SKIP_IOS_NORMALIZE - when true, never re-encode/remux downloaded video
+#     for iOS compatibility; just send the original file. This removes the
+#     single biggest OOM-kill risk (ffmpeg re-encoding a large HEVC/VP9
+#     video) at the cost of iOS occasionally showing a frozen first frame
+#     on non-H264 sources.
+#   API_RETRY_COUNT - number of retries (with exponential backoff, capped
+#     at 2s between attempts) for transient failures talking to YouTube/
+#     SoundCloud/VK, on top of each source's own internal fallbacks.
+#   MAX_CACHE_SIZE_MB - approximate resident-memory threshold (in MB); if
+#     exceeded, the periodic memory monitor proactively clears the
+#     in-memory caches instead of waiting for the OS to OOM-kill the bot.
+# ------------------------------------------------------------
+FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "30"))
+IOS_NORMALIZE_TIMEOUT_SECONDS = FFMPEG_TIMEOUT_SECONDS * 8
+SKIP_IOS_NORMALIZE = os.getenv("SKIP_IOS_NORMALIZE", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+API_RETRY_COUNT = max(0, int(os.getenv("API_RETRY_COUNT", "2")))
+MAX_CACHE_SIZE_MB = int(os.getenv("MAX_CACHE_SIZE_MB", "800"))
 
 # Song search (text search + Shazam recognition) uses SoundCloud first, then
 # VK Music as a fallback for tracks that are copyright-blocked or missing on
@@ -372,12 +403,66 @@ PLATFORM_PATTERNS = {
     "snapchat": re.compile(r"snapchat\.com"),
 }
 
+class TTLCache:
+    """Bounded, dict-like in-memory cache: entries expire after
+    ttl_seconds and the oldest entry is evicted once max_size is
+    exceeded. Drop-in replacement for the plain dicts these caches used
+    to be (supports [], .get(), .pop(), len(), .clear(), 'in') - fixes
+    the unbounded memory growth that came from relying solely on
+    best-effort asyncio.create_task() expiry timers, which never bound
+    the cache's *size*, only individual entries' *lifetime*."""
+
+    def __init__(self, max_size: int, ttl_seconds: int):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._data: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+    def _purge_expired(self):
+        now = time.time()
+        expired = [k for k, (ts, _v) in self._data.items() if now - ts > self.ttl_seconds]
+        for k in expired:
+            self._data.pop(k, None)
+
+    def __setitem__(self, key, value):
+        self._purge_expired()
+        self._data.pop(key, None)
+        self._data[key] = (time.time(), value)
+        while len(self._data) > self.max_size:
+            self._data.popitem(last=False)  # evict oldest (LRU-ish, insertion order)
+
+    def __getitem__(self, key):
+        self._purge_expired()
+        return self._data[key][1]
+
+    def __contains__(self, key):
+        self._purge_expired()
+        return key in self._data
+
+    def __len__(self):
+        self._purge_expired()
+        return len(self._data)
+
+    def get(self, key, default=None):
+        self._purge_expired()
+        entry = self._data.get(key)
+        return entry[1] if entry is not None else default
+
+    def pop(self, key, default=None):
+        entry = self._data.pop(key, None)
+        return entry[1] if entry is not None else default
+
+    def clear(self):
+        self._data.clear()
+
+
 # token -> {"filepath": str, "source_url": str}, used for the "detect music" button
-FILE_CACHE: dict[str, dict] = {}
+# Bounded (max 50, 5-min TTL) so a burst of downloads can't grow this forever.
+FILE_CACHE = TTLCache(max_size=50, ttl_seconds=300)
 
 # token -> {"query": str, "results": [...], "page": int}, used for the
 # text-based music search feature (search -> pick from list -> mp3)
-SEARCH_CACHE: dict[str, dict] = {}
+# Bounded (max 100, 10-min TTL) for the same reason.
+SEARCH_CACHE = TTLCache(max_size=100, ttl_seconds=600)
 SEARCH_RESULTS_PER_PAGE = 8
 SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
 SEARCH_CACHE_TTL_SECONDS = 600
@@ -385,7 +470,7 @@ SEARCH_CACHE_TTL_SECONDS = 600
 # token -> artist name, used for the "🔍 search by artist" button shown
 # after a song is recognized (callback_data has a 64-byte limit, so the
 # artist name itself can't always go directly in the callback data)
-ARTIST_SEARCH_CACHE: dict[str, str] = {}
+ARTIST_SEARCH_CACHE = TTLCache(max_size=100, ttl_seconds=600)
 
 # bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
@@ -1568,16 +1653,37 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     return filepath, info
 
 
-def _probe_video_stream(input_path: str) -> tuple[str, str]:
+async def _run_ffmpeg_async(cmd: list[str], timeout: int) -> tuple[int, str]:
+    """Run an ffmpeg command via asyncio.create_subprocess_exec so it never
+    blocks the event loop (or ties up a thread-pool worker) for the
+    duration of the call, and enforce a hard wall-clock timeout so a stuck
+    ffmpeg process can never hang around long enough to get the whole
+    container OOM-killed. Returns (returncode, stderr_text). On timeout the
+    process is killed and a RuntimeError is raised."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise RuntimeError(f"ffmpeg timed out after {timeout}s and was killed")
+    return proc.returncode, (stderr or b"").decode(errors="ignore")
+
+
+async def _probe_video_stream(input_path: str) -> tuple[str, str]:
     """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner (no
     ffprobe binary is bundled, only imageio-ffmpeg's ffmpeg)."""
     try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-i", input_path], capture_output=True, text=True, timeout=20
+        _rc, stderr = await _run_ffmpeg_async(
+            [FFMPEG_PATH, "-i", input_path], timeout=min(FFMPEG_TIMEOUT_SECONDS, 20)
         )
-    except subprocess.TimeoutExpired:
+    except RuntimeError:
         return "", ""
-    stderr = proc.stderr or ""
     vcodec = pix_fmt = ""
     m = re.search(r"Video:\s*([a-zA-Z0-9_]+)", stderr)
     if m:
@@ -1588,7 +1694,7 @@ def _probe_video_stream(input_path: str) -> tuple[str, str]:
     return vcodec, pix_fmt
 
 
-def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
+async def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
     """Make a downloaded video play correctly on Telegram-iOS.
 
     Why this is needed: Instagram (and some other platforms) often serve a
@@ -1613,7 +1719,7 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
     ffmpeg's own stderr banner (no ffprobe binary is bundled).
     """
     output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
-    vcodec, pix_fmt = _probe_video_stream(input_path)
+    vcodec, pix_fmt = await _probe_video_stream(input_path)
     is_already_compatible = vcodec in ("h264", "avc1") and pix_fmt.startswith("yuv420")
     size_mb = os.path.getsize(input_path) / (1024 * 1024) if os.path.exists(input_path) else 0
     MAX_REENCODE_MB = 60  # protects against OOM-killing the re-encode on Railway
@@ -1650,14 +1756,10 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
             output_path,
         ]
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
-    stderr = proc.stderr or ""
-    if proc.returncode != 0 or not os.path.exists(output_path):
-        killed = " (likely OOM-killed by the host - out of memory)" if proc.returncode == -9 else ""
-        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}){killed}: {stderr[-500:]}")
+    returncode, stderr = await _run_ffmpeg_async(cmd, timeout=IOS_NORMALIZE_TIMEOUT_SECONDS)
+    if returncode != 0 or not os.path.exists(output_path):
+        killed = " (likely OOM-killed by the host - out of memory)" if returncode == -9 else ""
+        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {returncode}){killed}: {stderr[-500:]}")
 
     width = height = duration = 0
     m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
@@ -1710,21 +1812,12 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                 if os.path.exists(merged):
                     filename = merged
 
-                ext = os.path.splitext(filename)[1].lower()
-                # Instagram in particular frequently serves a single
-                # progressive stream that never goes through ffmpeg at all
-                # (see docstring above) - normalize it for iOS. The function
-                # itself picks a fast lossless remux when possible, and only
-                # falls back to a real re-encode when the codec genuinely
-                # needs it (and stays within a safe size for that).
-                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
-                    try:
-                        norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
-                        os.remove(filename)
-                        filename = norm_path
-                        info["width"], info["height"], info["duration"] = w, h, dur
-                    except Exception as e:
-                        log.warning("iOS normalize failed, sending original file instead: %s", e)
+                # NOTE: the iOS-normalize ffmpeg step used to run right here,
+                # synchronously, inside this thread-pool worker. It now runs
+                # afterwards in download_media() as a real async subprocess
+                # (see _ffmpeg_normalize_for_ios) so it gets a proper
+                # timeout/kill via asyncio instead of blocking a worker
+                # thread, and so SKIP_IOS_NORMALIZE can bypass it entirely.
                 return filename, info
         except Exception as e:
             last_exc = e
@@ -1755,10 +1848,62 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
     _raise_ytdlp_failure(last_exc)
 
 
+def _is_retryable_download_error(exc: Exception) -> bool:
+    """Permanent errors (dead link, private/deleted content, unsupported
+    site) should fail fast instead of burning retries - only transient
+    network/server hiccups are worth retrying."""
+    msg = str(exc).lower()
+    permanent_markers = (
+        "404", "not found", "private", "unsupported url",
+        "no video formats found", "removed", "does not exist",
+    )
+    return not any(p in msg for p in permanent_markers)
+
+
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
-    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy, platform)
+
+    attempts = API_RETRY_COUNT + 1
+    delay = 1
+    filename = info = None
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            filename, info = await loop.run_in_executor(
+                None, _run_ytdlp_download, url, outdir, use_proxy, platform
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt >= attempts or not _is_retryable_download_error(e):
+                raise
+            log.warning(
+                "download_media: %s attempt %d/%d failed (%s) - retrying in %ds",
+                platform, attempt, attempts, e, delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2)
+    if filename is None:
+        raise last_exc or RuntimeError("download_media: no result and no exception - unexpected state")
+
+    # Instagram in particular frequently serves a single progressive stream
+    # that never goes through ffmpeg at all - normalize it for iOS so
+    # Telegram-iOS doesn't just show a frozen first frame. Skippable via
+    # SKIP_IOS_NORMALIZE for hosts tight on memory. Runs as a genuine async
+    # subprocess (not inside the executor thread) so it gets its own
+    # timeout/kill without tying up a worker thread.
+    ext = os.path.splitext(filename)[1].lower()
+    if platform == "instagram" and not SKIP_IOS_NORMALIZE and ext in (".mp4", ".mov", ".mkv", ".webm"):
+        try:
+            norm_path, w, h, dur = await _ffmpeg_normalize_for_ios(filename, outdir)
+            os.remove(filename)
+            filename = norm_path
+            info["width"], info["height"], info["duration"] = w, h, dur
+        except Exception as e:
+            log.warning("iOS normalize failed, sending original file instead: %s", e)
+
+    return filename, info
 
 
 # ============================================================
@@ -1865,15 +2010,23 @@ async def _vk_get_token() -> str | None:
         "2fa_supported": 1,
         "scope": "audio,offline",
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("https://oauth.vk.com/token", params=params) as resp:
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        log.warning("VK auth request failed: %s", e)
-        _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
-        return None
+    data = None
+    delay = 1
+    for attempt in range(1, API_RETRY_COUNT + 2):
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("https://oauth.vk.com/token", params=params) as resp:
+                    data = await resp.json(content_type=None)
+            break
+        except Exception as e:
+            if attempt >= API_RETRY_COUNT + 1:
+                log.warning("VK auth request failed after %d attempt(s): %s", attempt, e)
+                _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
+                return None
+            log.warning("VK auth request failed (attempt %d): %s - retrying in %ds", attempt, e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2)
     token = data.get("access_token")
     if not token:
         log.warning("VK auth failed: %s", data.get("error_description") or data)
@@ -1889,14 +2042,22 @@ async def _vk_search_tracks(query: str, count: int = 1) -> list[dict]:
     if not token:
         return []
     params = {"q": query, "count": count, "access_token": token, "v": _VK_API_VERSION}
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("https://api.vk.com/method/audio.search", params=params) as resp:
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        log.warning("VK search request failed: %s", e)
-        return []
+    data = None
+    delay = 1
+    for attempt in range(1, API_RETRY_COUNT + 2):
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("https://api.vk.com/method/audio.search", params=params) as resp:
+                    data = await resp.json(content_type=None)
+            break
+        except Exception as e:
+            if attempt >= API_RETRY_COUNT + 1:
+                log.warning("VK search request failed after %d attempt(s): %s", attempt, e)
+                return []
+            log.warning("VK search request failed (attempt %d): %s - retrying in %ds", attempt, e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2)
     if "error" in data:
         err = data["error"]
         log.warning("VK search error: %s", err.get("error_msg"))
@@ -1978,19 +2139,63 @@ def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | N
     return None
 
 
-async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> YouTube -> VK Music. Raises RuntimeError
-    if all three fail."""
+async def _retry_call(func, *args, label: str, **kwargs):
+    """Call a sync func in the executor, or an async func directly, with
+    exponential backoff (1s, then capped at 2s) on any exception. Retries
+    up to API_RETRY_COUNT extra times on top of the first attempt, logging
+    every retry and the final failure, then re-raises the last exception -
+    a single transient hiccup should never take down an entire search/
+    download chain."""
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
+    is_async = asyncio.iscoroutinefunction(func)
+    attempts = API_RETRY_COUNT + 1
+    delay = 1
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if is_async:
+                return await func(*args, **kwargs)
+            return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+        except Exception as e:
+            last_exc = e
+            if attempt >= attempts:
+                log.warning("%s failed after %d attempt(s), giving up: %s", label, attempt, e)
+                raise
+            log.warning("%s failed (attempt %d/%d): %s - retrying in %ds", label, attempt, attempts, e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2)
+    raise last_exc
+
+
+async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
+    """Search order: SoundCloud -> YouTube -> VK Music. Each source gets its
+    own retries (with backoff) for transient failures before falling
+    through to the next source. Raises RuntimeError only if all three,
+    after retries, come up empty."""
+    try:
+        result = await _retry_call(
+            _run_soundcloud_search_download, query, outdir, label=f"SoundCloud search '{query}'"
+        )
+    except Exception:
+        result = None
     if result:
         return result
     log.info("SoundCloud had no usable result for '%s' - trying YouTube", query)
-    result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
+    try:
+        result = await _retry_call(
+            _run_youtube_search_download, query, outdir, label=f"YouTube search '{query}'"
+        )
+    except Exception:
+        result = None
     if result:
         return result
     log.info("YouTube had no usable result for '%s' - trying VK Music", query)
-    result = await vk_search_and_download(query, outdir)
+    try:
+        result = await _retry_call(
+            vk_search_and_download, query, outdir, label=f"VK Music search '{query}'"
+        )
+    except Exception:
+        result = None
     if result:
         return result
     raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
@@ -2232,19 +2437,28 @@ async def _expire_search_cache(token: str, delay: int):
 
 
 def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
+    # Runs inside a thread-pool worker (via run_in_executor), so plain
+    # subprocess.run is fine here - but it MUST have a timeout, since an
+    # unbounded call is exactly the kind of thing that used to hang a
+    # worker thread indefinitely on a malformed/huge upload.
     audio_path = os.path.join(outdir, "sample.mp3")
-    result = subprocess.run(
-        [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg timed out after {FFMPEG_TIMEOUT_SECONDS}s extracting audio")
     stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
         # No audio track in the source (e.g. a silent GIF/video) - this is a
         # normal case, not a real error: just tell the user music wasn't found.
         if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
             return None
-        raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
+        killed = " (likely OOM-killed - out of memory)" if result.returncode == -9 else ""
+        raise RuntimeError(f"ffmpeg failed{killed}: {stderr_text[-500:]}")
     return audio_path
 
 
@@ -2670,6 +2884,34 @@ async def cb_artist_search(call: CallbackQuery):
     await status.edit_text(text, reply_markup=kb)
 
 
+async def _memory_monitor_task(interval_seconds: int = 300):
+    """Periodically logs resident memory usage and, if it crosses
+    MAX_CACHE_SIZE_MB, proactively clears the in-memory caches instead of
+    waiting for the OS to OOM-kill the whole process. This is a coarse
+    safety net on top of the TTLCache size/TTL bounds above - those stop
+    the caches from growing unbounded in the first place, this just gives
+    an extra margin if something else in the process is holding memory."""
+    while True:
+        try:
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mb = rss_kb / 1024  # ru_maxrss is KB on Linux
+            log.info(
+                "memory monitor: ~%.0fMB RSS (limit %dMB) | FILE_CACHE=%d SEARCH_CACHE=%d ARTIST_SEARCH_CACHE=%d",
+                rss_mb, MAX_CACHE_SIZE_MB, len(FILE_CACHE), len(SEARCH_CACHE), len(ARTIST_SEARCH_CACHE),
+            )
+            if rss_mb > MAX_CACHE_SIZE_MB:
+                log.warning(
+                    "memory monitor: RSS ~%.0fMB exceeds MAX_CACHE_SIZE_MB=%dMB - clearing caches early",
+                    rss_mb, MAX_CACHE_SIZE_MB,
+                )
+                FILE_CACHE.clear()
+                SEARCH_CACHE.clear()
+                ARTIST_SEARCH_CACHE.clear()
+        except Exception as e:
+            log.warning("memory monitor tick failed: %s", e)
+        await asyncio.sleep(interval_seconds)
+
+
 # ============================================================
 # ENTRYPOINT
 # ============================================================
@@ -2687,6 +2929,8 @@ async def main():
     BOT_DISPLAY_NAME = me.first_name or me.username or "Bot"
     BOT_USERNAME = me.username or ""
     log.info("Bot started as @%s (%s)", me.username, BOT_DISPLAY_NAME)
+
+    asyncio.create_task(_memory_monitor_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
