@@ -1,11 +1,9 @@
 import asyncio
 import base64
-import contextlib
 import io
 import logging
 import os
 import re
-import resource
 import shutil
 import subprocess
 import tempfile
@@ -13,7 +11,6 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from collections import OrderedDict
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
@@ -97,34 +94,6 @@ ADMIN_IDS = {
 # Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 
-# ------------------------------------------------------------
-# Reliability / memory-safety knobs (all optional, sane defaults below).
-# See the OOM/leak fixes this controls:
-#   FFMPEG_TIMEOUT_SECONDS - base timeout for a single ffmpeg subprocess
-#     call (probing, mp3 extraction, etc). The iOS-normalize re-encode is
-#     the one operation allowed to run longer, since a real re-encode of a
-#     large video legitimately takes more time - it uses this value * 8
-#     (30s default -> 240s ceiling) as its own timeout.
-#   SKIP_IOS_NORMALIZE - when true, never re-encode/remux downloaded video
-#     for iOS compatibility; just send the original file. This removes the
-#     single biggest OOM-kill risk (ffmpeg re-encoding a large HEVC/VP9
-#     video) at the cost of iOS occasionally showing a frozen first frame
-#     on non-H264 sources.
-#   API_RETRY_COUNT - number of retries (with exponential backoff, capped
-#     at 2s between attempts) for transient failures talking to YouTube/
-#     SoundCloud/VK, on top of each source's own internal fallbacks.
-#   MAX_CACHE_SIZE_MB - approximate resident-memory threshold (in MB); if
-#     exceeded, the periodic memory monitor proactively clears the
-#     in-memory caches instead of waiting for the OS to OOM-kill the bot.
-# ------------------------------------------------------------
-FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "30"))
-IOS_NORMALIZE_TIMEOUT_SECONDS = FFMPEG_TIMEOUT_SECONDS * 8
-SKIP_IOS_NORMALIZE = os.getenv("SKIP_IOS_NORMALIZE", "false").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-API_RETRY_COUNT = max(0, int(os.getenv("API_RETRY_COUNT", "2")))
-MAX_CACHE_SIZE_MB = int(os.getenv("MAX_CACHE_SIZE_MB", "800"))
-
 # Song search (text search + Shazam recognition) uses SoundCloud first, then
 # VK Music as a fallback for tracks that are copyright-blocked or missing on
 # SoundCloud. YouTube is NOT used for song search anymore - only for
@@ -170,38 +139,20 @@ def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
     return len(valid), len(data_lines)
 
 
-# Fallback YouTube cookies baked directly into the code, so the bot works
-# out of the box without requiring any env var setup. If YOUTUBE_COOKIES /
-# YOUTUBE_COOKIES_B64 / COOKIES_FILE are set in the environment, those take
-# priority over this default. When these cookies eventually expire, either
-# set one of those env vars with a fresh export, or just replace the string
-# below with a newly exported cookies.txt content.
-DEFAULT_YOUTUBE_COOKIES = """# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-# This is a generated file! Do not edit.
-
-.youtube.com	TRUE	/	TRUE	1817791305	LOGIN_INFO	AFmmF2swRQIgDRcYQVPgbRJ3vlWPkVMGISXb1xaVY1b9YMthPmOsnmkCIQCbARuqv7F1U5KfUsmBpDZsdyXlIaj4Ui0OfJ6flInlEQ:QUQ3MjNmeW5DTVRzOGVVeGxDVjJwbVU2UGl6MGtzdXJQdXdUX24tbXJYOXhTVC0xVkFRRUFzeWhMVHVnTkQ3aHhQMVNvYjdoMUs5SkxmUHg1QW16amNobUNJZDVoVlZlRVp6TkltSVdmZHBNUlpzbGU5R1Q4R3VObE42anl4OTdycm9FZFh3andVUURXU3k2SWVQLVE2ZWgwcW1RT1RzSUxR
-.youtube.com	TRUE	/	TRUE	1822295915	PREF	f4=4000000&f6=40000000&tz=Europe.Moscow&f7=100
-.youtube.com	TRUE	/	FALSE	1821086644	HSID	ATXHu8uSmp5ws1G6X
-.youtube.com	TRUE	/	TRUE	1821086644	SSID	AYA4p499iZj4LZY_N
-.youtube.com	TRUE	/	FALSE	1821086644	APISID	UymPtvX_CiM_SJ7A/AGcDbcKxOKKppoiQ1
-.youtube.com	TRUE	/	TRUE	1821086644	SAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
-.youtube.com	TRUE	/	TRUE	1821086644	__Secure-1PAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
-.youtube.com	TRUE	/	TRUE	1821086644	__Secure-3PAPISID	D-8sxdkx1NW-3FHd/AOFYJh3oc_ZkKcfMG
-.youtube.com	TRUE	/	FALSE	1821086644	SID	g.a000BAnb2kEqhtDPkqsMXF1Ax5oOOcgB_Eu3g2wEPLgEzh6Sc7risM8JurTi2nc-yC7X33xVKAACgYKAToSARUSFQHGX2MiNOGd0TAOFVoyhel_aR6NYxoVAUF8yKrmtih9ljEJp5bOagBgadKz0076
-.youtube.com	TRUE	/	TRUE	1821086644	__Secure-1PSID	g.a000BAnb2kEqhtDPkqsMXF1Ax5oOOcgB_Eu3g2wEPLgEzh6Sc7rigtbTAj_bUrd-RYzjpxqtMQACgYKAQcSARUSFQHGX2MiMy3VAa40fdZvcLyITIlYBBoVAUF8yKq5ujCEYZ1IzBLphNDMR6V90076
-.youtube.com	TRUE	/	TRUE	1821086644	__Secure-3PSID	g.a000BAnb2kEqhtDPkqsMXF1Ax5oOOcgB_Eu3g2wEPLgEzh6Sc7riHhkl0cdDuQJxWRv9dfB08AACgYKAbISARUSFQHGX2MiStVpUxu5a6ooYjTmfuS74xoVAUF8yKoJePiABMLBJxlLK-xfRb4j0076
-.youtube.com	TRUE	/	TRUE	1819271554	__Secure-1PSIDTS	sidts-CjEBXMw41SgXiNjTUHATbUSCKacl6iHuPOsXnwTelW2JY2OWYe9K1h4vozR5YA4gpnFoEAA
-.youtube.com	TRUE	/	TRUE	1819271554	__Secure-3PSIDTS	sidts-CjEBXMw41SgXiNjTUHATbUSCKacl6iHuPOsXnwTelW2JY2OWYe9K1h4vozR5YA4gpnFoEAA
-.youtube.com	TRUE	/	FALSE	1819271557	SIDCC	AKEyXzWjEOgZta2lOpPqQIsLPqB4LjsyuswTzaLpWphkkKnGEs1HHRtrWTHJ9UsUWmpMMf7pUhg
-.youtube.com	TRUE	/	TRUE	1819271557	__Secure-1PSIDCC	AKEyXzUkQ5doHANtQDZFrOPOM72MjZ_Ahp96Yr-nHOTDHk7m5ILSz4Heasrv8L4nyuhqJ3vTdg
-.youtube.com	TRUE	/	TRUE	1819271557	__Secure-3PSIDCC	AKEyXzXvJwmhVQQJoTSX9gEjZ5VkPMQXV7ktwO9zteN3rGb_wy6qUsKXh1x3WsqGr0EbkJ7mGOI
-.youtube.com	TRUE	/	TRUE	1803287555	VISITOR_INFO1_LIVE	CHiAqyiszTA
-.youtube.com	TRUE	/	TRUE	1803287555	VISITOR_PRIVACY_METADATA	CgJVWhIEGgAgVg%3D%3D
-.youtube.com	TRUE	/	TRUE	1803287547	__Secure-YNID	21.YT=LABIZh7m9_D--0sQCozM55Xbj82d-OGiKwdDfqe8GzqclUiPe8RU22MHLI1itQ6Jj0Qs2U1sAdiVLuyZ1QQ6dn9uOfgtMBbOBZcCXglM-iKY9y-10gjrCq8qUbluf7JpTiONHCFtLc_aMXOalPGe6s-7ZofJesgXTCVU9dyz_ExMIyEdPNTvnDj6UWDP7Ve5BhQpqn7nCN7MSDRh6s0j1ByC20TfjQszaV7ysx_KE2BZ_OznSotM2lkrjqquKALSTHFWabDiWhkos810ZwJ2oW-MKeoTS6jwM4SjNpHDgr-cn8vVBAn4d-CPrzkcimZTTyDn2StPArv3g5mbuiH9CQ
-.youtube.com	TRUE	/	TRUE	0	YSC	6NlZ9pI3MdY
-.youtube.com	TRUE	/	TRUE	1803287547	__Secure-ROLLOUT_TOKEN	CIPE9cDPxoH_zgEQ1aejoe66lQMY6N7r7t69lgM%3D
-"""
+# SECURITY NOTE (fixed): this used to contain a real, live YouTube account's
+# session cookies (SID/PSID/APISID/etc.) hardcoded directly in the source.
+# That is a full account-takeover credential leak the moment this file is
+# committed anywhere semi-public (GitHub, a shared Railway project, etc.) -
+# anyone with those cookie values can act as that Google account. It has
+# been removed. If you pasted this file into a public repo, rotate that
+# Google account's password now and revoke its sessions.
+#
+# Cookies are no longer baked into the code. Set one of these env vars
+# instead (Railway → Variables), same as before:
+#   YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content
+#   YOUTUBE_COOKIES       -> raw cookies.txt content (Netscape format)
+#   COOKIES_FILE          -> path to an already-mounted cookies.txt file
+DEFAULT_YOUTUBE_COOKIES = ""
 
 
 def _write_cookies_file(content: str, filename: str = "yt_cookies.txt") -> str:
@@ -246,8 +197,10 @@ def _setup_youtube_cookies() -> str | None:
       1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
       2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
       3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
-      4. DEFAULT_YOUTUBE_COOKIES -> baked into the code above, used if nothing
-         else worked, so the bot works without any extra setup.
+
+    There is no hardcoded fallback cookie set anymore (see the security note
+    above DEFAULT_YOUTUBE_COOKIES) - one of the env vars above must be set
+    for cookie-assisted YouTube downloads to work.
     """
     logger = logging.getLogger("bot")
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
@@ -279,15 +232,10 @@ def _setup_youtube_cookies() -> str | None:
         logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
         return path_env
 
-    result = _try_load_cookie_candidate(
-        "the built-in default (edit DEFAULT_YOUTUBE_COOKIES in main.py to update)",
-        DEFAULT_YOUTUBE_COOKIES,
-        logger,
+    logger.warning(
+        "No usable YouTube cookies found (YOUTUBE_COOKIES_B64 / YOUTUBE_COOKIES / COOKIES_FILE "
+        "are all unset) - relying on player_client fallback only, which YouTube may still bot-check."
     )
-    if result:
-        return result
-
-    logger.warning("No usable YouTube cookies found anywhere - relying on player_client fallback only.")
     return None
 
 
@@ -339,6 +287,48 @@ def _setup_instagram_cookies() -> str | None:
     return None
 
 
+def _setup_facebook_cookies() -> str | None:
+    """Facebook login-walls most videos/reels for logged-out (datacenter IP)
+    requests. Optional, same pattern as Instagram/YouTube:
+      1. FACEBOOK_COOKIES_B64  -> base64-encoded cookies.txt content (env var)
+      2. FACEBOOK_COOKIES      -> raw cookies.txt content (env var, Netscape format)
+      3. FACEBOOK_COOKIES_FILE -> path to an already-mounted cookies.txt file (env var)
+    """
+    logger = logging.getLogger("bot")
+    b64 = os.getenv("FACEBOOK_COOKIES_B64", "").strip()
+    raw = os.getenv("FACEBOOK_COOKIES", "").strip()
+    path_env = os.getenv("FACEBOOK_COOKIES_FILE", "").strip()
+
+    if b64:
+        cleaned = "".join(b64.split())
+        padding = len(cleaned) % 4
+        if padding:
+            cleaned += "=" * (4 - padding)
+        try:
+            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
+            result = _try_load_cookie_candidate(
+                "FACEBOOK_COOKIES_B64", decoded, logger, filename="facebook_cookies.txt", label="Facebook"
+            )
+            if result:
+                return result
+        except Exception as e:
+            logger.warning("FACEBOOK_COOKIES_B64 could not be decoded (%s) - trying the next available source.", e)
+
+    if raw:
+        result = _try_load_cookie_candidate(
+            "FACEBOOK_COOKIES", raw, logger, filename="facebook_cookies.txt", label="Facebook"
+        )
+        if result:
+            return result
+
+    if path_env and os.path.exists(path_env):
+        logger.info("Facebook cookies loaded from FACEBOOK_COOKIES_FILE (%s).", path_env)
+        return path_env
+
+    logger.info("No Facebook cookies configured - many Facebook videos are login-walled and will fail without them.")
+    return None
+
+
 # Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
 # "Sign in to confirm you're not a bot" checks. See _setup_youtube_cookies().
 COOKIES_FILE = _setup_youtube_cookies()
@@ -346,6 +336,9 @@ COOKIES_FILE = _setup_youtube_cookies()
 # Optional: same idea but for Instagram's rate-limit/login-wall errors.
 # See _setup_instagram_cookies().
 INSTAGRAM_COOKIES_FILE = _setup_instagram_cookies()
+
+# Optional: Facebook login-wall cookies. See _setup_facebook_cookies().
+FACEBOOK_COOKIES_FILE = _setup_facebook_cookies()
 
 
 def _check_cookies_expiry(path):
@@ -400,69 +393,16 @@ PLATFORM_PATTERNS = {
     "youtube": re.compile(r"(youtube\.com|youtu\.be)"),
     "tiktok": re.compile(r"tiktok\.com"),
     "pinterest": re.compile(r"(pinterest\.com|pin\.it)"),
-    "snapchat": re.compile(r"snapchat\.com"),
+    "snapchat": re.compile(r"(snapchat\.com|snap\.com)"),
+    "facebook": re.compile(r"(facebook\.com|fb\.watch)"),
 }
 
-class TTLCache:
-    """Bounded, dict-like in-memory cache: entries expire after
-    ttl_seconds and the oldest entry is evicted once max_size is
-    exceeded. Drop-in replacement for the plain dicts these caches used
-    to be (supports [], .get(), .pop(), len(), .clear(), 'in') - fixes
-    the unbounded memory growth that came from relying solely on
-    best-effort asyncio.create_task() expiry timers, which never bound
-    the cache's *size*, only individual entries' *lifetime*."""
-
-    def __init__(self, max_size: int, ttl_seconds: int):
-        self.max_size = max_size
-        self.ttl_seconds = ttl_seconds
-        self._data: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
-
-    def _purge_expired(self):
-        now = time.time()
-        expired = [k for k, (ts, _v) in self._data.items() if now - ts > self.ttl_seconds]
-        for k in expired:
-            self._data.pop(k, None)
-
-    def __setitem__(self, key, value):
-        self._purge_expired()
-        self._data.pop(key, None)
-        self._data[key] = (time.time(), value)
-        while len(self._data) > self.max_size:
-            self._data.popitem(last=False)  # evict oldest (LRU-ish, insertion order)
-
-    def __getitem__(self, key):
-        self._purge_expired()
-        return self._data[key][1]
-
-    def __contains__(self, key):
-        self._purge_expired()
-        return key in self._data
-
-    def __len__(self):
-        self._purge_expired()
-        return len(self._data)
-
-    def get(self, key, default=None):
-        self._purge_expired()
-        entry = self._data.get(key)
-        return entry[1] if entry is not None else default
-
-    def pop(self, key, default=None):
-        entry = self._data.pop(key, None)
-        return entry[1] if entry is not None else default
-
-    def clear(self):
-        self._data.clear()
-
-
 # token -> {"filepath": str, "source_url": str}, used for the "detect music" button
-# Bounded (max 50, 5-min TTL) so a burst of downloads can't grow this forever.
-FILE_CACHE = TTLCache(max_size=50, ttl_seconds=300)
+FILE_CACHE: dict[str, dict] = {}
 
 # token -> {"query": str, "results": [...], "page": int}, used for the
 # text-based music search feature (search -> pick from list -> mp3)
-# Bounded (max 100, 10-min TTL) for the same reason.
-SEARCH_CACHE = TTLCache(max_size=100, ttl_seconds=600)
+SEARCH_CACHE: dict[str, dict] = {}
 SEARCH_RESULTS_PER_PAGE = 8
 SEARCH_FETCH_LIMIT = 40  # fetched once per query, paginated locally
 SEARCH_CACHE_TTL_SECONDS = 600
@@ -470,13 +410,74 @@ SEARCH_CACHE_TTL_SECONDS = 600
 # token -> artist name, used for the "🔍 search by artist" button shown
 # after a song is recognized (callback_data has a 64-byte limit, so the
 # artist name itself can't always go directly in the callback data)
-ARTIST_SEARCH_CACHE = TTLCache(max_size=100, ttl_seconds=600)
+ARTIST_SEARCH_CACHE: dict[str, str] = {}
 
 # bot's own display name, auto-detected from the token at startup
 BOT_DISPLAY_NAME = "Bot"
 BOT_USERNAME = ""
 
 pool: asyncpg.Pool | None = None
+
+
+# ============================================================
+# CONCURRENCY LIMIT — tuned for the current Railway plan
+# (2 vCPU / 1 GB RAM, see Replica Limits in the Railway dashboard).
+#
+# Every video/audio job below spawns a yt-dlp + ffmpeg subprocess.
+# A single one of those can use 150-400MB RAM (more for an Instagram
+# HEVC re-encode). Running more than ~2 of them truly in parallel on
+# a 1GB box risks the host OOM-killing the whole service.
+#
+# Rather than lowering quality (smaller resolution, more compression)
+# to let more requests run at once, extra requests are QUEUED: they
+# wait their turn for a free slot instead of running underpowered or
+# crashing the process. Users see a short "navbatda" message while
+# they wait, then the normal status text once their job starts.
+# If you upgrade the Railway plan, raise HEAVY_JOB_SLOTS accordingly
+# (roughly: 1 slot per 400-500MB of available RAM).
+# ============================================================
+HEAVY_JOB_SLOTS = 2
+HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(HEAVY_JOB_SLOTS)
+
+
+class HeavyJobSlot:
+    """Async context manager that serializes heavy (download/encode/
+    recognize) work behind HEAVY_JOB_SEMAPHORE.
+
+    If both slots are busy when a new job arrives, it edits `status`
+    to a "queued" message so the user understands the wait, then swaps
+    it to `busy_text_key`'s text once a slot actually frees up and the
+    job starts running.
+    """
+
+    __slots__ = ("status", "lang", "busy_text_key")
+
+    def __init__(self, status, lang: str, busy_text_key: str):
+        self.status = status
+        self.lang = lang
+        self.busy_text_key = busy_text_key
+
+    async def __aenter__(self):
+        was_queued = HEAVY_JOB_SEMAPHORE.locked()
+        if was_queued:
+            try:
+                await self.status.edit_text(t(self.lang, "queued"))
+            except Exception:
+                pass
+        await HEAVY_JOB_SEMAPHORE.acquire()
+        # Only touch the status text again if we actually showed the
+        # "queued" message above - otherwise leave whatever the caller
+        # had already put there (e.g. a "found: <song>" message).
+        if was_queued:
+            try:
+                await self.status.edit_text(t(self.lang, self.busy_text_key))
+            except Exception:
+                pass
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        HEAVY_JOB_SEMAPHORE.release()
+        return False
 
 
 # ============================================================
@@ -493,6 +494,7 @@ TEXTS = {
         ),
         "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Yuklanmoqda, biroz kuting...",
+        "queued": "⏳ Hozir band, navbatingiz kelishi bilan boshlanadi...",
         "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
         "detect_music_btn": "🎵 Musiqani aniqlash",
         "recognizing": "🎧 Musiqa aniqlanmoqda...",
@@ -506,7 +508,9 @@ TEXTS = {
         "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
         "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
         "link_not_found": "❌ Bu post topilmadi — o'chirilgan, yopiq (private) yoki linkda xatolik bo'lishi mumkin.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.",
+        "err_private": "🔐 Bu post yopiq (private) yoki yuklab olish cheklangan.\nUni ilova ichidan ulashib ko'ring yoki ochiq (public) qilishni so'rang.",
+        "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
+        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
         "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
@@ -577,6 +581,7 @@ TEXTS = {
         ),
         "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Загружается, подождите...",
+        "queued": "⏳ Сейчас все занято, начнём, как только освободится место в очереди...",
         "caption": "✅ Спасибо, что пользуетесь ботом!",
         "detect_music_btn": "🎵 Распознать музыку",
         "recognizing": "🎧 Распознаём музыку...",
@@ -590,7 +595,9 @@ TEXTS = {
         "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
         "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
         "link_not_found": "❌ Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.",
+        "err_private": "🔐 Этот пост закрыт (private) или загрузка ограничена владельцем.\nПопробуйте поделиться им из самого приложения или попросите сделать его публичным.",
+        "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
+        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
         "admin_only": "⛔ Эта команда только для администраторов.",
@@ -661,6 +668,7 @@ TEXTS = {
         ),
         "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
         "downloading": "⏳ Downloading, please wait...",
+        "queued": "⏳ All slots are busy right now, this will start as soon as one frees up...",
         "caption": "✅ Thanks for using our bot!",
         "detect_music_btn": "🎵 Recognize music",
         "recognizing": "🎧 Recognizing the music...",
@@ -674,7 +682,9 @@ TEXTS = {
         "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
         "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
         "link_not_found": "❌ Post not found — it may have been deleted, made private, or the link is wrong.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.",
+        "err_private": "🔐 This post is private or downloads are restricted by the owner.\nTry sharing it from within the app itself, or ask for it to be made public.",
+        "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
+        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
         "admin_only": "⛔ This command is for admins only.",
@@ -1622,18 +1632,19 @@ def _build_ydl_opts_base(outdir, player_clients):
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
-def _download_instagram_photo_fallback(url: str, outdir: str):
-    """Instagram photo-only posts have no video formats, so yt-dlp's normal
-    download raises 'No video formats found!'. This grabs the highest-res
-    display image directly instead."""
+def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = None):
+    """Some posts (Instagram photo-only posts, some Pinterest image pins)
+    have no video formats at all, so yt-dlp's normal video download raises
+    'No video formats found!'. This grabs the highest-res display image
+    directly instead. Used as a safety net for both platforms."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "http_headers": {"User-Agent": DEFAULT_UA},
     }
-    if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
-        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if "entries" in info:
@@ -1643,7 +1654,7 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     if thumbs:
         img_url = max(thumbs, key=lambda th: (th.get("width") or 0) * (th.get("height") or 0)).get("url")
     if not img_url:
-        img_url = info.get("thumbnail")
+        img_url = info.get("thumbnail") or info.get("url")
     if not img_url:
         return None
     filepath = os.path.join(outdir, f"{info.get('id') or 'photo'}.jpg")
@@ -1653,37 +1664,16 @@ def _download_instagram_photo_fallback(url: str, outdir: str):
     return filepath, info
 
 
-async def _run_ffmpeg_async(cmd: list[str], timeout: int) -> tuple[int, str]:
-    """Run an ffmpeg command via asyncio.create_subprocess_exec so it never
-    blocks the event loop (or ties up a thread-pool worker) for the
-    duration of the call, and enforce a hard wall-clock timeout so a stuck
-    ffmpeg process can never hang around long enough to get the whole
-    container OOM-killed. Returns (returncode, stderr_text). On timeout the
-    process is killed and a RuntimeError is raised."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        raise RuntimeError(f"ffmpeg timed out after {timeout}s and was killed")
-    return proc.returncode, (stderr or b"").decode(errors="ignore")
-
-
-async def _probe_video_stream(input_path: str) -> tuple[str, str]:
+def _probe_video_stream(input_path: str) -> tuple[str, str]:
     """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner (no
     ffprobe binary is bundled, only imageio-ffmpeg's ffmpeg)."""
     try:
-        _rc, stderr = await _run_ffmpeg_async(
-            [FFMPEG_PATH, "-i", input_path], timeout=min(FFMPEG_TIMEOUT_SECONDS, 20)
+        proc = subprocess.run(
+            [FFMPEG_PATH, "-i", input_path], capture_output=True, text=True, timeout=20
         )
-    except RuntimeError:
+    except subprocess.TimeoutExpired:
         return "", ""
+    stderr = proc.stderr or ""
     vcodec = pix_fmt = ""
     m = re.search(r"Video:\s*([a-zA-Z0-9_]+)", stderr)
     if m:
@@ -1694,7 +1684,7 @@ async def _probe_video_stream(input_path: str) -> tuple[str, str]:
     return vcodec, pix_fmt
 
 
-async def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
+def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
     """Make a downloaded video play correctly on Telegram-iOS.
 
     Why this is needed: Instagram (and some other platforms) often serve a
@@ -1719,7 +1709,7 @@ async def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, 
     ffmpeg's own stderr banner (no ffprobe binary is bundled).
     """
     output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
-    vcodec, pix_fmt = await _probe_video_stream(input_path)
+    vcodec, pix_fmt = _probe_video_stream(input_path)
     is_already_compatible = vcodec in ("h264", "avc1") and pix_fmt.startswith("yuv420")
     size_mb = os.path.getsize(input_path) / (1024 * 1024) if os.path.exists(input_path) else 0
     MAX_REENCODE_MB = 60  # protects against OOM-killing the re-encode on Railway
@@ -1756,10 +1746,14 @@ async def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, 
             output_path,
         ]
 
-    returncode, stderr = await _run_ffmpeg_async(cmd, timeout=IOS_NORMALIZE_TIMEOUT_SECONDS)
-    if returncode != 0 or not os.path.exists(output_path):
-        killed = " (likely OOM-killed by the host - out of memory)" if returncode == -9 else ""
-        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {returncode}){killed}: {stderr[-500:]}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
+    stderr = proc.stderr or ""
+    if proc.returncode != 0 or not os.path.exists(output_path):
+        killed = " (likely OOM-killed by the host - out of memory)" if proc.returncode == -9 else ""
+        raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}){killed}: {stderr[-500:]}")
 
     width = height = duration = 0
     m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
@@ -1790,15 +1784,28 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
     last_exc = None
     for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
         ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        # Prefer merging the best separate video+audio streams (ffmpeg does
-        # the merge) for real quality; fall back to a single progressive
-        # mp4/best file if a merge isn't possible for this video.
-        ydl_opts["format"] = (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        )
+        # Format selection differs by platform:
+        # - instagram/youtube/tiktok: merge best video+audio for real quality,
+        #   falling back to a single progressive file.
+        # - pinterest: pins can be either a video OR a plain image with no
+        #   video formats at all. "best" alone correctly picks whichever one
+        #   exists instead of forcing a video-only selector that raises
+        #   "No video formats found!" on image pins.
+        # - facebook/snapchat: these extractors frequently only expose a
+        #   single progressive format (no separate audio/video streams to
+        #   merge), so try a plain "best" first and only fall back to a
+        #   video+audio merge if that's genuinely what's available.
+        if platform == "pinterest":
+            ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best"
+        elif platform in ("facebook", "snapchat"):
+            ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+        else:
+            ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         ydl_opts["merge_output_format"] = "mp4"
         if platform == "instagram" and INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
             ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+        elif platform == "facebook" and FACEBOOK_COOKIES_FILE and os.path.exists(FACEBOOK_COOKIES_FILE):
+            ydl_opts["cookiefile"] = FACEBOOK_COOKIES_FILE
         if use_proxy and GENERAL_PROXY:
             ydl_opts["proxy"] = GENERAL_PROXY
         try:
@@ -1812,17 +1819,27 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                 if os.path.exists(merged):
                     filename = merged
 
-                # NOTE: the iOS-normalize ffmpeg step used to run right here,
-                # synchronously, inside this thread-pool worker. It now runs
-                # afterwards in download_media() as a real async subprocess
-                # (see _ffmpeg_normalize_for_ios) so it gets a proper
-                # timeout/kill via asyncio instead of blocking a worker
-                # thread, and so SKIP_IOS_NORMALIZE can bypass it entirely.
+                ext = os.path.splitext(filename)[1].lower()
+                # Instagram in particular frequently serves a single
+                # progressive stream that never goes through ffmpeg at all
+                # (see docstring above) - normalize it for iOS. The function
+                # itself picks a fast lossless remux when possible, and only
+                # falls back to a real re-encode when the codec genuinely
+                # needs it (and stays within a safe size for that).
+                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
+                    try:
+                        norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
+                        os.remove(filename)
+                        filename = norm_path
+                        info["width"], info["height"], info["duration"] = w, h, dur
+                    except Exception as e:
+                        log.warning("iOS normalize failed, sending original file instead: %s", e)
                 return filename, info
         except Exception as e:
             last_exc = e
-            if "no video formats found" in str(e).lower() and "instagram" in url.lower():
-                result = _download_instagram_photo_fallback(url, outdir)
+            if "no video formats found" in str(e).lower() and platform in ("instagram", "pinterest"):
+                cookies_for_fallback = INSTAGRAM_COOKIES_FILE if platform == "instagram" else None
+                result = _download_image_fallback(url, outdir, cookies_for_fallback)
                 if result:
                     return result
                 raise
@@ -1836,6 +1853,11 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                         "set INSTAGRAM_COOKIES_B64 in Railway environment variables."
                     )
                 raise
+            if platform == "facebook" and not FACEBOOK_COOKIES_FILE:
+                log.info(
+                    "Facebook download failed and no FACEBOOK_COOKIES_B64 is set - many Facebook "
+                    "videos/reels are login-walled and need cookies from a logged-in account to work."
+                )
             if "youtube" not in url and "youtu.be" not in url:
                 raise
             if not _is_bot_check_error(e):
@@ -1848,62 +1870,23 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
     _raise_ytdlp_failure(last_exc)
 
 
-def _is_retryable_download_error(exc: Exception) -> bool:
-    """Permanent errors (dead link, private/deleted content, unsupported
-    site) should fail fast instead of burning retries - only transient
-    network/server hiccups are worth retrying."""
+def classify_download_error(exc: Exception) -> str:
+    """Maps a yt-dlp exception to one of a small set of error codes so the
+    UI can show a specific, actionable message instead of a generic one."""
     msg = str(exc).lower()
-    permanent_markers = (
-        "404", "not found", "private", "unsupported url",
-        "no video formats found", "removed", "does not exist",
-    )
-    return not any(p in msg for p in permanent_markers)
+    if "expired" in msg or "no longer available" in msg or "24 hours" in msg:
+        return "ERROR_EXPIRED"
+    if "private" in msg or "login" in msg or "restricted" in msg or "log in" in msg:
+        return "ERROR_PRIVATE"
+    if "not found" in msg or "404" in msg or "this post" in msg and "deleted" in msg or "deleted" in msg:
+        return "ERROR_DELETED"
+    return "ERROR_UNKNOWN"
 
 
 async def download_media(url: str, outdir: str, platform: str):
     loop = asyncio.get_running_loop()
     use_proxy = platform != "tiktok"  # TikTok is never proxied, per requirements
-
-    attempts = API_RETRY_COUNT + 1
-    delay = 1
-    filename = info = None
-    last_exc = None
-    for attempt in range(1, attempts + 1):
-        try:
-            filename, info = await loop.run_in_executor(
-                None, _run_ytdlp_download, url, outdir, use_proxy, platform
-            )
-            break
-        except Exception as e:
-            last_exc = e
-            if attempt >= attempts or not _is_retryable_download_error(e):
-                raise
-            log.warning(
-                "download_media: %s attempt %d/%d failed (%s) - retrying in %ds",
-                platform, attempt, attempts, e, delay,
-            )
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2)
-    if filename is None:
-        raise last_exc or RuntimeError("download_media: no result and no exception - unexpected state")
-
-    # Instagram in particular frequently serves a single progressive stream
-    # that never goes through ffmpeg at all - normalize it for iOS so
-    # Telegram-iOS doesn't just show a frozen first frame. Skippable via
-    # SKIP_IOS_NORMALIZE for hosts tight on memory. Runs as a genuine async
-    # subprocess (not inside the executor thread) so it gets its own
-    # timeout/kill without tying up a worker thread.
-    ext = os.path.splitext(filename)[1].lower()
-    if platform == "instagram" and not SKIP_IOS_NORMALIZE and ext in (".mp4", ".mov", ".mkv", ".webm"):
-        try:
-            norm_path, w, h, dur = await _ffmpeg_normalize_for_ios(filename, outdir)
-            os.remove(filename)
-            filename = norm_path
-            info["width"], info["height"], info["duration"] = w, h, dur
-        except Exception as e:
-            log.warning("iOS normalize failed, sending original file instead: %s", e)
-
-    return filename, info
+    return await loop.run_in_executor(None, _run_ytdlp_download, url, outdir, use_proxy, platform)
 
 
 # ============================================================
@@ -2010,23 +1993,15 @@ async def _vk_get_token() -> str | None:
         "2fa_supported": 1,
         "scope": "audio,offline",
     }
-    data = None
-    delay = 1
-    for attempt in range(1, API_RETRY_COUNT + 2):
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get("https://oauth.vk.com/token", params=params) as resp:
-                    data = await resp.json(content_type=None)
-            break
-        except Exception as e:
-            if attempt >= API_RETRY_COUNT + 1:
-                log.warning("VK auth request failed after %d attempt(s): %s", attempt, e)
-                _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
-                return None
-            log.warning("VK auth request failed (attempt %d): %s - retrying in %ds", attempt, e, delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2)
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://oauth.vk.com/token", params=params) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("VK auth request failed: %s", e)
+        _vk_auth_cooldown_until = now + _VK_AUTH_COOLDOWN_SECONDS
+        return None
     token = data.get("access_token")
     if not token:
         log.warning("VK auth failed: %s", data.get("error_description") or data)
@@ -2042,22 +2017,14 @@ async def _vk_search_tracks(query: str, count: int = 1) -> list[dict]:
     if not token:
         return []
     params = {"q": query, "count": count, "access_token": token, "v": _VK_API_VERSION}
-    data = None
-    delay = 1
-    for attempt in range(1, API_RETRY_COUNT + 2):
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get("https://api.vk.com/method/audio.search", params=params) as resp:
-                    data = await resp.json(content_type=None)
-            break
-        except Exception as e:
-            if attempt >= API_RETRY_COUNT + 1:
-                log.warning("VK search request failed after %d attempt(s): %s", attempt, e)
-                return []
-            log.warning("VK search request failed (attempt %d): %s - retrying in %ds", attempt, e, delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2)
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.vk.com/method/audio.search", params=params) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("VK search request failed: %s", e)
+        return []
     if "error" in data:
         err = data["error"]
         log.warning("VK search error: %s", err.get("error_msg"))
@@ -2139,63 +2106,19 @@ def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | N
     return None
 
 
-async def _retry_call(func, *args, label: str, **kwargs):
-    """Call a sync func in the executor, or an async func directly, with
-    exponential backoff (1s, then capped at 2s) on any exception. Retries
-    up to API_RETRY_COUNT extra times on top of the first attempt, logging
-    every retry and the final failure, then re-raises the last exception -
-    a single transient hiccup should never take down an entire search/
-    download chain."""
-    loop = asyncio.get_running_loop()
-    is_async = asyncio.iscoroutinefunction(func)
-    attempts = API_RETRY_COUNT + 1
-    delay = 1
-    last_exc = None
-    for attempt in range(1, attempts + 1):
-        try:
-            if is_async:
-                return await func(*args, **kwargs)
-            return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-        except Exception as e:
-            last_exc = e
-            if attempt >= attempts:
-                log.warning("%s failed after %d attempt(s), giving up: %s", label, attempt, e)
-                raise
-            log.warning("%s failed (attempt %d/%d): %s - retrying in %ds", label, attempt, attempts, e, delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2)
-    raise last_exc
-
-
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> YouTube -> VK Music. Each source gets its
-    own retries (with backoff) for transient failures before falling
-    through to the next source. Raises RuntimeError only if all three,
-    after retries, come up empty."""
-    try:
-        result = await _retry_call(
-            _run_soundcloud_search_download, query, outdir, label=f"SoundCloud search '{query}'"
-        )
-    except Exception:
-        result = None
+    """Search order: SoundCloud -> YouTube -> VK Music. Raises RuntimeError
+    if all three fail."""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
     if result:
         return result
     log.info("SoundCloud had no usable result for '%s' - trying YouTube", query)
-    try:
-        result = await _retry_call(
-            _run_youtube_search_download, query, outdir, label=f"YouTube search '{query}'"
-        )
-    except Exception:
-        result = None
+    result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
     if result:
         return result
     log.info("YouTube had no usable result for '%s' - trying VK Music", query)
-    try:
-        result = await _retry_call(
-            vk_search_and_download, query, outdir, label=f"VK Music search '{query}'"
-        )
-    except Exception:
-        result = None
+    result = await vk_search_and_download(query, outdir)
     if result:
         return result
     raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
@@ -2437,28 +2360,19 @@ async def _expire_search_cache(token: str, delay: int):
 
 
 def extract_audio_for_recognition(video_path: str, outdir: str) -> str | None:
-    # Runs inside a thread-pool worker (via run_in_executor), so plain
-    # subprocess.run is fine here - but it MUST have a timeout, since an
-    # unbounded call is exactly the kind of thing that used to hang a
-    # worker thread indefinitely on a malformed/huge upload.
     audio_path = os.path.join(outdir, "sample.mp3")
-    try:
-        result = subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"ffmpeg timed out after {FFMPEG_TIMEOUT_SECONDS}s extracting audio")
+    result = subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", video_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", audio_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     stderr_text = result.stderr.decode(errors="ignore")
     if result.returncode != 0 or not os.path.exists(audio_path):
         # No audio track in the source (e.g. a silent GIF/video) - this is a
         # normal case, not a real error: just tell the user music wasn't found.
         if "does not contain any stream" in stderr_text or "Output file does not contain any stream" in stderr_text:
             return None
-        killed = " (likely OOM-killed - out of memory)" if result.returncode == -9 else ""
-        raise RuntimeError(f"ffmpeg failed{killed}: {stderr_text[-500:]}")
+        raise RuntimeError(f"ffmpeg failed: {stderr_text[-500:]}")
     return audio_path
 
 
@@ -2519,18 +2433,23 @@ async def handle_link(message: Message):
     status = await message.answer(t(lang, "downloading"))
     outdir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
-        filepath, info = await download_media(url, outdir, platform)
+        async with HeavyJobSlot(status, lang, "downloading"):
+            filepath, info = await download_media(url, outdir, platform)
     except Exception as e:
         shutil.rmtree(outdir, ignore_errors=True)
-        err_msg = str(e).lower()
         if platform == "tiktok":
             await status.edit_text(t(lang, "tiktok_unavailable"))
-        elif "404" in err_msg or "not found" in err_msg or "private" in err_msg:
-            log.info("link not found/private/deleted: %s", e)
-            await status.edit_text(t(lang, "link_not_found"))
         else:
-            log.warning("download failed: %s", e)
-            await status.edit_text(t(lang, "error"))
+            code = classify_download_error(e)
+            log.info("download failed (%s) for platform=%s: %s", code, platform, e)
+            if code == "ERROR_PRIVATE":
+                await status.edit_text(t(lang, "err_private"))
+            elif code == "ERROR_EXPIRED":
+                await status.edit_text(t(lang, "err_expired"))
+            elif code == "ERROR_DELETED":
+                await status.edit_text(t(lang, "link_not_found"))
+            else:
+                await status.edit_text(t(lang, "error"))
         return
 
     try:
@@ -2601,7 +2520,8 @@ async def handle_own_media(message: Message):
             f.write(buf.read())
 
         loop = asyncio.get_running_loop()
-        audio_sample = await loop.run_in_executor(None, extract_audio_for_recognition, src_path, outdir)
+        async with HeavyJobSlot(status, lang, "recognizing"):
+            audio_sample = await loop.run_in_executor(None, extract_audio_for_recognition, src_path, outdir)
         if not audio_sample:
             await status.edit_text(t(lang, "not_recognized"))
             return
@@ -2615,7 +2535,8 @@ async def handle_own_media(message: Message):
 
         query = f"{song['artist']} {song['title']}"
         try:
-            mp3_path, song_link = await search_and_download_song(query, outdir)
+            async with HeavyJobSlot(status, lang, "downloading"):
+                mp3_path, song_link = await search_and_download_song(query, outdir)
         except Exception as e:
             log.info("own-media song download failed, falling back to YouTube link: %s", e)
             yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
@@ -2884,34 +2805,6 @@ async def cb_artist_search(call: CallbackQuery):
     await status.edit_text(text, reply_markup=kb)
 
 
-async def _memory_monitor_task(interval_seconds: int = 300):
-    """Periodically logs resident memory usage and, if it crosses
-    MAX_CACHE_SIZE_MB, proactively clears the in-memory caches instead of
-    waiting for the OS to OOM-kill the whole process. This is a coarse
-    safety net on top of the TTLCache size/TTL bounds above - those stop
-    the caches from growing unbounded in the first place, this just gives
-    an extra margin if something else in the process is holding memory."""
-    while True:
-        try:
-            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            rss_mb = rss_kb / 1024  # ru_maxrss is KB on Linux
-            log.info(
-                "memory monitor: ~%.0fMB RSS (limit %dMB) | FILE_CACHE=%d SEARCH_CACHE=%d ARTIST_SEARCH_CACHE=%d",
-                rss_mb, MAX_CACHE_SIZE_MB, len(FILE_CACHE), len(SEARCH_CACHE), len(ARTIST_SEARCH_CACHE),
-            )
-            if rss_mb > MAX_CACHE_SIZE_MB:
-                log.warning(
-                    "memory monitor: RSS ~%.0fMB exceeds MAX_CACHE_SIZE_MB=%dMB - clearing caches early",
-                    rss_mb, MAX_CACHE_SIZE_MB,
-                )
-                FILE_CACHE.clear()
-                SEARCH_CACHE.clear()
-                ARTIST_SEARCH_CACHE.clear()
-        except Exception as e:
-            log.warning("memory monitor tick failed: %s", e)
-        await asyncio.sleep(interval_seconds)
-
-
 # ============================================================
 # ENTRYPOINT
 # ============================================================
@@ -2929,8 +2822,6 @@ async def main():
     BOT_DISPLAY_NAME = me.first_name or me.username or "Bot"
     BOT_USERNAME = me.username or ""
     log.info("Bot started as @%s (%s)", me.username, BOT_DISPLAY_NAME)
-
-    asyncio.create_task(_memory_monitor_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
