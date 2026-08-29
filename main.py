@@ -92,6 +92,10 @@ ADMIN_IDS = {
 }
 # Optional. Never used for TikTok on purpose (see requirements).
 GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
+# Optional, YouTube-specific proxy override (falls back to GENERAL_PROXY,
+# then no proxy, if unset). See _pick_youtube_proxy() below.
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
+YOUTUBE_PROXY_LIST = [p.strip() for p in os.getenv("YOUTUBE_PROXY_LIST", "").split(",") if p.strip()]
 
 # Song search (text search + Shazam recognition) uses SoundCloud first, then
 # VK Music as a fallback for tracks that are copyright-blocked or missing on
@@ -464,6 +468,9 @@ TEXTS = {
         "err_private": "🔐 Bu post yopiq (private) yoki yuklab olish cheklangan.\nUni ilova ichidan ulashib ko'ring yoki ochiq (public) qilishni so'rang.",
         "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
         "err_stale_cookie": "🍪 Instagram cookie eskirgan yoki yaroqsiz, shuning uchun bu postni ololmayapti. Iltimos, brauzerdan yangi cookie eksport qilib qayta yuklang.",
+        "err_youtube_blocked": "⏳ YouTube hozircha vaqtincha ishlamayapti (server bloklangan), keyinroq urinib ko'ring.",
+        "err_pinterest_video": "🎬 Bu Pinterest videosini hozircha yuklab bo'lmadi.",
+        "err_facebook_parse": "❌ Bu Facebook video'sini yuklab bo'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
@@ -552,6 +559,9 @@ TEXTS = {
         "err_private": "🔐 Этот пост закрыт (private) или загрузка ограничена владельцем.\nПопробуйте поделиться им из самого приложения или попросите сделать его публичным.",
         "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
         "err_stale_cookie": "🍪 Cookie Instagram устарели или недействительны, из-за этого пост не загружается. Экспортируйте свежие cookie из браузера и обновите их.",
+        "err_youtube_blocked": "⏳ YouTube сейчас временно не работает (сервер заблокирован), попробуйте позже.",
+        "err_pinterest_video": "🎬 Это видео с Pinterest сейчас не удалось скачать.",
+        "err_facebook_parse": "❌ Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
@@ -640,6 +650,9 @@ TEXTS = {
         "err_private": "🔐 This post is private or downloads are restricted by the owner.\nTry sharing it from within the app itself, or ask for it to be made public.",
         "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
         "err_stale_cookie": "🍪 The Instagram cookies are stale or invalid, so this post can't be fetched. Please export fresh cookies from your browser and update them.",
+        "err_youtube_blocked": "⏳ YouTube is temporarily unavailable (server is blocked), please try again later.",
+        "err_pinterest_video": "🎬 This Pinterest video couldn't be downloaded right now.",
+        "err_facebook_parse": "❌ This Facebook video couldn't be downloaded, it may be private or restricted.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
@@ -1539,18 +1552,54 @@ def _is_bot_check_error(exc: Exception) -> bool:
     ))
 
 
+# Tracks how many times each InnerTube player_client has failed with a
+# bot-check error in this process's lifetime. Clients that keep getting
+# blocked on this particular Railway IP are tried LAST on subsequent
+# requests instead of always eating the first ~2s timeout again - pure
+# optimization, doesn't change which clients are tried, just the order.
+_YT_CLIENT_FAILURE_COUNTS: dict[str, int] = {}
+
+
+def _ordered_player_clients() -> list[list[str]]:
+    return sorted(PLAYER_CLIENT_FALLBACKS, key=lambda pc: _YT_CLIENT_FAILURE_COUNTS.get(pc[0], 0))
+
+
+def _pick_youtube_proxy(attempt_index: int) -> str | None:
+    """Fully optional proxy selection for YouTube specifically. Priority:
+      1. YOUTUBE_PROXY_LIST - comma-separated list, cycled through one per
+         attempt (so each retry/client naturally tries a different exit IP).
+      2. YOUTUBE_PROXY      - a single proxy URL, used for every attempt.
+      3. PROXY_URL          - the bot-wide general proxy (GENERAL_PROXY).
+      4. None               - no proxy, today's default behavior.
+    Never raises - a malformed/unreachable proxy just means yt-dlp's own
+    request fails and the normal client-fallback loop moves on, exactly
+    like any other failed attempt (fail-safe, no special handling needed).
+    """
+    if YOUTUBE_PROXY_LIST:
+        return YOUTUBE_PROXY_LIST[attempt_index % len(YOUTUBE_PROXY_LIST)]
+    if YOUTUBE_PROXY:
+        return YOUTUBE_PROXY
+    return GENERAL_PROXY
+
+
 _cookie_hint_logged = False
 
 
 def _raise_ytdlp_failure(last_exc):
     global _cookie_hint_logged
-    if last_exc is not None and _is_bot_check_error(last_exc) and not _cookie_hint_logged:
-        _cookie_hint_logged = True
-        log.error(
-            "YouTube is blocking all requests from this IP (Railway datacenter). "
-            "Fix: export fresh cookies from your browser and set YOUTUBE_COOKIES "
-            "in Railway environment variables. See instructions below the code."
-        )
+    if last_exc is not None and _is_bot_check_error(last_exc):
+        if not _cookie_hint_logged:
+            _cookie_hint_logged = True
+            log.error(
+                "YOUTUBE_IP_BLOCKED: YouTube is blocking every InnerTube client from this IP "
+                "(Railway datacenter), even with cookies set. Fix: configure YOUTUBE_PROXY or "
+                "YOUTUBE_PROXY_LIST in Railway environment variables to route around the block, "
+                "or wait - Railway IP ranges sometimes get unblocked after a while."
+            )
+        # Tagged so classify_download_error() can show a clean, specific
+        # message instead of a generic one, and so this is easy to grep for
+        # in logs/monitoring separately from any other failure type.
+        raise RuntimeError(f"YOUTUBE_IP_BLOCKED: all InnerTube clients blocked - {last_exc}") from last_exc
     if last_exc is None:
         raise RuntimeError("yt-dlp: all InnerTube client fallbacks exhausted.")
     raise last_exc
@@ -1784,88 +1833,54 @@ def _is_instagram_rate_limit_error(exc: Exception) -> bool:
     )
 
 
-def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | None = None):
-    last_exc = None
-    for attempt, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        # Format selection differs by platform:
-        # - instagram/youtube/tiktok: merge best video+audio for real quality,
-        #   falling back to a single progressive file.
-        # - pinterest: pins can be either a video OR a plain image with no
-        #   video formats at all. "best" alone correctly picks whichever one
-        #   exists instead of forcing a video-only selector that raises
-        #   "No video formats found!" on image pins.
-        # - facebook/snapchat: these extractors frequently only expose a
-        #   single progressive format (no separate audio/video streams to
-        #   merge), so try a plain "best" first and only fall back to a
-        #   video+audio merge if that's genuinely what's available.
-        if platform == "pinterest":
-            ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best[ext=jpg]/best[ext=png]/best"
-        elif platform in ("facebook", "snapchat"):
-            ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-        else:
-            ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        ydl_opts["merge_output_format"] = "mp4"
-        if platform == "instagram" and INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
-            ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
-        elif platform == "facebook" and FACEBOOK_COOKIES_FILE and os.path.exists(FACEBOOK_COOKIES_FILE):
-            ydl_opts["cookiefile"] = FACEBOOK_COOKIES_FILE
-        if use_proxy and GENERAL_PROXY:
-            ydl_opts["proxy"] = GENERAL_PROXY
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if "entries" in info:
-                    info = info["entries"][0]
-                filename = ydl.prepare_filename(info)
-                # merged output is renamed to merge_output_format's extension
-                merged = os.path.splitext(filename)[0] + ".mp4"
-                if os.path.exists(merged):
-                    filename = merged
+def _execute_ytdlp_download(ydl_opts: dict, url: str, outdir: str):
+    """Runs a single yt-dlp download attempt with the given (already fully
+    built) options and returns (filepath, info). Shared by every
+    platform-specific downloader below purely to avoid re-typing this exact
+    extract+rename dance six times - it carries no platform decisions."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
+        filename = ydl.prepare_filename(info)
+        # merged output is renamed to merge_output_format's extension
+        merged = os.path.splitext(filename)[0] + ".mp4"
+        if os.path.exists(merged):
+            filename = merged
+        return filename, info
 
-                ext = os.path.splitext(filename)[1].lower()
-                # Instagram in particular frequently serves a single
-                # progressive stream that never goes through ffmpeg at all
-                # (see docstring above) - normalize it for iOS. The function
-                # itself picks a fast lossless remux when possible, and only
-                # falls back to a real re-encode when the codec genuinely
-                # needs it (and stays within a safe size for that).
-                if platform == "instagram" and ext in (".mp4", ".mov", ".mkv", ".webm"):
-                    try:
-                        norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
-                        os.remove(filename)
-                        filename = norm_path
-                        info["width"], info["height"], info["duration"] = w, h, dur
-                    except Exception as e:
-                        log.warning("iOS normalize failed, sending original file instead: %s", e)
-                return filename, info
+
+def _download_youtube(url: str, outdir: str, use_proxy: bool):
+    """YouTube is the one platform that genuinely needs the InnerTube
+    player_client fallback loop - different clients dodge bot-check
+    differently depending on the datacenter IP. Merges best video+audio.
+    Clients are tried in order of least-recently-blocked first (see
+    _ordered_player_clients), and an optional proxy is layered on top via
+    YOUTUBE_PROXY / YOUTUBE_PROXY_LIST if configured."""
+    last_exc = None
+    for attempt, player_clients in enumerate(_ordered_player_clients()):
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ydl_opts["merge_output_format"] = "mp4"
+        if use_proxy:
+            proxy = _pick_youtube_proxy(attempt)
+            if proxy:
+                ydl_opts["proxy"] = proxy
+        try:
+            result = _execute_ytdlp_download(ydl_opts, url, outdir)
+            # a clean success on a client that previously failed means the
+            # block was likely temporary/IP-specific - let its count decay
+            # so it's not permanently deprioritized.
+            if player_clients[0] in _YT_CLIENT_FAILURE_COUNTS:
+                _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] = max(
+                    0, _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] - 1
+                )
+            return result
         except Exception as e:
             last_exc = e
-            if "no video formats found" in str(e).lower() and platform in ("instagram", "pinterest"):
-                cookies_for_fallback = INSTAGRAM_COOKIES_FILE if platform == "instagram" else None
-                result = _download_image_fallback(url, outdir, cookies_for_fallback)
-                if result:
-                    return result
-                raise
-            if platform == "instagram" and _is_instagram_rate_limit_error(e):
-                global _instagram_cookie_hint_logged
-                if not INSTAGRAM_COOKIES_FILE and not _instagram_cookie_hint_logged:
-                    _instagram_cookie_hint_logged = True
-                    log.error(
-                        "Instagram is rate-limiting/blocking this IP. Fix: export cookies from a "
-                        "logged-in Instagram account (browser extension, same way as YouTube) and "
-                        "set INSTAGRAM_COOKIES in Railway environment variables."
-                    )
-                raise
-            if platform == "facebook" and not FACEBOOK_COOKIES_FILE:
-                log.info(
-                    "Facebook download failed and no FACEBOOK_COOKIES is set - many Facebook "
-                    "videos/reels are login-walled and need cookies from a logged-in account to work."
-                )
-            if "youtube" not in url and "youtu.be" not in url:
-                raise
             if not _is_bot_check_error(e):
                 raise
+            _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] = _YT_CLIENT_FAILURE_COUNTS.get(player_clients[0], 0) + 1
             log.warning(
                 "InnerTube client %s (attempt %d) blocked — trying next client",
                 player_clients, attempt + 1,
@@ -1874,10 +1889,191 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
     _raise_ytdlp_failure(last_exc)
 
 
+def _download_tiktok(url: str, outdir: str):
+    """TikTok: never proxied (its CDN blocks most proxy ranges harder than
+    going direct), single attempt, no cookies needed for public videos."""
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    return _execute_ytdlp_download(ydl_opts, url, outdir)
+
+
+def _download_instagram(url: str, outdir: str, use_proxy: bool):
+    """Instagram: optional login cookies (rate-limit/private-account errors
+    otherwise), a photo-only-post image fallback, and an iOS-compatibility
+    remux/re-encode pass since it frequently serves a single progressive
+    stream that Telegram-iOS can't always play directly."""
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    try:
+        filename, info = _execute_ytdlp_download(ydl_opts, url, outdir)
+    except Exception as e:
+        if "no video formats found" in str(e).lower():
+            result = _download_image_fallback(url, outdir, INSTAGRAM_COOKIES_FILE)
+            if result:
+                return result
+            raise
+        if _is_instagram_rate_limit_error(e):
+            global _instagram_cookie_hint_logged
+            if not INSTAGRAM_COOKIES_FILE and not _instagram_cookie_hint_logged:
+                _instagram_cookie_hint_logged = True
+                log.error(
+                    "Instagram is rate-limiting/blocking this IP. Fix: export cookies from a "
+                    "logged-in Instagram account (browser extension, same way as YouTube) and "
+                    "set INSTAGRAM_COOKIES in Railway environment variables."
+                )
+        raise
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in (".mp4", ".mov", ".mkv", ".webm"):
+        try:
+            norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
+            os.remove(filename)
+            filename = norm_path
+            info["width"], info["height"], info["duration"] = w, h, dur
+        except Exception as e:
+            log.warning("iOS normalize failed, sending original file instead: %s", e)
+    return filename, info
+
+
+def _download_pinterest(url: str, outdir: str, use_proxy: bool):
+    """Pinterest: pins can be a video OR a plain image. A lightweight probe
+    (metadata only, no download) first checks whether this pin actually has
+    a real video stream:
+      - image pin (no video formats) -> og:image scrape fallback is fine,
+        that IS the content.
+      - video pin whose format genuinely can't be fetched -> fallback is
+        NOT used, since silently handing back a single static thumbnail
+        frame when the user asked for a video would be misleading. A clear
+        "couldn't download this video" error is raised instead.
+      - probe itself failed (type unknown) -> same as video pin, err on
+        the side of not silently substituting a static image.
+    """
+    probe_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "http_headers": {"User-Agent": DEFAULT_UA},
+    }
+    if use_proxy and GENERAL_PROXY:
+        probe_opts["proxy"] = GENERAL_PROXY
+    is_video_pin = None  # None = couldn't determine
+    try:
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            probe_info = ydl.extract_info(url, download=False)
+        if "entries" in probe_info:
+            probe_info = probe_info["entries"][0]
+        formats = probe_info.get("formats") or []
+        is_video_pin = any(f.get("vcodec") not in (None, "none") for f in formats)
+    except Exception as e:
+        log.info("PINTEREST_PROBE_FAILED: could not pre-classify pin type for %s (%s)", url, e)
+
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best[ext=jpg]/best[ext=png]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    try:
+        return _execute_ytdlp_download(ydl_opts, url, outdir)
+    except Exception as e:
+        msg = str(e).lower()
+        if "no video formats found" in msg or "requested format is not available" in msg:
+            if is_video_pin is False:
+                # confirmed image pin - the image IS the real content
+                result = _download_image_fallback(url, outdir, None)
+                if result:
+                    return result
+            else:
+                log.warning(
+                    "PINTEREST_VIDEO_FORMAT_NOT_FOUND: %s (pin_type=%s): %s",
+                    url, "video" if is_video_pin else "unknown", e,
+                )
+                raise RuntimeError(f"PINTEREST_VIDEO_UNAVAILABLE: {e}") from e
+        raise
+
+
+def _download_facebook(url: str, outdir: str, use_proxy: bool):
+    """Facebook: most videos/reels are login-walled for logged-out
+    (datacenter IP) requests, so cookies matter a lot more here than for
+    other platforms. Prefers a single progressive format since Facebook's
+    extractor often doesn't expose separate video+audio streams to merge."""
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    if FACEBOOK_COOKIES_FILE and os.path.exists(FACEBOOK_COOKIES_FILE):
+        ydl_opts["cookiefile"] = FACEBOOK_COOKIES_FILE
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    try:
+        return _execute_ytdlp_download(ydl_opts, url, outdir)
+    except Exception as e:
+        if "cannot parse data" in str(e).lower():
+            log.warning("FACEBOOK_PARSE_ERROR: page structure unreadable or login-walled for %s: %s", url, e)
+        elif not FACEBOOK_COOKIES_FILE:
+            log.info(
+                "Facebook download failed and no FACEBOOK_COOKIES is set - many Facebook "
+                "videos/reels are login-walled and need cookies from a logged-in account to work."
+            )
+        raise
+
+
+def _download_snapchat(url: str, outdir: str, use_proxy: bool):
+    """Snapchat: public stories/spotlights only, single progressive format,
+    and a shorter socket timeout since a story that has expired tends to
+    hang rather than fail fast otherwise."""
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    ydl_opts["socket_timeout"] = 20
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    return _execute_ytdlp_download(ydl_opts, url, outdir)
+
+
+def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | None = None):
+    """Router: dispatches to the platform-specific downloader above. Each
+    one is fully self-contained (its own format selector, retry strategy,
+    cookies, and fallbacks) rather than sharing one generic code path, so
+    tuning one platform can never accidentally break another."""
+    if platform == "youtube":
+        return _download_youtube(url, outdir, use_proxy)
+    if platform == "tiktok":
+        return _download_tiktok(url, outdir)
+    if platform == "instagram":
+        return _download_instagram(url, outdir, use_proxy)
+    if platform == "pinterest":
+        return _download_pinterest(url, outdir, use_proxy)
+    if platform == "facebook":
+        return _download_facebook(url, outdir, use_proxy)
+    if platform == "snapchat":
+        return _download_snapchat(url, outdir, use_proxy)
+    # Unknown/unlisted platform - best-effort generic attempt.
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    ydl_opts["merge_output_format"] = "mp4"
+    if use_proxy and GENERAL_PROXY:
+        ydl_opts["proxy"] = GENERAL_PROXY
+    return _execute_ytdlp_download(ydl_opts, url, outdir)
+
+
 def classify_download_error(exc: Exception) -> str:
     """Maps a yt-dlp exception to one of a small set of error codes so the
     UI can show a specific, actionable message instead of a generic one."""
     msg = str(exc).lower()
+    # Tagged errors raised deliberately elsewhere in this file - check
+    # these first since they're unambiguous (see _raise_ytdlp_failure,
+    # _download_pinterest).
+    if "youtube_ip_blocked" in msg:
+        return "ERROR_YOUTUBE_BLOCKED"
+    if "pinterest_video_unavailable" in msg:
+        return "ERROR_PINTEREST_VIDEO"
+    if "cannot parse data" in msg:
+        return "ERROR_FACEBOOK_PARSE"
     # Instagram (and sometimes other cookie-gated platforms) returns an
     # empty/HTML "please log in" response instead of JSON once its cookies
     # go stale, which yt-dlp then fails to parse as JSON. Left unhandled
@@ -2458,9 +2654,23 @@ async def handle_link(message: Message):
             await status.edit_text(t(lang, "tiktok_unavailable"))
         else:
             code = classify_download_error(e)
-            log.info("download failed (%s) for platform=%s: %s", code, platform, e)
+            # Distinct log level per severity, so monitoring can grep/alert
+            # on the ones that actually need attention (e.g. YOUTUBE_BLOCKED)
+            # separately from routine per-user failures.
+            if code == "ERROR_YOUTUBE_BLOCKED":
+                log.error("download failed (%s) for platform=%s: %s", code, platform, e)
+            elif code in ("ERROR_FACEBOOK_PARSE", "ERROR_PINTEREST_VIDEO"):
+                log.warning("download failed (%s) for platform=%s: %s", code, platform, e)
+            else:
+                log.info("download failed (%s) for platform=%s: %s", code, platform, e)
             if code == "ERROR_STALE_COOKIE":
                 await status.edit_text(t(lang, "err_stale_cookie"))
+            elif code == "ERROR_YOUTUBE_BLOCKED":
+                await status.edit_text(t(lang, "err_youtube_blocked"))
+            elif code == "ERROR_PINTEREST_VIDEO":
+                await status.edit_text(t(lang, "err_pinterest_video"))
+            elif code == "ERROR_FACEBOOK_PARSE":
+                await status.edit_text(t(lang, "err_facebook_parse"))
             elif code == "ERROR_PRIVATE":
                 await status.edit_text(t(lang, "err_private"))
             elif code == "ERROR_EXPIRED":
