@@ -1533,6 +1533,9 @@ def _is_bot_check_error(exc: Exception) -> bool:
         "preconditionfailed",# InnerTube 412
         "error code: 152",   # client context rejected
         "video unavailable", # sometimes a masked bot-check
+        "requested format is not available",  # this client's format list was
+                                                # incomplete/empty - another
+                                                # client often has the real one
     ))
 
 
@@ -1588,11 +1591,51 @@ def _build_ydl_opts_base(outdir, player_clients):
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
+def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
+    """Last-resort image grab that doesn't depend on yt-dlp at all: fetch the
+    page HTML directly and pull the og:image meta tag. Used when yt-dlp's
+    extractor can't even build metadata for a post (some Pinterest image
+    pins raise 'No video formats found!' during extraction itself, before
+    any format selection or thumbnail data is available)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        log.warning("og:image scrape failed to fetch page %s: %s", url, e)
+        return None
+
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+    if not m:
+        # some pages put content before property
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
+    if not m:
+        return None
+    img_url = m.group(1).replace("&amp;", "&")
+
+    try:
+        req = urllib.request.Request(img_url, headers={"User-Agent": DEFAULT_UA})
+        filepath = os.path.join(outdir, f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg")
+        with urllib.request.urlopen(req, timeout=30) as resp, open(filepath, "wb") as f:
+            f.write(resp.read())
+    except Exception as e:
+        log.warning("og:image scrape failed to download image %s: %s", img_url, e)
+        return None
+    return filepath, {"id": filename_prefix, "title": filename_prefix, "ext": "jpg"}
+
+
 def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = None):
     """Some posts (Instagram photo-only posts, some Pinterest image pins)
     have no video formats at all, so yt-dlp's normal video download raises
     'No video formats found!'. This grabs the highest-res display image
-    directly instead. Used as a safety net for both platforms."""
+    directly instead. Used as a safety net for both platforms.
+
+    Note: for some Pinterest image pins, yt-dlp's own extractor raises this
+    same "No video formats found!" error DURING metadata extraction itself
+    (even with download=False) - there's no info dict to pull a thumbnail
+    from at all in that case. When that happens this falls through to a
+    plain HTML og:image scrape instead of propagating the error.
+    """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -1601,23 +1644,28 @@ def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = N
     }
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts["cookiefile"] = cookies_file
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if "entries" in info:
-        info = info["entries"][0]
-    thumbs = info.get("thumbnails") or []
-    img_url = None
-    if thumbs:
-        img_url = max(thumbs, key=lambda th: (th.get("width") or 0) * (th.get("height") or 0)).get("url")
-    if not img_url:
-        img_url = info.get("thumbnail") or info.get("url")
-    if not img_url:
-        return None
-    filepath = os.path.join(outdir, f"{info.get('id') or 'photo'}.jpg")
-    req = urllib.request.Request(img_url, headers={"User-Agent": DEFAULT_UA})
-    with urllib.request.urlopen(req, timeout=30) as resp, open(filepath, "wb") as f:
-        f.write(resp.read())
-    return filepath, info
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        thumbs = info.get("thumbnails") or []
+        img_url = None
+        if thumbs:
+            img_url = max(thumbs, key=lambda th: (th.get("width") or 0) * (th.get("height") or 0)).get("url")
+        if not img_url:
+            img_url = info.get("thumbnail") or info.get("url")
+        if img_url:
+            filepath = os.path.join(outdir, f"{info.get('id') or 'photo'}.jpg")
+            req = urllib.request.Request(img_url, headers={"User-Agent": DEFAULT_UA})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(filepath, "wb") as f:
+                f.write(resp.read())
+            return filepath, info
+    except Exception as e:
+        log.info("yt-dlp metadata extraction for image fallback failed (%s), trying og:image scrape instead.", e)
+
+    # yt-dlp couldn't help at all - try a plain HTML scrape as a last resort.
+    return _scrape_og_image(url, outdir, filename_prefix="pin" if "pinterest" in url.lower() or "pin.it" in url.lower() else "image")
 
 
 def _probe_video_stream(input_path: str) -> tuple[str, str]:
@@ -1841,6 +1889,13 @@ def classify_download_error(exc: Exception) -> str:
     if "private" in msg or "login" in msg or "restricted" in msg or "log in" in msg:
         return "ERROR_PRIVATE"
     if "not found" in msg or "404" in msg or "this post" in msg and "deleted" in msg or "deleted" in msg:
+        return "ERROR_DELETED"
+    # After exhausting all InnerTube client fallbacks, "video is unavailable" /
+    # "requested format is not available" almost always means the video is
+    # genuinely gone/region-blocked/age-restricted for this server, not a
+    # bug in the format selector - treat it like a deleted/unavailable post
+    # rather than a generic error.
+    if "video unavailable" in msg or "requested format is not available" in msg or "no video formats found" in msg:
         return "ERROR_DELETED"
     return "ERROR_UNKNOWN"
 
