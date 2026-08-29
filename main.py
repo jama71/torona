@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import io
 import logging
 import os
@@ -147,11 +146,11 @@ def _count_valid_cookie_lines(content: str) -> tuple[int, int]:
 # been removed. If you pasted this file into a public repo, rotate that
 # Google account's password now and revoke its sessions.
 #
-# Cookies are no longer baked into the code. Set one of these env vars
-# instead (Railway → Variables), same as before:
-#   YOUTUBE_COOKIES_B64  -> base64-encoded cookies.txt content
-#   YOUTUBE_COOKIES       -> raw cookies.txt content (Netscape format)
-#   COOKIES_FILE          -> path to an already-mounted cookies.txt file
+# Cookies are no longer baked into the code and there is no base64 layer
+# either. Each platform reads exactly one env var (Railway → Variables),
+# whose value is the raw, plain-text content of a cookies.txt file
+# (Netscape format - what "Get cookies.txt LOCALLY" exports):
+#   YOUTUBE_COOKIES, INSTAGRAM_COOKIES, FACEBOOK_COOKIES
 DEFAULT_YOUTUBE_COOKIES = ""
 
 
@@ -190,143 +189,82 @@ def _setup_youtube_cookies() -> str | None:
     "Sign in to confirm you're not a bot" REGARDLESS of which player_client
     yt-dlp uses. The only reliable fix is real browser cookies.
 
-    Tries each source in order and FALLS THROUGH to the next one if a
-    source is set but turns out invalid/empty/truncated - a broken or
-    stale env var (e.g. left over from earlier troubleshooting) must never
-    block the built-in default from being used:
-      1. YOUTUBE_COOKIES_B64     -> base64-encoded cookies.txt content (env var)
-      2. YOUTUBE_COOKIES         -> raw cookies.txt content (env var, Netscape format)
-      3. COOKIES_FILE            -> path to an already-mounted cookies.txt file (env var)
-
-    There is no hardcoded fallback cookie set anymore (see the security note
-    above DEFAULT_YOUTUBE_COOKIES) - one of the env vars above must be set
-    for cookie-assisted YouTube downloads to work.
+    Reads exactly ONE env var: YOUTUBE_COOKIES. Its value is the raw,
+    plain-text content of a cookies.txt file (Netscape format) - e.g. what
+    the "Get cookies.txt LOCALLY" browser extension exports. Not base64.
     """
     logger = logging.getLogger("bot")
-    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
-    path_env = os.getenv("COOKIES_FILE", "").strip()
 
-    if b64:
-        cleaned = "".join(b64.split())
-        padding = len(cleaned) % 4
-        if padding:
-            cleaned += "=" * (4 - padding)
-        try:
-            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            result = _try_load_cookie_candidate("YOUTUBE_COOKIES_B64", decoded, logger)
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(
-                "YOUTUBE_COOKIES_B64 could not be decoded (%s) - trying the next available source.",
-                e,
-            )
+    if not raw:
+        logger.warning(
+            "No usable YouTube cookies found (YOUTUBE_COOKIES env var is unset) - relying on "
+            "player_client fallback only, which YouTube may still bot-check."
+        )
+        return None
 
-    if raw:
-        result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
-        if result:
-            return result
-
-    if path_env and os.path.exists(path_env):
-        logger.info("YouTube cookies loaded from COOKIES_FILE (%s).", path_env)
-        return path_env
-
-    logger.warning(
-        "No usable YouTube cookies found (YOUTUBE_COOKIES_B64 / YOUTUBE_COOKIES / COOKIES_FILE "
-        "are all unset) - relying on player_client fallback only, which YouTube may still bot-check."
-    )
-    return None
+    result = _try_load_cookie_candidate("YOUTUBE_COOKIES", raw, logger)
+    if not result:
+        logger.warning(
+            "YOUTUBE_COOKIES is set but doesn't look like a valid cookies.txt - re-export it with "
+            "'Get cookies.txt LOCALLY' while logged into youtube.com and paste the full file content."
+        )
+    return result
 
 
 def _setup_instagram_cookies() -> str | None:
     """
     Instagram rate-limits/blocks datacenter IPs too ("Please wait a few
     minutes" / login-wall errors), same story as YouTube. Real browser
-    cookies from a logged-in Instagram account fix this. Unlike YouTube
-    there's no hardcoded default here - this is fully optional, set only
-    if the errors show up:
-      1. INSTAGRAM_COOKIES_B64  -> base64-encoded cookies.txt content (env var)
-      2. INSTAGRAM_COOKIES      -> raw cookies.txt content (env var, Netscape format)
-      3. INSTAGRAM_COOKIES_FILE -> path to an already-mounted cookies.txt file (env var)
+    cookies from a logged-in Instagram account fix this. Fully optional,
+    set only if the errors show up.
+
+    Reads exactly ONE env var: INSTAGRAM_COOKIES. Same plain-text
+    cookies.txt format as YOUTUBE_COOKIES above, not base64.
     """
     logger = logging.getLogger("bot")
-    b64 = os.getenv("INSTAGRAM_COOKIES_B64", "").strip()
     raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
-    path_env = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip()
 
-    if b64:
-        cleaned = "".join(b64.split())
-        padding = len(cleaned) % 4
-        if padding:
-            cleaned += "=" * (4 - padding)
-        try:
-            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            result = _try_load_cookie_candidate(
-                "INSTAGRAM_COOKIES_B64", decoded, logger, filename="instagram_cookies.txt", label="Instagram"
-            )
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(
-                "INSTAGRAM_COOKIES_B64 could not be decoded (%s) - trying the next available source.", e
-            )
+    if not raw:
+        logger.info("No Instagram cookies configured (INSTAGRAM_COOKIES unset) - using defaults "
+                     "unless rate-limit errors show up.")
+        return None
 
-    if raw:
-        result = _try_load_cookie_candidate(
-            "INSTAGRAM_COOKIES", raw, logger, filename="instagram_cookies.txt", label="Instagram"
+    result = _try_load_cookie_candidate(
+        "INSTAGRAM_COOKIES", raw, logger, filename="instagram_cookies.txt", label="Instagram"
+    )
+    if not result:
+        logger.warning(
+            "INSTAGRAM_COOKIES is set but doesn't look like a valid cookies.txt - re-export it with "
+            "'Get cookies.txt LOCALLY' while logged into instagram.com and paste the full file content."
         )
-        if result:
-            return result
-
-    if path_env and os.path.exists(path_env):
-        logger.info("Instagram cookies loaded from INSTAGRAM_COOKIES_FILE (%s).", path_env)
-        return path_env
-
-    logger.info("No Instagram cookies configured - using player defaults (fine unless rate-limit errors show up).")
-    return None
+    return result
 
 
 def _setup_facebook_cookies() -> str | None:
     """Facebook login-walls most videos/reels for logged-out (datacenter IP)
-    requests. Optional, same pattern as Instagram/YouTube:
-      1. FACEBOOK_COOKIES_B64  -> base64-encoded cookies.txt content (env var)
-      2. FACEBOOK_COOKIES      -> raw cookies.txt content (env var, Netscape format)
-      3. FACEBOOK_COOKIES_FILE -> path to an already-mounted cookies.txt file (env var)
+    requests. Optional, same pattern as above.
+
+    Reads exactly ONE env var: FACEBOOK_COOKIES. Plain-text cookies.txt
+    content, not base64.
     """
     logger = logging.getLogger("bot")
-    b64 = os.getenv("FACEBOOK_COOKIES_B64", "").strip()
     raw = os.getenv("FACEBOOK_COOKIES", "").strip()
-    path_env = os.getenv("FACEBOOK_COOKIES_FILE", "").strip()
 
-    if b64:
-        cleaned = "".join(b64.split())
-        padding = len(cleaned) % 4
-        if padding:
-            cleaned += "=" * (4 - padding)
-        try:
-            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
-            result = _try_load_cookie_candidate(
-                "FACEBOOK_COOKIES_B64", decoded, logger, filename="facebook_cookies.txt", label="Facebook"
-            )
-            if result:
-                return result
-        except Exception as e:
-            logger.warning("FACEBOOK_COOKIES_B64 could not be decoded (%s) - trying the next available source.", e)
+    if not raw:
+        logger.info("No Facebook cookies configured (FACEBOOK_COOKIES unset) - many Facebook "
+                     "videos are login-walled and will fail without them.")
+        return None
 
-    if raw:
-        result = _try_load_cookie_candidate(
-            "FACEBOOK_COOKIES", raw, logger, filename="facebook_cookies.txt", label="Facebook"
+    result = _try_load_cookie_candidate(
+        "FACEBOOK_COOKIES", raw, logger, filename="facebook_cookies.txt", label="Facebook"
+    )
+    if not result:
+        logger.warning(
+            "FACEBOOK_COOKIES is set but doesn't look like a valid cookies.txt - re-export it with "
+            "'Get cookies.txt LOCALLY' while logged into facebook.com and paste the full file content."
         )
-        if result:
-            return result
-
-    if path_env and os.path.exists(path_env):
-        logger.info("Facebook cookies loaded from FACEBOOK_COOKIES_FILE (%s).", path_env)
-        return path_env
-
-    logger.info("No Facebook cookies configured - many Facebook videos are login-walled and will fail without them.")
-    return None
+    return result
 
 
 # Path to a cookies.txt (Netscape format) that helps yt-dlp bypass YouTube's
@@ -366,7 +304,7 @@ def _check_cookies_expiry(path):
         log.warning(
             "⚠️  %d YouTube cookie(s) MUDDATI O\'TGAN! "
             "Bot 'Sign in to confirm' xatosini beradi. "
-            "Yangi cookies eksport qilib YOUTUBE_COOKIES_B64 ga qo\'ying.",
+            "Yangi cookies eksport qilib YOUTUBE_COOKIES ga qo\'ying.",
             expired,
         )
     else:
@@ -510,6 +448,7 @@ TEXTS = {
         "link_not_found": "❌ Bu post topilmadi — o'chirilgan, yopiq (private) yoki linkda xatolik bo'lishi mumkin.",
         "err_private": "🔐 Bu post yopiq (private) yoki yuklab olish cheklangan.\nUni ilova ichidan ulashib ko'ring yoki ochiq (public) qilishni so'rang.",
         "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
+        "err_stale_cookie": "🍪 Instagram cookie eskirgan yoki yaroqsiz, shuning uchun bu postni ololmayapti. Iltimos, brauzerdan yangi cookie eksport qilib qayta yuklang.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
         "no_link": "❗️ Iltimos, media havolasini yuboring.",
@@ -597,6 +536,7 @@ TEXTS = {
         "link_not_found": "❌ Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.",
         "err_private": "🔐 Этот пост закрыт (private) или загрузка ограничена владельцем.\nПопробуйте поделиться им из самого приложения или попросите сделать его публичным.",
         "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
+        "err_stale_cookie": "🍪 Cookie Instagram устарели или недействительны, из-за этого пост не загружается. Экспортируйте свежие cookie из браузера и обновите их.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
         "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
@@ -684,6 +624,7 @@ TEXTS = {
         "link_not_found": "❌ Post not found — it may have been deleted, made private, or the link is wrong.",
         "err_private": "🔐 This post is private or downloads are restricted by the owner.\nTry sharing it from within the app itself, or ask for it to be made public.",
         "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
+        "err_stale_cookie": "🍪 The Instagram cookies are stale or invalid, so this post can't be fetched. Please export fresh cookies from your browser and update them.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
         "no_link": "❗️ Please send a media link.",
@@ -1589,7 +1530,7 @@ def _raise_ytdlp_failure(last_exc):
         _cookie_hint_logged = True
         log.error(
             "YouTube is blocking all requests from this IP (Railway datacenter). "
-            "Fix: export fresh cookies from your browser and set YOUTUBE_COOKIES_B64 "
+            "Fix: export fresh cookies from your browser and set YOUTUBE_COOKIES "
             "in Railway environment variables. See instructions below the code."
         )
     if last_exc is None:
@@ -1796,7 +1737,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
         #   merge), so try a plain "best" first and only fall back to a
         #   video+audio merge if that's genuinely what's available.
         if platform == "pinterest":
-            ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best"
+            ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best[ext=jpg]/best[ext=png]/best"
         elif platform in ("facebook", "snapchat"):
             ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
         else:
@@ -1850,12 +1791,12 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
                     log.error(
                         "Instagram is rate-limiting/blocking this IP. Fix: export cookies from a "
                         "logged-in Instagram account (browser extension, same way as YouTube) and "
-                        "set INSTAGRAM_COOKIES_B64 in Railway environment variables."
+                        "set INSTAGRAM_COOKIES in Railway environment variables."
                     )
                 raise
             if platform == "facebook" and not FACEBOOK_COOKIES_FILE:
                 log.info(
-                    "Facebook download failed and no FACEBOOK_COOKIES_B64 is set - many Facebook "
+                    "Facebook download failed and no FACEBOOK_COOKIES is set - many Facebook "
                     "videos/reels are login-walled and need cookies from a logged-in account to work."
                 )
             if "youtube" not in url and "youtu.be" not in url:
@@ -1874,6 +1815,12 @@ def classify_download_error(exc: Exception) -> str:
     """Maps a yt-dlp exception to one of a small set of error codes so the
     UI can show a specific, actionable message instead of a generic one."""
     msg = str(exc).lower()
+    # Instagram (and sometimes other cookie-gated platforms) returns an
+    # empty/HTML "please log in" response instead of JSON once its cookies
+    # go stale, which yt-dlp then fails to parse as JSON. Left unhandled
+    # this surfaces as a raw JSONDecodeError instead of a useful message.
+    if "expecting value" in msg or "jsondecodeerror" in msg or "failed to parse json" in msg:
+        return "ERROR_STALE_COOKIE"
     if "expired" in msg or "no longer available" in msg or "24 hours" in msg:
         return "ERROR_EXPIRED"
     if "private" in msg or "login" in msg or "restricted" in msg or "log in" in msg:
@@ -2442,7 +2389,9 @@ async def handle_link(message: Message):
         else:
             code = classify_download_error(e)
             log.info("download failed (%s) for platform=%s: %s", code, platform, e)
-            if code == "ERROR_PRIVATE":
+            if code == "ERROR_STALE_COOKIE":
+                await status.edit_text(t(lang, "err_stale_cookie"))
+            elif code == "ERROR_PRIVATE":
                 await status.edit_text(t(lang, "err_private"))
             elif code == "ERROR_EXPIRED":
                 await status.edit_text(t(lang, "err_expired"))
