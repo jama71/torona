@@ -155,6 +155,21 @@ DEFAULT_YOUTUBE_COOKIES = ""
 
 
 def _write_cookies_file(content: str, filename: str = "yt_cookies.txt") -> str:
+    # yt-dlp's cookiejar loader only checks the *very first line* of the
+    # file for the literal "# Netscape HTTP Cookie File" (or "# HTTP Cookie
+    # File") header - if that line is missing or malformed it rejects the
+    # whole file with "does not look like a Netscape format cookies file",
+    # even if every actual cookie line below is perfectly fine. This has
+    # been observed to happen when a value is pasted into some env-var UIs
+    # (e.g. Railway's) that strip/mangle lines starting with "#" - the
+    # header comment silently disappears in transit. So: always force the
+    # canonical header onto the first line of the file we write, regardless
+    # of whether the incoming content already had one (if it did, this
+    # replaces it with a known-good copy; if it didn't, this adds it).
+    lines = content.splitlines()
+    if lines and lines[0].strip().lstrip("#").strip().lower().startswith(("netscape http cookie file", "http cookie file")):
+        lines = lines[1:]
+    content = "# Netscape HTTP Cookie File\n" + "\n".join(lines) + ("\n" if lines else "")
     cookies_path = os.path.join(tempfile.gettempdir(), filename)
     with open(cookies_path, "w", encoding="utf-8") as f:
         f.write(content)
