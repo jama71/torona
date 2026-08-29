@@ -1,6 +1,6 @@
 aiogram>=3.6.0
 shazamio
-yt-dlp>=2026.7.4
+yt-dlp>=2026.8.1
 pydub
 requests
 aiohttp
