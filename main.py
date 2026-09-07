@@ -17,6 +17,7 @@ from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -342,7 +343,59 @@ DEFAULT_UA = (
 )
 
 DOWNLOAD_ROOT = tempfile.gettempdir()
-CACHE_TTL_SECONDS = 300  # free-tier disk friendly: auto-clean unused files after 5 min
+CACHE_TTL_SECONDS = 60  # free-tier disk friendly: auto-clean unused files after 1 min
+                        # (was 5 min - shortened since Railway's 1GB /tmp fills up fast
+                        # under concurrent downloads)
+
+# The iOS-normalize pass only pays for a REAL re-encode when Instagram's
+# codec isn't already iOS-safe (otherwise it's a near-free remux, see
+# _ffmpeg_normalize_for_ios), but that real re-encode is still the single
+# most CPU/memory-hungry thing this bot does (~15-20s, 200-400MB). Set
+# SKIP_IOS_NORMALIZE=true in Railway env vars to disable it completely if
+# the free-tier plan is still under memory pressure - Instagram videos will
+# just be sent as-is (Android/most players handle them fine either way).
+SKIP_IOS_NORMALIZE = os.getenv("SKIP_IOS_NORMALIZE", "false").strip().lower() in ("1", "true", "yes")
+
+# Hard cap on how many entries each in-memory cache dict can hold, independent
+# of TTL - bounds worst-case memory even if a lot of distinct queries/files
+# come in faster than their TTL would naturally clear them. Oldest entry is
+# evicted first (dicts preserve insertion order in Python 3.7+).
+FILE_CACHE_MAX_SIZE = 20
+SEARCH_CACHE_MAX_SIZE = 50
+ARTIST_SEARCH_CACHE_MAX_SIZE = 30
+
+
+def _cache_put(cache: dict, key, value, max_size: int):
+    """Insert into a bounded FIFO cache dict, evicting the oldest entry(ies)
+    first if this would push it over max_size."""
+    cache[key] = value
+    while len(cache) > max_size:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+
+
+# Memory watermark: reject new heavy jobs (downloads/re-encodes) while the
+# process is already using a lot of RAM, instead of letting Railway's OOM
+# killer take down the whole bot mid-request. Purely a safety valve - on a
+# healthy 1GB plan this basically never triggers.
+MEMORY_WATERMARK_MB = int(os.getenv("MEMORY_WATERMARK_MB", "750"))
+
+
+def _current_rss_mb() -> float | None:
+    """Current process resident memory in MB, read straight from
+    /proc/self/status (Linux-only, which Railway containers always are) -
+    no extra dependency like psutil needed. Returns None if unavailable
+    (e.g. running locally on a non-Linux OS) so callers can just skip the
+    check rather than crash."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return kb / 1024
+    except Exception:
+        return None
+    return None
 
 URL_RE = re.compile(r"(https?://\S+)")
 PLATFORM_PATTERNS = {
@@ -415,6 +468,19 @@ class HeavyJobSlot:
         self.busy_text_key = busy_text_key
 
     async def __aenter__(self):
+        # Reject new heavy work outright while the process is already under
+        # memory pressure, rather than letting it pile on top and risk an
+        # OOM kill of the whole bot. Checked before even queueing, since a
+        # free semaphore slot doesn't mean memory is actually free (other
+        # things - caches, a job that just finished - can still be holding it).
+        rss = _current_rss_mb()
+        if rss is not None and rss > MEMORY_WATERMARK_MB:
+            log.warning(
+                "MEMORY_WATERMARK_EXCEEDED: RSS=%.0fMB > %dMB limit, rejecting new heavy job",
+                rss, MEMORY_WATERMARK_MB,
+            )
+            raise RuntimeError(f"MEMORY_WATERMARK_EXCEEDED: server is using {rss:.0f}MB RAM right now")
+
         was_queued = HEAVY_JOB_SEMAPHORE.locked()
         if was_queued:
             try:
@@ -469,6 +535,7 @@ TEXTS = {
         "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
         "err_stale_cookie": "🍪 Instagram cookie eskirgan yoki yaroqsiz, shuning uchun bu postni ololmayapti. Iltimos, brauzerdan yangi cookie eksport qilib qayta yuklang.",
         "err_youtube_blocked": "⏳ YouTube hozircha vaqtincha ishlamayapti (server bloklangan), keyinroq urinib ko'ring.",
+        "err_busy": "⏳ Bot hozir band (band xotira), birozdan keyin qayta urinib ko'ring.",
         "err_pinterest_video": "🎬 Bu Pinterest videosini hozircha yuklab bo'lmadi.",
         "err_facebook_parse": "❌ Bu Facebook video'sini yuklab bo'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
@@ -560,6 +627,7 @@ TEXTS = {
         "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
         "err_stale_cookie": "🍪 Cookie Instagram устарели или недействительны, из-за этого пост не загружается. Экспортируйте свежие cookie из браузера и обновите их.",
         "err_youtube_blocked": "⏳ YouTube сейчас временно не работает (сервер заблокирован), попробуйте позже.",
+        "err_busy": "⏳ Бот сейчас перегружен, попробуйте ещё раз через некоторое время.",
         "err_pinterest_video": "🎬 Это видео с Pinterest сейчас не удалось скачать.",
         "err_facebook_parse": "❌ Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
@@ -651,6 +719,7 @@ TEXTS = {
         "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
         "err_stale_cookie": "🍪 The Instagram cookies are stale or invalid, so this post can't be fetched. Please export fresh cookies from your browser and update them.",
         "err_youtube_blocked": "⏳ YouTube is temporarily unavailable (server is blocked), please try again later.",
+        "err_busy": "⏳ The bot is under heavy load right now, please try again in a bit.",
         "err_pinterest_video": "🎬 This Pinterest video couldn't be downloaded right now.",
         "err_facebook_parse": "❌ This Facebook video couldn't be downloaded, it may be private or restricted.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
@@ -727,7 +796,12 @@ def t(lang: str, key: str, **kwargs) -> str:
 # ============================================================
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=5,  # fail fast instead of hanging a whole request if the DB is slow/unreachable
+    )
     async with pool.acquire() as conn:
         await conn.execute(
             """CREATE TABLE IF NOT EXISTS users (
@@ -918,6 +992,24 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
+
+
+@dp.errors()
+async def handle_dispatcher_errors(event) -> bool:
+    """Global safety net for the whole dispatcher. Telegram's 429
+    ("Too Many Requests") comes back as TelegramRetryAfter with the exact
+    number of seconds it wants us to wait - respecting that (instead of
+    hammering the API again immediately) is what keeps a burst of activity
+    from getting the whole bot rate-limited/blocked. Anything else gets
+    logged instead of silently swallowed, so a bug in one handler can't take
+    the whole polling loop down without at least leaving a trace."""
+    exc = getattr(event, "exception", None)
+    if isinstance(exc, TelegramRetryAfter):
+        log.warning("TELEGRAM_RATE_LIMITED: sleeping %.1fs as instructed by Telegram", exc.retry_after)
+        await asyncio.sleep(exc.retry_after)
+        return True
+    log.exception("Unhandled exception while processing an update: %s", exc)
+    return True
 
 
 class EnsureUserRegisteredMiddleware(BaseMiddleware):
@@ -1930,6 +2022,8 @@ def _download_instagram(url: str, outdir: str, use_proxy: bool):
         raise
 
     ext = os.path.splitext(filename)[1].lower()
+    if SKIP_IOS_NORMALIZE:
+        return filename, info
     if ext in (".mp4", ".mov", ".mkv", ".webm"):
         try:
             norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
@@ -2065,6 +2159,8 @@ def classify_download_error(exc: Exception) -> str:
     """Maps a yt-dlp exception to one of a small set of error codes so the
     UI can show a specific, actionable message instead of a generic one."""
     msg = str(exc).lower()
+    if "memory_watermark_exceeded" in msg:
+        return "ERROR_BUSY"
     # Tagged errors raised deliberately elsewhere in this file - check
     # these first since they're unambiguous (see _raise_ytdlp_failure,
     # _download_pinterest).
@@ -2665,6 +2761,8 @@ async def handle_link(message: Message):
                 log.info("download failed (%s) for platform=%s: %s", code, platform, e)
             if code == "ERROR_STALE_COOKIE":
                 await status.edit_text(t(lang, "err_stale_cookie"))
+            elif code == "ERROR_BUSY":
+                await status.edit_text(t(lang, "err_busy"))
             elif code == "ERROR_YOUTUBE_BLOCKED":
                 await status.edit_text(t(lang, "err_youtube_blocked"))
             elif code == "ERROR_PINTEREST_VIDEO":
@@ -2704,7 +2802,7 @@ async def handle_link(message: Message):
                 height=info.get("height") or None,
                 duration=info.get("duration") or None,
             )
-        FILE_CACHE[token] = {"filepath": filepath, "source_url": url}
+        _cache_put(FILE_CACHE, token, {"filepath": filepath, "source_url": url}, FILE_CACHE_MAX_SIZE)
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
         log.warning("send failed: %s", e)
@@ -2823,7 +2921,7 @@ async def handle_text_search(message: Message):
         return
 
     token = uuid.uuid4().hex[:12]
-    SEARCH_CACHE[token] = {"query": query, "results": results, "page": 0}
+    _cache_put(SEARCH_CACHE, token, {"query": query, "results": results, "page": 0}, SEARCH_CACHE_MAX_SIZE)
     asyncio.create_task(_expire_search_cache(token, delay=SEARCH_CACHE_TTL_SECONDS))
 
     text, kb = render_search_page(lang, token)
@@ -2954,7 +3052,7 @@ async def cb_recognize_music(call: CallbackQuery):
         # edit the video's own caption/keyboard to show the recognized song
         # (see reference screenshot) before downloading the mp3 itself
         artist_token = uuid.uuid4().hex[:10]
-        ARTIST_SEARCH_CACHE[artist_token] = song["artist"]
+        _cache_put(ARTIST_SEARCH_CACHE, artist_token, song["artist"], ARTIST_SEARCH_CACHE_MAX_SIZE)
         asyncio.create_task(_expire_artist_cache(artist_token, delay=SEARCH_CACHE_TTL_SECONDS))
         try:
             await call.message.edit_caption(
@@ -3028,7 +3126,7 @@ async def cb_artist_search(call: CallbackQuery):
         return
 
     search_token = uuid.uuid4().hex[:12]
-    SEARCH_CACHE[search_token] = {"query": artist, "results": results, "page": 0}
+    _cache_put(SEARCH_CACHE, search_token, {"query": artist, "results": results, "page": 0}, SEARCH_CACHE_MAX_SIZE)
     asyncio.create_task(_expire_search_cache(search_token, delay=SEARCH_CACHE_TTL_SECONDS))
     text, kb = render_search_page(lang, search_token)
     await status.edit_text(text, reply_markup=kb)
@@ -3037,6 +3135,61 @@ async def cb_artist_search(call: CallbackQuery):
 # ============================================================
 # ENTRYPOINT
 # ============================================================
+TMP_DISK_CLEANUP_INTERVAL = int(os.getenv("TMP_DISK_CLEANUP_INTERVAL", "30"))
+STALE_TEMP_DIR_MAX_AGE_SECONDS = 600  # 10 minutes
+
+
+def _sweep_stale_temp_dirs():
+    """Best-effort removal of leftover per-download temp directories older
+    than STALE_TEMP_DIR_MAX_AGE_SECONDS. Normal downloads clean up their own
+    tempdir when they finish (success or failure via shutil.rmtree in the
+    handler), so anything still here this old is orphaned - e.g. left behind
+    by a crash mid-download - and just wastes the 1GB /tmp disk until
+    something removes it."""
+    now = time.time()
+    try:
+        for name in os.listdir(DOWNLOAD_ROOT):
+            path = os.path.join(DOWNLOAD_ROOT, name)
+            try:
+                if not os.path.isdir(path):
+                    continue
+                if not (name.startswith("tmp") or "torona" in name.lower()):
+                    continue
+                age = now - os.path.getmtime(path)
+                if age > STALE_TEMP_DIR_MAX_AGE_SECONDS:
+                    shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning("stale temp dir sweep failed: %s", e)
+
+
+async def _periodic_disk_cleanup_task():
+    """Runs _sweep_stale_temp_dirs() every TMP_DISK_CLEANUP_INTERVAL seconds
+    for the life of the process, in a thread so the (blocking) os.listdir/
+    stat/rmtree calls never stall the event loop."""
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(TMP_DISK_CLEANUP_INTERVAL)
+        try:
+            await loop.run_in_executor(None, _sweep_stale_temp_dirs)
+        except Exception as e:
+            log.warning("periodic disk cleanup task error: %s", e)
+
+
+async def _periodic_db_health_check_task():
+    """Simple 'SELECT 1' every 30s so a dead/unreachable database shows up
+    as a clear, distinctly-tagged log line instead of surfacing later as a
+    confusing pool-exhaustion error deep inside some unrelated handler."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+        except Exception as e:
+            log.error("DB_HEALTH_CHECK_FAILED: %s", e)
+
+
 async def main():
     global BOT_DISPLAY_NAME, BOT_USERNAME
 
@@ -3046,6 +3199,12 @@ async def main():
         raise RuntimeError("DATABASE_URL environment variable is not set!")
 
     await init_db()
+
+    # Clean up anything a previous crashed/killed run left behind before we
+    # start accepting new downloads, then keep sweeping periodically.
+    await asyncio.get_running_loop().run_in_executor(None, _sweep_stale_temp_dirs)
+    asyncio.create_task(_periodic_disk_cleanup_task())
+    asyncio.create_task(_periodic_db_health_check_task())
 
     me = await bot.get_me()
     BOT_DISPLAY_NAME = me.first_name or me.username or "Bot"
