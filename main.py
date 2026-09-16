@@ -17,7 +17,7 @@ from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart, Command
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -584,10 +584,17 @@ TEXTS = {
             "📎 Kanal/gurux qo'shish uchun:\n\n"
             "1) Botni o'sha kanal/guruhga <b>administrator</b> qilib qo'ying.\n"
             "2) Shu yerga o'sha kanal/guruhdagi istalgan xabarni forward qiling, "
-            "yoki uning @username'ini, yoki chat_id sini yuboring."
+            "yoki uning @username'ini, yoki chat_id sini yuboring.\n\n"
+            "⚠️ Yopiq (private) kanal bo'lsa, botga <b>'Invite Users via Link'</b> huquqini ham bering.\n"
+            "ℹ️ Taklif havolasi (https://t.me/+...) yuborish ishlamaydi — forward qiling."
         ),
         "channel_added": "✅ \"{title}\" majburiy obunalar ro'yxatiga qo'shildi.",
         "channel_add_fail_not_admin": "❌ Botni avval o'sha kanal/guruhga administrator qiling, keyin qaytadan urinib ko'ring.",
+        "channel_add_fail_link": "❌ Kanal uchun taklif havolasi (invite link) yaratib bo'lmadi, shuning uchun kanal saqlanmadi. Botning o'sha kanalda 'Invite Users via Link' huquqi borligini tekshirib, qaytadan urinib ko'ring.",
+        "channel_add_fail_not_found": "❌ Bunday kanal/guruh topilmadi. Username'ni tekshiring (@kanal), yoki eng ishonchlisi — o'sha kanaldan istalgan xabarni menga forward qiling.",
+        "channel_add_fail_invite_link": "❌ Taklif havolasi (https://t.me/+...) orqali kanalni qo'shib bo'lmaydi — Telegram bunga ruxsat bermaydi.\n\nBuning o'rniga: o'sha kanaldan istalgan xabarni menga <b>forward</b> qiling, yoki ochiq kanal bo'lsa @username yuboring.",
+        "channel_add_fail_wrong_type": "❌ Faqat kanal yoki guruhni majburiy obuna sifatida qo'shish mumkin.",
+        "channel_add_fail_no_invite_perm": "❌ Botda bu kanalda taklif havolasi yaratish huquqi yo'q.\n\nKanal sozlamalari → Administratorlar → Bot → <b>'Invite Users via Link'</b> huquqini yoqing va qayta urinib ko'ring.",
         "channel_add_fail": "❌ Kanal/guruhni aniqlab bo'lmadi. Forward yoki @username/ID yuboring.",
         "channel_list_empty": "📭 Hozircha majburiy obunalar yo'q.",
         "channel_list_title": "📋 Majburiy obunalar ro'yxati:",
@@ -679,6 +686,11 @@ TEXTS = {
         ),
         "channel_added": "✅ \"{title}\" добавлен в обязательные подписки.",
         "channel_add_fail_not_admin": "❌ Сначала сделайте бота администратором канала/группы, затем попробуйте снова.",
+        "channel_add_fail_link": "❌ Не удалось создать пригласительную ссылку для канала, поэтому канал не сохранён. Проверьте, что у бота есть право «Invite Users via Link» в этом канале, и попробуйте снова.",
+        "channel_add_fail_not_found": "❌ Такой канал/группа не найдены. Проверьте username (@канал) или, что надёжнее, перешлите мне любое сообщение из этого канала.",
+        "channel_add_fail_invite_link": "❌ Добавить канал по пригласительной ссылке (https://t.me/+...) нельзя — Telegram этого не поддерживает.\n\nВместо этого: <b>перешлите</b> мне любое сообщение из канала, либо отправьте @username, если канал публичный.",
+        "channel_add_fail_wrong_type": "❌ В качестве обязательной подписки можно добавить только канал или группу.",
+        "channel_add_fail_no_invite_perm": "❌ У бота нет права создавать пригласительные ссылки в этом канале.\n\nНастройки канала → Администраторы → Бот → включите <b>«Invite Users via Link»</b> и попробуйте снова.",
         "channel_add_fail": "❌ Не удалось определить канал/группу. Перешлите сообщение или отправьте @username/ID.",
         "channel_list_empty": "📭 Обязательных подписок пока нет.",
         "channel_list_title": "📋 Список обязательных подписок:",
@@ -770,6 +782,11 @@ TEXTS = {
         ),
         "channel_added": "✅ \"{title}\" added to mandatory subscriptions.",
         "channel_add_fail_not_admin": "❌ Make the bot an administrator of that channel/group first, then try again.",
+        "channel_add_fail_link": "❌ Couldn't create an invite link for the channel, so it wasn't saved. Check the bot has the \"Invite Users via Link\" permission there, then try again.",
+        "channel_add_fail_not_found": "❌ No such channel/group found. Check the username (@channel), or more reliably, forward me any message from that channel.",
+        "channel_add_fail_invite_link": "❌ A channel can't be added via an invite link (https://t.me/+...) — Telegram doesn't allow it.\n\nInstead: <b>forward</b> me any message from the channel, or send @username if it's public.",
+        "channel_add_fail_wrong_type": "❌ Only a channel or a group can be added as a mandatory subscription.",
+        "channel_add_fail_no_invite_perm": "❌ The bot doesn't have permission to create invite links in that channel.\n\nChannel settings → Administrators → the bot → enable <b>\"Invite Users via Link\"</b>, then try again.",
         "channel_add_fail": "❌ Couldn't detect the channel/group. Forward a message, or send its @username/ID.",
         "channel_list_empty": "📭 No mandatory subscriptions yet.",
         "channel_list_title": "📋 Mandatory subscriptions:",
@@ -913,6 +930,21 @@ async def has_join_request(chat_id: int, user_id: int) -> bool:
         return row is not None
 
 
+async def clear_join_request(chat_id: int, user_id: int):
+    """Drop a logged join request.
+
+    Needed because a pending request counts as satisfying the mandatory
+    subscription. If the user later leaves the channel (or an admin removes
+    them), the stale row would otherwise keep them marked as subscribed
+    forever, letting them use the bot without being in the channel at all.
+    Clearing it means they have to request again.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
+        )
+
+
 async def get_channel_by_chat_id(chat_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM mandatory_channels WHERE chat_id=$1", chat_id)
@@ -992,6 +1024,29 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
+
+
+async def _safe_cb_answer(call: CallbackQuery, *args, **kwargs) -> None:
+    """call.answer() that never raises.
+
+    A Telegram callback query is only answerable for a short window (~15s).
+    Any handler that does real work first - a DB read, a message edit, or
+    worst of all waiting on a HeavyJobSlot queue - can easily blow past that,
+    and then answer() raises "query is too old and response timeout expired
+    or query ID is invalid". That exception used to propagate all the way up
+    and get logged as an unhandled error, even though it is completely
+    harmless: the user already got their result, only the little spinner
+    acknowledgement was late.
+
+    Swallowing it here keeps the logs honest about real failures.
+    """
+    try:
+        await call.answer(*args, **kwargs)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e).lower() or "query id is invalid" in str(e).lower():
+            log.debug("callback answer arrived too late (harmless): %s", e)
+            return
+        raise
 
 
 @dp.errors()
@@ -1173,7 +1228,7 @@ async def cb_lang(call: CallbackQuery):
         t(lang, "send_link"),
         reply_markup=user_reply_kb(lang, is_admin(call.from_user.id)),
     )
-    await call.answer()
+    await _safe_cb_answer(call)
 
 
 # ============================================================
@@ -1412,17 +1467,98 @@ async def btn_add_channel_ask(message: Message, state: FSMContext):
 
 
 async def _resolve_chat(message: Message):
+    """Work out which chat the admin means, from any of the usual inputs.
+
+    Returns (chat, error_key). Exactly one of the two is non-None, so the
+    caller can tell the admin WHY it failed instead of one vague message -
+    the old version swallowed every failure into a single "couldn't add"
+    which made real problems (wrong username vs bot not in the chat vs a
+    private-invite link the API simply cannot resolve) impossible to tell
+    apart.
+
+    Accepted inputs:
+      - a forwarded message from the channel/group  (most reliable)
+      - @username  /  username
+      - https://t.me/username  /  t.me/username
+      - a numeric chat id like -1001234567890
+      - a private invite link (https://t.me/+XXXX or /joinchat/XXXX) is
+        explicitly rejected with its own message, because Telegram's API
+        cannot look a chat up from an invite hash - admins try this
+        constantly, so it gets a real explanation instead of "failed".
+    """
     if message.forward_from_chat:
-        return message.forward_from_chat
+        return message.forward_from_chat, None
+
     text = (message.text or "").strip()
     if not text:
-        return None
+        return None, "channel_add_fail"
+
+    # strip a t.me/telegram.me prefix if present
+    cleaned = text
+    for prefix in ("https://", "http://"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    for host in ("t.me/", "telegram.me/", "telegram.dog/"):
+        if cleaned.lower().startswith(host):
+            cleaned = cleaned[len(host):]
+            break
+
+    # private invite links can't be resolved via the Bot API at all
+    if cleaned.startswith("+") or cleaned.lower().startswith("joinchat/"):
+        return None, "channel_add_fail_invite_link"
+
+    cleaned = cleaned.split("?")[0].rstrip("/")
+    if not cleaned:
+        return None, "channel_add_fail"
+
     try:
-        if text.lstrip("-").isdigit():
-            return await bot.get_chat(int(text))
-        return await bot.get_chat(text if text.startswith("@") else f"@{text}")
-    except Exception:
-        return None
+        if cleaned.lstrip("-").isdigit():
+            chat = await bot.get_chat(int(cleaned))
+        else:
+            chat = await bot.get_chat(cleaned if cleaned.startswith("@") else f"@{cleaned}")
+        return chat, None
+    except Exception as e:
+        msg = str(e).lower()
+        log.info("MANDATORY_CHANNEL_RESOLVE_FAILED: input=%r error=%s", text, e)
+        if "chat not found" in msg:
+            return None, "channel_add_fail_not_found"
+        return None, "channel_add_fail"
+
+
+async def _refresh_invite_link(chat_id: int, existing_link: str | None) -> tuple[str | None, Exception | None]:
+    """Revoke any previously-issued link for this chat, then mint a brand
+    new one. Returns (new_link, last_error).
+
+    A fresh link is created EVERY time a channel is added - including when
+    re-adding a channel that was added before - so a link that leaked while
+    the channel was previously configured can't keep working. Revoking is
+    best-effort: an already-invalid/expired old link is not a failure, it
+    just means there's nothing left to revoke.
+    """
+    if existing_link and "t.me/" in existing_link and ("+" in existing_link or "joinchat" in existing_link):
+        try:
+            await bot.revoke_chat_invite_link(chat_id, existing_link)
+            log.info("revoked previous invite link for chat %s", chat_id)
+        except Exception as e:
+            log.info("old invite link for chat %s could not be revoked (already invalid?): %s", chat_id, e)
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            link_obj = await bot.create_chat_invite_link(
+                chat_id,
+                name=f"Majburiy obuna {int(time.time())}",
+                creates_join_request=True,
+            )
+            return link_obj.invite_link, None
+        except TelegramRetryAfter as e:
+            last_err = e
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt)
+    return None, last_err
 
 
 @router.message(AdminStates.waiting_channel)
@@ -1433,38 +1569,70 @@ async def do_add_channel(message: Message, state: FSMContext):
         return
     await state.clear()
 
-    chat = await _resolve_chat(message)
-    if not chat:
-        await message.answer(t(lang, "channel_add_fail"), reply_markup=admin_reply_kb(lang))
-        return
-
     try:
-        member = await bot.get_chat_member(chat.id, bot.id)
-        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-            raise PermissionError
-    except Exception:
-        await message.answer(t(lang, "channel_add_fail_not_admin"), reply_markup=admin_reply_kb(lang))
-        return
+        chat, err_key = await _resolve_chat(message)
+        if not chat:
+            await message.answer(t(lang, err_key or "channel_add_fail"), reply_markup=admin_reply_kb(lang))
+            return
 
-    is_private = chat.username is None
-    invite_link = None
-    if is_private:
+        # Only channels/groups can be used as a mandatory subscription -
+        # pointing this at a private chat or at the bot itself would create
+        # a requirement that can never be satisfied.
+        if chat.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+            await message.answer(t(lang, "channel_add_fail_wrong_type"), reply_markup=admin_reply_kb(lang))
+            return
+
+        # Check the bot's own membership/permissions there.
         try:
-            link_obj = await bot.create_chat_invite_link(
-                chat.id, name="Majburiy obuna", creates_join_request=True
-            )
-            invite_link = link_obj.invite_link
+            me_member = await bot.get_chat_member(chat.id, bot.id)
         except Exception as e:
-            log.warning("could not create invite link: %s", e)
-            invite_link = None
-    else:
-        invite_link = f"https://t.me/{chat.username}"
+            log.info("MANDATORY_CHANNEL_MEMBER_CHECK_FAILED: chat=%s error=%s", chat.id, e)
+            await message.answer(t(lang, "channel_add_fail_not_admin"), reply_markup=admin_reply_kb(lang))
+            return
 
-    await add_channel(chat.id, chat.title or chat.username or str(chat.id), chat.username, is_private, invite_link)
-    await message.answer(
-        t(lang, "channel_added", title=chat.title or chat.username or str(chat.id)),
-        reply_markup=admin_reply_kb(lang),
-    )
+        if me_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            await message.answer(t(lang, "channel_add_fail_not_admin"), reply_markup=admin_reply_kb(lang))
+            return
+
+        is_private = not chat.username
+        invite_link = None
+
+        if is_private:
+            # Creating an invite link needs an explicit permission that is
+            # OFF by default even for admins. Checking it up front turns a
+            # confusing API error into a precise instruction.
+            can_invite = getattr(me_member, "can_invite_users", None)
+            if me_member.status == ChatMemberStatus.ADMINISTRATOR and can_invite is False:
+                await message.answer(t(lang, "channel_add_fail_no_invite_perm"), reply_markup=admin_reply_kb(lang))
+                return
+
+            existing = await get_channel_by_chat_id(chat.id)
+            invite_link, link_err = await _refresh_invite_link(
+                chat.id, existing["invite_link"] if existing else None
+            )
+            if not invite_link:
+                # Never save a private channel without a working link: that
+                # would be a requirement no user could ever satisfy, silently
+                # locking everyone out of the whole bot.
+                log.error("MANDATORY_CHANNEL_LINK_FAILED: chat=%s error=%s", chat.id, link_err)
+                await message.answer(t(lang, "channel_add_fail_link"), reply_markup=admin_reply_kb(lang))
+                return
+        else:
+            invite_link = f"https://t.me/{chat.username}"
+
+        title = chat.title or chat.username or str(chat.id)
+        await add_channel(chat.id, title, chat.username, is_private, invite_link)
+        # A newly (re-)added channel gets a clean slate in the broken-channel
+        # cache, so a previous outage doesn't keep it excluded from checks.
+        _BROKEN_MANDATORY_CHANNELS.pop(chat.id, None)
+        log.info("MANDATORY_CHANNEL_ADDED: %s (chat_id=%s, private=%s)", title, chat.id, is_private)
+        await message.answer(
+            t(lang, "channel_added", title=title),
+            reply_markup=admin_reply_kb(lang),
+        )
+    except Exception as e:
+        log.exception("MANDATORY_CHANNEL_ADD_FAILED: unexpected error: %s", e)
+        await message.answer(t(lang, "channel_add_fail"), reply_markup=admin_reply_kb(lang))
 
 
 async def _build_channel_rows(lang: str, channels) -> list:
@@ -1498,7 +1666,7 @@ async def btn_list_channels(message: Message):
 @router.callback_query(F.data.startswith("delchan:"))
 async def cb_delete_channel(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        await call.answer()
+        await _safe_cb_answer(call)
         return
     lang = await get_user_lang(call.from_user.id)
     channel_id = int(call.data.split(":", 1)[1])
@@ -1509,7 +1677,7 @@ async def cb_delete_channel(call: CallbackQuery):
     else:
         rows = await _build_channel_rows(lang, channels)
         await call.message.edit_text(t(lang, "channel_list_title"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await call.answer(t(lang, "channel_removed"))
+    await _safe_cb_answer(call, t(lang, "channel_removed"))
 
 
 
@@ -1517,11 +1685,15 @@ async def cb_delete_channel(call: CallbackQuery):
 # HANDLER: join requests for private mandatory channels
 #
 # IMPORTANT: this only LOGS the request. It never calls
-# bot.approve_chat_join_request() or decline_chat_join_request() - the
-# channel owner/admin must approve requests manually in Telegram.
-# The bot treats a user as "subscribed" only after Telegram reports them
-# as an actual channel member (see get_unsubscribed_channels below),
-# never just because they sent a join request.
+# bot.approve_chat_join_request() or decline_chat_join_request() - whether
+# to actually let someone in stays entirely the channel admin's decision.
+#
+# The logged request is what lets get_unsubscribed_channels() treat the user
+# as having satisfied a private channel while approval is still pending:
+# tapping a join-request link is the most a user can do on their own, so
+# making them wait on a human admin before the bot works would lock them out
+# for no reason. If they later leave the channel, on_chat_member_update()
+# clears the row again.
 # ============================================================
 @router.chat_join_request()
 async def on_join_request(update: ChatJoinRequest):
@@ -1548,24 +1720,61 @@ async def on_chat_member_update(update: ChatMemberUpdated):
         await mark_channel_subscriber(update.chat.id, user_id)
     elif not is_member_now and was_member_before:
         await unmark_channel_subscriber(update.chat.id, user_id)
+        # They left (or were removed). Any join request we logged for them is
+        # now stale - without clearing it, that row would keep counting as
+        # "subscribed" and let them keep using the bot from outside the
+        # channel. Clearing forces a fresh request.
+        await clear_join_request(update.chat.id, user_id)
 
 
 # ============================================================
 # MANDATORY SUBSCRIPTION CHECK
 # ============================================================
-# ============================================================
-# MANDATORY SUBSCRIPTION CHECK
-# ============================================================
+# If the bot loses admin rights in a mandatory channel, or the channel gets
+# deleted, bot.get_chat_member() starts failing for EVERY user - which,
+# without this safeguard, would silently turn into "nobody can use the bot
+# at all" (every user permanently stuck on a channel requirement nobody can
+# satisfy). Instead, a channel confirmed broken this way is excluded from
+# the requirement for _BROKEN_CHANNEL_RECHECK_SECONDS, logged loudly once,
+# and automatically re-tried afterwards (self-heals once an admin fixes the
+# bot's permissions there, with no restart needed).
+_BROKEN_MANDATORY_CHANNELS: dict[int, float] = {}  # chat_id -> time.time() when marked broken
+_BROKEN_CHANNEL_RECHECK_SECONDS = 300
+_BROKEN_CHANNEL_ERROR_PATTERNS = (
+    "chat not found",
+    "kicked",
+    "bot is not a member",
+    "have no rights",
+    "forbidden",
+    "channel_private",
+    "chat_admin_required",
+)
+
+
 async def get_unsubscribed_channels(user_id: int):
     """
-    A user only counts as subscribed once they are an ACTUAL member of the
-    channel/group (status member/administrator/creator). For private
-    channels this means the channel owner/admin must approve their join
-    request first - merely sending a join request is NOT enough on its own.
+    Returns the mandatory channels this user still has to act on.
+
+    A user counts as satisfying a channel when EITHER:
+      - they are an actual member (status member/administrator/creator), or
+      - the channel is private and they have sent a join request to it.
+
+    That second case matters: private channels are added with
+    `creates_join_request=True` links, so a user who taps the link can only
+    ever reach "pending approval" until a human admin approves them. Gating
+    the bot on approval would mean the user is told "you haven't subscribed"
+    even though they did everything they could, and stays locked out until
+    an admin happens to look - which is exactly the complaint here. Sending
+    the request is the most the user can do, so that's what the bot asks of
+    them; whether to actually approve stays entirely up to the admin.
     """
     channels = await list_channels()
     missing = []
+    now = time.time()
     for c in channels:
+        broken_at = _BROKEN_MANDATORY_CHANNELS.get(c["chat_id"])
+        if broken_at is not None and (now - broken_at) < _BROKEN_CHANNEL_RECHECK_SECONDS:
+            continue  # confirmed broken recently - don't block every user on it, skip silently
         subscribed = False
         try:
             member = await bot.get_chat_member(c["chat_id"], user_id)
@@ -1575,8 +1784,32 @@ async def get_unsubscribed_channels(user_id: int):
                 ChatMemberStatus.CREATOR,
             ):
                 subscribed = True
-        except Exception:
+            _BROKEN_MANDATORY_CHANNELS.pop(c["chat_id"], None)  # confirmed reachable again
+        except Exception as e:
+            msg = str(e).lower()
+            if any(p in msg for p in _BROKEN_CHANNEL_ERROR_PATTERNS):
+                if c["chat_id"] not in _BROKEN_MANDATORY_CHANNELS:
+                    log.error(
+                        "MANDATORY_CHANNEL_BROKEN: bot can no longer access channel '%s' (chat_id=%s): %s "
+                        "- excluding it from the mandatory-subscription check for %ds so it doesn't block "
+                        "every user. Fix the bot's admin rights there (or remove/re-add the channel).",
+                        c["title"], c["chat_id"], e, _BROKEN_CHANNEL_RECHECK_SECONDS,
+                    )
+                _BROKEN_MANDATORY_CHANNELS[c["chat_id"]] = now
+                continue
             subscribed = False
+
+        # Not a member (yet). For a private channel, a pending join request
+        # counts - see the docstring. Telegram gives the bot no API to query
+        # pending requests, so this relies on the chat_join_request update
+        # we logged in on_join_request().
+        if not subscribed and c["is_private"]:
+            try:
+                if await has_join_request(c["chat_id"], user_id):
+                    subscribed = True
+            except Exception as e:
+                log.warning("join-request lookup failed for chat=%s user=%s: %s", c["chat_id"], user_id, e)
+
         if not subscribed:
             missing.append(c)
     return missing
@@ -1587,7 +1820,20 @@ def subscribe_kb(lang: str, channels) -> InlineKeyboardMarkup:
     for c in channels:
         url = c["invite_link"] or (f"https://t.me/{c['username']}" if c["username"] else None)
         if url:
-            rows.append([InlineKeyboardButton(text=f"➕ {c['title']}", url=url)])
+            # Telegram rejects the whole keyboard if any button text is empty,
+            # and silently truncates very long ones - guard both.
+            label = (c["title"] or "Kanal").strip()[:40] or "Kanal"
+            rows.append([InlineKeyboardButton(text=f"➕ {label}", url=url)])
+        else:
+            # A channel with no usable link can't be joined by the user, so
+            # showing it as a requirement would trap them with no way out.
+            # do_add_channel now refuses to save such a row, but an older row
+            # from before that fix could still exist in the database.
+            log.error(
+                "MANDATORY_CHANNEL_NO_LINK: channel '%s' (chat_id=%s) has no invite link or username "
+                "- users cannot join it. Remove and re-add it from the admin panel.",
+                c["title"], c["chat_id"],
+            )
     rows.append([InlineKeyboardButton(text=t(lang, "check_sub_btn"), callback_data="checksub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1595,12 +1841,25 @@ def subscribe_kb(lang: str, channels) -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "checksub")
 async def cb_check_sub(call: CallbackQuery):
     lang = await get_user_lang(call.from_user.id)
-    missing = await get_unsubscribed_channels(call.from_user.id)
-    if missing:
-        await call.answer(t(lang, "still_not_subscribed"), show_alert=True)
+    try:
+        missing = await get_unsubscribed_channels(call.from_user.id)
+    except Exception as e:
+        log.error("MANDATORY_SUB_CHECK_FAILED: user=%s error=%s", call.from_user.id, e)
+        await _safe_cb_answer(call, t(lang, "error"), show_alert=True)
         return
-    await call.message.edit_text(t(lang, "now_subscribed"))
-    await call.answer()
+
+    if missing:
+        await _safe_cb_answer(call, t(lang, "still_not_subscribed"), show_alert=True)
+        return
+
+    try:
+        await call.message.edit_text(t(lang, "now_subscribed"))
+    except TelegramBadRequest as e:
+        # "message is not modified" happens when the user taps the button
+        # twice - harmless, the text is already what we want it to be.
+        if "message is not modified" not in str(e).lower():
+            log.info("could not edit subscription message: %s", e)
+    await _safe_cb_answer(call)
 
 
 # ============================================================
@@ -1728,9 +1987,39 @@ def _build_ydl_opts_base(outdir, player_clients):
     }
     if outdir:
         opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    cookie_copy = _private_cookie_copy(COOKIES_FILE, outdir)
+    if cookie_copy:
+        opts["cookiefile"] = cookie_copy
     return opts
+
+
+def _private_cookie_copy(cookies_file: str | None, outdir: str | None) -> str | None:
+    """Return a per-download PRIVATE COPY of a cookies.txt file.
+
+    This matters because yt-dlp does not treat `cookiefile` as read-only - it
+    writes the (possibly refreshed) cookie jar BACK to that same path when it
+    finishes. With HEAVY_JOB_SLOTS=2 that means two yt-dlp instances can be
+    writing the one shared /tmp/yt_cookies.txt at the same time, and one ends
+    up reading a half-written file. That's exactly the
+    "'/tmp/yt_cookies.txt' does not look like a Netscape format cookies file"
+    error seen at runtime even though the very same file loaded fine at
+    startup - the file was fine, concurrency corrupted it afterwards.
+
+    Giving each download its own copy inside its own temp dir means yt-dlp's
+    write-back lands on a throwaway file that gets deleted with the rest of
+    the download's tempdir, and the pristine original is never mutated.
+    """
+    if not cookies_file or not os.path.exists(cookies_file):
+        return None
+    if not outdir:
+        return cookies_file  # metadata-only probes don't run concurrently on one dir
+    try:
+        dest = os.path.join(outdir, os.path.basename(cookies_file))
+        shutil.copyfile(cookies_file, dest)
+        return dest
+    except Exception as e:
+        log.warning("could not make a private cookie copy (%s), falling back to the shared file", e)
+        return cookies_file
 
 def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
     """Last-resort image grab that doesn't depend on yt-dlp at all: fetch the
@@ -1998,8 +2287,9 @@ def _download_instagram(url: str, outdir: str, use_proxy: bool):
     ydl_opts = _build_ydl_opts_base(outdir, ["web"])
     ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     ydl_opts["merge_output_format"] = "mp4"
-    if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
-        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+    _ig_cookies = _private_cookie_copy(INSTAGRAM_COOKIES_FILE, outdir)
+    if _ig_cookies:
+        ydl_opts["cookiefile"] = _ig_cookies
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
     try:
@@ -2099,8 +2389,9 @@ def _download_facebook(url: str, outdir: str, use_proxy: bool):
     ydl_opts = _build_ydl_opts_base(outdir, ["web"])
     ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
     ydl_opts["merge_output_format"] = "mp4"
-    if FACEBOOK_COOKIES_FILE and os.path.exists(FACEBOOK_COOKIES_FILE):
-        ydl_opts["cookiefile"] = FACEBOOK_COOKIES_FILE
+    _fb_cookies = _private_cookie_copy(FACEBOOK_COOKIES_FILE, outdir)
+    if _fb_cookies:
+        ydl_opts["cookiefile"] = _fb_cookies
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
     try:
@@ -2226,8 +2517,9 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
     }
-    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
-        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
+    _sc_cookies = _private_cookie_copy(SOUNDCLOUD_COOKIES_FILE, outdir)
+    if _sc_cookies:
+        ydl_opts["cookiefile"] = _sc_cookies
 
     # Fetch several candidates up front (flat, no download) so a DRM-blocked
     # top result doesn't kill the whole search - just move to the next one.
@@ -2463,8 +2755,9 @@ def _run_soundcloud_list_search(query: str, limit: int) -> list[dict]:
         "skip_download": True,
         "socket_timeout": 30,
     }
-    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
-        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
+    _sc_cookies = _private_cookie_copy(SOUNDCLOUD_COOKIES_FILE, None)
+    if _sc_cookies:
+        ydl_opts["cookiefile"] = _sc_cookies
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
@@ -2573,8 +2866,9 @@ def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
     }
-    if SOUNDCLOUD_COOKIES_FILE and os.path.exists(SOUNDCLOUD_COOKIES_FILE):
-        ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIES_FILE
+    _sc_cookies = _private_cookie_copy(SOUNDCLOUD_COOKIES_FILE, outdir)
+    if _sc_cookies:
+        ydl_opts["cookiefile"] = _sc_cookies
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
@@ -2934,7 +3228,7 @@ async def cb_search_action(call: CallbackQuery):
     _, token, action = call.data.split(":", 2)
     data = SEARCH_CACHE.get(token)
     if not data:
-        await call.answer(t(lang, "file_expired"), show_alert=True)
+        await _safe_cb_answer(call, t(lang, "file_expired"), show_alert=True)
         return
 
     if action == "cancel":
@@ -2943,7 +3237,7 @@ async def cb_search_action(call: CallbackQuery):
             await call.message.delete()
         except Exception:
             pass
-        await call.answer()
+        await _safe_cb_answer(call)
         return
 
     if action == "prev":
@@ -2951,7 +3245,7 @@ async def cb_search_action(call: CallbackQuery):
             data["page"] -= 1
         text, kb = render_search_page(lang, token)
         await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
+        await _safe_cb_answer(call)
         return
 
     if action == "next":
@@ -2960,21 +3254,21 @@ async def cb_search_action(call: CallbackQuery):
             data["page"] += 1
         text, kb = render_search_page(lang, token)
         await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
+        await _safe_cb_answer(call)
         return
 
     # otherwise `action` is the 1..8 button - the user picked a song
     if not action.isdigit():
-        await call.answer()
+        await _safe_cb_answer(call)
         return
     start = data["page"] * SEARCH_RESULTS_PER_PAGE
     real_idx = start + int(action) - 1
     if real_idx >= len(data["results"]):
-        await call.answer()
+        await _safe_cb_answer(call)
         return
     entry = data["results"][real_idx]
 
-    await call.answer()
+    await _safe_cb_answer(call)
     status = await call.message.answer(t(lang, "downloading"))
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
@@ -3029,10 +3323,10 @@ async def cb_recognize_music(call: CallbackQuery):
     video_path = entry.get("filepath") if entry else None
     source_url = entry.get("source_url", "") if entry else ""
     if not video_path or not os.path.exists(video_path):
-        await call.answer(t(lang, "file_expired"), show_alert=True)
+        await _safe_cb_answer(call, t(lang, "file_expired"), show_alert=True)
         return
 
-    await call.answer()
+    await _safe_cb_answer(call)
     status = await call.message.answer(t(lang, "recognizing"))
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     video_outdir = os.path.dirname(video_path)
@@ -3110,10 +3404,10 @@ async def cb_artist_search(call: CallbackQuery):
     token = call.data.split(":", 1)[1]
     artist = ARTIST_SEARCH_CACHE.get(token)
     if not artist:
-        await call.answer(t(lang, "file_expired"), show_alert=True)
+        await _safe_cb_answer(call, t(lang, "file_expired"), show_alert=True)
         return
 
-    await call.answer()
+    await _safe_cb_answer(call)
     status = await call.message.answer(t(lang, "searching"))
     try:
         results = await text_search_songs(artist)
@@ -3212,8 +3506,18 @@ async def main():
     log.info("Bot started as @%s (%s)", me.username, BOT_DISPLAY_NAME)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    # allowed_updates must be explicit: Telegram does NOT send chat_member or
+    # chat_join_request updates unless they're requested. Without them the
+    # mandatory-subscription feature silently breaks - join requests never
+    # get logged, so users who tapped the invite link are told they still
+    # aren't subscribed. resolve_used_update_types() derives the list from
+    # the handlers actually registered above, so it stays correct as handlers
+    # are added or removed.
+    allowed = dp.resolve_used_update_types()
+    log.info("polling with allowed_updates=%s", allowed)
+    await dp.start_polling(bot, allowed_updates=allowed)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
