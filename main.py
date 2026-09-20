@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import io
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import uuid
@@ -99,9 +101,8 @@ YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
 YOUTUBE_PROXY_LIST = [p.strip() for p in os.getenv("YOUTUBE_PROXY_LIST", "").split(",") if p.strip()]
 
 # Song search (text search + Shazam recognition) uses SoundCloud first, then
-# VK Music as a fallback for tracks that are copyright-blocked or missing on
-# SoundCloud. YouTube is NOT used for song search anymore - only for
-# downloading video when the user pastes an actual YouTube link.
+# YouTube (guarded by a circuit breaker, see YOUTUBE_BREAKER) and finally VK
+# Music, but only if VK credentials are configured.
 SOUNDCLOUD_COOKIES_FILE = os.getenv("SOUNDCLOUD_COOKIES_FILE", "").strip() or None
 VK_LOGIN = os.getenv("VK_LOGIN", "").strip()
 VK_PASSWORD = os.getenv("VK_PASSWORD", "").strip()
@@ -533,8 +534,10 @@ TEXTS = {
         "link_not_found": "❌ Bu post topilmadi — o'chirilgan, yopiq (private) yoki linkda xatolik bo'lishi mumkin.",
         "err_private": "🔐 Bu post yopiq (private) yoki yuklab olish cheklangan.\nUni ilova ichidan ulashib ko'ring yoki ochiq (public) qilishni so'rang.",
         "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
-        "err_stale_cookie": "🍪 Instagram cookie eskirgan yoki yaroqsiz, shuning uchun bu postni ololmayapti. Iltimos, brauzerdan yangi cookie eksport qilib qayta yuklang.",
-        "err_youtube_blocked": "⏳ YouTube hozircha vaqtincha ishlamayapti (server bloklangan), keyinroq urinib ko'ring.",
+        "err_stale_cookie": "⚠️ Instagram hozircha bu postni bermayapti. Birozdan so'ng qayta urinib ko'ring yoki havolani tekshiring.",
+        "err_youtube_blocked": "⏳ YouTube hozircha vaqtincha ishlamayapti, keyinroq urinib ko'ring.",
+        "err_media_too_large": "⚠️ Fayl juda katta yoki uzun (Telegram bot limiti ~50 MB, treklar uchun ~20 daqiqa). Boshqa variantni tanlang.",
+        "err_file_too_big_input": "⚠️ Yuborilgan fayl juda katta (bot 20 MB gacha fayllarni o'qiy oladi). Qisqaroq video yuboring.",
         "err_busy": "⏳ Bot hozir band (band xotira), birozdan keyin qayta urinib ko'ring.",
         "err_pinterest_video": "🎬 Bu Pinterest videosini hozircha yuklab bo'lmadi.",
         "err_facebook_parse": "❌ Bu Facebook video'sini yuklab bo'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.",
@@ -632,8 +635,10 @@ TEXTS = {
         "link_not_found": "❌ Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.",
         "err_private": "🔐 Этот пост закрыт (private) или загрузка ограничена владельцем.\nПопробуйте поделиться им из самого приложения или попросите сделать его публичным.",
         "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
-        "err_stale_cookie": "🍪 Cookie Instagram устарели или недействительны, из-за этого пост не загружается. Экспортируйте свежие cookie из браузера и обновите их.",
-        "err_youtube_blocked": "⏳ YouTube сейчас временно не работает (сервер заблокирован), попробуйте позже.",
+        "err_stale_cookie": "⚠️ Instagram сейчас не отдаёт этот пост. Попробуйте ещё раз чуть позже или проверьте ссылку.",
+        "err_youtube_blocked": "⏳ YouTube сейчас временно не работает, попробуйте позже.",
+        "err_media_too_large": "⚠️ Файл слишком большой или длинный (лимит бота Telegram ~50 МБ, для треков ~20 минут). Выберите другой вариант.",
+        "err_file_too_big_input": "⚠️ Присланный файл слишком большой (бот читает файлы до 20 МБ). Отправьте видео покороче.",
         "err_busy": "⏳ Бот сейчас перегружен, попробуйте ещё раз через некоторое время.",
         "err_pinterest_video": "🎬 Это видео с Pinterest сейчас не удалось скачать.",
         "err_facebook_parse": "❌ Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.",
@@ -729,8 +734,10 @@ TEXTS = {
         "link_not_found": "❌ Post not found — it may have been deleted, made private, or the link is wrong.",
         "err_private": "🔐 This post is private or downloads are restricted by the owner.\nTry sharing it from within the app itself, or ask for it to be made public.",
         "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
-        "err_stale_cookie": "🍪 The Instagram cookies are stale or invalid, so this post can't be fetched. Please export fresh cookies from your browser and update them.",
-        "err_youtube_blocked": "⏳ YouTube is temporarily unavailable (server is blocked), please try again later.",
+        "err_stale_cookie": "⚠️ Instagram is not serving this post right now. Please try again a bit later or check the link.",
+        "err_youtube_blocked": "⏳ YouTube is temporarily unavailable, please try again later.",
+        "err_media_too_large": "⚠️ The file is too big or too long (Telegram bot limit is ~50 MB, ~20 min for tracks). Please pick another option.",
+        "err_file_too_big_input": "⚠️ The file you sent is too large (the bot can read files up to 20 MB). Please send a shorter video.",
         "err_busy": "⏳ The bot is under heavy load right now, please try again in a bit.",
         "err_pinterest_video": "🎬 This Pinterest video couldn't be downloaded right now.",
         "err_facebook_parse": "❌ This Facebook video couldn't be downloaded, it may be private or restricted.",
@@ -1872,47 +1879,254 @@ def detect_platform(url: str) -> str | None:
     return None
 
 
-# Fallback order of YouTube "player_client" configs. Some of these dodge the
-# "Sign in to confirm you're not a bot" check better than others depending on
-# the datacenter IP the bot is hosted on, so we try them one by one.
-PLAYER_CLIENT_FALLBACKS = [
-    ["android_testsuite"],   # no sig-check, best with cookies on server IPs
-    ["ios"],                 # Apple client, separate sig path
-    ["tv_embedded"],         # embedded TV player, no JS challenge
-    ["android_creator"],     # Studio app client
-    ["web"],                 # standard web
-    ["mweb"],                # mobile web, last resort
-]
+# ============================================================
+# YT-DLP SHARED HELPERS
+#
+# Added after analysing the production logs:
+#   * _YDL()            - one place that silences yt-dlp's progress bars and
+#                         raw stderr. They were ~69% of all log bytes on
+#                         Railway (which only keeps the last ~1000 lines), so
+#                         the real errors scrolled out of view within hours.
+#   * JS runtime        - current yt-dlp needs Deno (or Node) to solve
+#                         YouTube's JS challenges; without it many formats are
+#                         simply missing ("Requested format is not available").
+#   * circuit breaker   - when YouTube fails for everything, stop paying
+#                         ~13 s per request to rediscover that.
+#   * size/duration caps- a 77 MB / 404-fragment track was downloaded for
+#                         2m12s and then rejected by Telegram (50 MB limit).
+# ============================================================
+MAX_TRACK_SECONDS = int(os.getenv("MAX_TRACK_SECONDS", "1200"))  # 20 min
+# Bot API limits: 50 MB for uploads, 20 MB for getFile downloads.
+TELEGRAM_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024
+TELEGRAM_GETFILE_LIMIT_BYTES = 20 * 1024 * 1024
+
+
+class MediaTooLargeError(RuntimeError):
+    """The media is too long / too big to be sent through the Bot API."""
+
+
+def _ensure_within_upload_limit(path: str) -> None:
+    """Raise MediaTooLargeError BEFORE we try to upload something Telegram
+    will reject with 'Request Entity Too Large'."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+        raise MediaTooLargeError(
+            f"file is {size / 1048576:.1f} MB, Telegram bot upload limit is 50 MB"
+        )
+
+
+def _short(value, limit: int = 220) -> str:
+    """Single-line, length-capped text for log messages."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class _YDLLogger:
+    """yt-dlp logger: drops progress/debug/info/error noise (the exception a
+    caller gets already carries the error text and the bot logs it once) but
+    keeps each *distinct* yt-dlp warning once - e.g. 'No supported JavaScript
+    runtime could be found' - which is exactly the kind of hint that was
+    invisible before."""
+
+    _seen: set = set()
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+    def warning(self, msg):
+        text = str(msg)
+        key = re.sub(r"[A-Za-z0-9_-]{11}(?=:)", "<id>", text)[:120]
+        if key in self._seen or len(self._seen) > 200:
+            return
+        self._seen.add(key)
+        log.warning("yt-dlp: %s", _short(text, 400))
+
+
+_YDL_LOGGER = _YDLLogger()
+
+_JS_RUNTIME_OPTS: dict | None = None
+
+
+def _js_runtime_opts() -> dict:
+    """yt-dlp enables only `deno` by default. If Deno isn't installed but Node
+    (or Bun) is, opt in explicitly. Returns {} when nothing needs to be set
+    (Deno present, or no runtime at all - startup logs a warning for that)."""
+    global _JS_RUNTIME_OPTS
+    if _JS_RUNTIME_OPTS is None:
+        opts: dict = {}
+        if not shutil.which("deno"):
+            for name in ("node", "bun"):
+                path = shutil.which(name)
+                if path:
+                    opts = {name: {"path": path}}
+                    break
+        _JS_RUNTIME_OPTS = opts
+    return _JS_RUNTIME_OPTS
+
+
+def _YDL(opts: dict):
+    """Factory for every yt_dlp.YoutubeDL in this file (single place to keep
+    logging quiet and the JS runtime configured)."""
+    opts.setdefault("noprogress", True)
+    opts.setdefault("logger", _YDL_LOGGER)
+    opts["no_warnings"] = False  # let warnings reach _YDLLogger (deduplicated)
+    js = _js_runtime_opts()
+    if js:
+        opts.setdefault("js_runtimes", js)
+    return yt_dlp.YoutubeDL(opts)
+
+
+def _duration_match_filter():
+    """yt-dlp match_filter: skip live streams and anything longer than
+    MAX_TRACK_SECONDS (unknown duration passes). A rejected video makes
+    extract_info() return None."""
+    from yt_dlp.utils import match_filter_func
+
+    return match_filter_func(f"duration <=? {MAX_TRACK_SECONDS} & !is_live")
+
+
+class _FailureBreaker:
+    """Tiny thread-safe circuit breaker (yt-dlp runs in executor threads).
+
+    Opens after `threshold` failures on at least `min_distinct` DIFFERENT keys
+    inside `window` seconds (so one deleted video retried by three users does
+    not trip it). While open, calls fail fast; one probe is let through every
+    `probe_interval` seconds, and any success closes the breaker again."""
+
+    def __init__(self, name: str, threshold: int = 3, min_distinct: int = 2,
+                 window: int = 600, cooldown: int = 300, probe_interval: int = 60):
+        self.name = name
+        self.threshold = threshold
+        self.min_distinct = min_distinct
+        self.window = window
+        self.cooldown = cooldown
+        self.probe_interval = probe_interval
+        self._fails: list[tuple[float, str]] = []
+        self._open_until = 0.0
+        self._next_probe = 0.0
+        self._lock = threading.Lock()
+
+    def is_open(self) -> bool:
+        return time.monotonic() < self._open_until
+
+    def allow(self) -> bool:
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._open_until:
+                return True
+            if now >= self._next_probe:
+                self._next_probe = now + self.probe_interval
+                return True
+            return False
+
+    def success(self) -> None:
+        with self._lock:
+            self._fails.clear()
+            self._open_until = 0.0
+
+    def failure(self, key: str) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._fails = [(t0, k) for t0, k in self._fails if now - t0 <= self.window]
+            self._fails.append((now, key))
+            if (
+                len(self._fails) >= self.threshold
+                and len({k for _, k in self._fails}) >= self.min_distinct
+            ):
+                if now >= self._open_until:
+                    log.error(
+                        "%s_CIRCUIT_OPEN: %d failures on %d different targets within %ds - "
+                        "failing fast for %ds (one probe every %ds)",
+                        self.name.upper(), len(self._fails),
+                        len({k for _, k in self._fails}), self.window,
+                        self.cooldown, self.probe_interval,
+                    )
+                self._open_until = now + self.cooldown
+                self._next_probe = now + self.probe_interval
+
+
+YOUTUBE_BREAKER = _FailureBreaker(
+    "youtube",
+    threshold=int(os.getenv("YT_BREAKER_THRESHOLD", "3")),
+    cooldown=int(os.getenv("YT_BREAKER_COOLDOWN", "300")),
+)
+
+
+def _parse_client_groups(raw: str) -> list[list[str]]:
+    """'default,tv,web_safari+mweb' -> [['default'], ['tv'], ['web_safari', 'mweb']]"""
+    groups = []
+    for part in (raw or "").split(","):
+        names = [c.strip() for c in part.split("+") if c.strip()]
+        if names:
+            groups.append(names)
+    return groups
+
+
+# InnerTube "player_client" groups, tried in order. The old hard-coded list
+# (android_testsuite / tv_embedded / android_creator ...) was tuned for a
+# 2024-era yt-dlp and produced a deterministic 3x "Error code: 152" +
+# 3x "Requested format is not available" on EVERY request. Client names change
+# often - verify with `yt-dlp -v <url>` and override via YT_PLAYER_CLIENTS
+# (comma = next group, plus = several clients in one group). "default" means
+# "whatever this yt-dlp version considers its default clients", which is the
+# safest first choice.
+PLAYER_CLIENT_FALLBACKS = _parse_client_groups(
+    os.getenv("YT_PLAYER_CLIENTS", "default,tv,web_safari,mweb,android_vr")
+) or [["default"]]
+# Upper bound on how many client groups one request may burn through.
+YT_MAX_CLIENT_ATTEMPTS = max(1, int(os.getenv("YT_MAX_CLIENT_ATTEMPTS", "3")))
+
+# Real bot-check / rate-limit signals (this is what the old code *claimed*
+# it was seeing; the logs never contained any of these strings).
+_BOT_CHECK_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "http error 429",
+    "too many requests",
+    "preconditionfailed",   # InnerTube 412
+)
+# Errors where another player_client may still succeed.
+_RETRYABLE_MARKERS = _BOT_CHECK_MARKERS + (
+    "cookies",                            # "use --cookies-from-browser"
+    "error code: 152",                    # embedded-player rejection
+    "video unavailable",
+    "video is unavailable",
+    "requested format is not available",  # this client returned no usable formats
+    "no video formats found",
+    "http error 403",                     # googlevideo URL rejected (missing PO token)
+)
 
 
 def _is_bot_check_error(exc: Exception) -> bool:
-    """Detect bot-check / auth errors worth retrying with another InnerTube client."""
+    """True only for genuine bot-check / rate-limit responses."""
     msg = str(exc).lower()
-    return any(p in msg for p in (
-        "sign in to confirm",
-        "not a bot",
-        "cookies",           # "use --cookies-from-browser"
-        "http error 429",    # Too Many Requests
-        "too many requests",
-        "preconditionfailed",# InnerTube 412
-        "error code: 152",   # client context rejected
-        "video unavailable", # sometimes a masked bot-check
-        "requested format is not available",  # this client's format list was
-                                                # incomplete/empty - another
-                                                # client often has the real one
-    ))
+    return any(p in msg for p in _BOT_CHECK_MARKERS)
 
 
-# Tracks how many times each InnerTube player_client has failed with a
-# bot-check error in this process's lifetime. Clients that keep getting
-# blocked on this particular Railway IP are tried LAST on subsequent
-# requests instead of always eating the first ~2s timeout again - pure
-# optimization, doesn't change which clients are tried, just the order.
+def _is_retryable_youtube_error(exc: Exception) -> bool:
+    """True if trying a different InnerTube client is worthwhile."""
+    msg = str(exc).lower()
+    return any(p in msg for p in _RETRYABLE_MARKERS)
+
+
+# Tracks how many times each InnerTube player_client has failed in this
+# process's lifetime. Clients that keep failing are tried LAST on later
+# requests - pure ordering optimisation.
 _YT_CLIENT_FAILURE_COUNTS: dict[str, int] = {}
 
 
 def _ordered_player_clients() -> list[list[str]]:
-    return sorted(PLAYER_CLIENT_FALLBACKS, key=lambda pc: _YT_CLIENT_FAILURE_COUNTS.get(pc[0], 0))
+    ordered = sorted(PLAYER_CLIENT_FALLBACKS, key=lambda pc: _YT_CLIENT_FAILURE_COUNTS.get(pc[0], 0))
+    return ordered[:YT_MAX_CLIENT_ATTEMPTS]
 
 
 def _pick_youtube_proxy(attempt_index: int) -> str | None:
@@ -1933,53 +2147,120 @@ def _pick_youtube_proxy(attempt_index: int) -> str | None:
     return GENERAL_PROXY
 
 
-_cookie_hint_logged = False
+_ip_block_hint_logged = False
+_no_formats_hint_logged = False
 
 
-def _raise_ytdlp_failure(last_exc):
-    global _cookie_hint_logged
-    if last_exc is not None and _is_bot_check_error(last_exc):
-        if not _cookie_hint_logged:
-            _cookie_hint_logged = True
-            log.error(
-                "YOUTUBE_IP_BLOCKED: YouTube is blocking every InnerTube client from this IP "
-                "(Railway datacenter), even with cookies set. Fix: configure YOUTUBE_PROXY or "
-                "YOUTUBE_PROXY_LIST in Railway environment variables to route around the block, "
-                "or wait - Railway IP ranges sometimes get unblocked after a while."
-            )
-        # Tagged so classify_download_error() can show a clean, specific
-        # message instead of a generic one, and so this is easy to grep for
-        # in logs/monitoring separately from any other failure type.
-        raise RuntimeError(f"YOUTUBE_IP_BLOCKED: all InnerTube clients blocked - {last_exc}") from last_exc
+def _raise_ytdlp_failure(last_exc, saw_bot_check: bool = False):
+    """Raise a tagged error after every client group failed.
+
+    * YOUTUBE_IP_BLOCKED  - only when a REAL bot-check/429 was seen.
+    * YOUTUBE_NO_FORMATS  - every client answered, but none returned usable
+      formats. That is an environment problem (outdated yt-dlp, missing JS
+      runtime / PO token, unavailable video), not proof of an IP block.
+    Both are mapped to ERROR_YOUTUBE_BLOCKED for the user by
+    classify_download_error()."""
+    global _ip_block_hint_logged, _no_formats_hint_logged
     if last_exc is None:
         raise RuntimeError("yt-dlp: all InnerTube client fallbacks exhausted.")
-    raise last_exc
+    if not _is_retryable_youtube_error(last_exc):
+        raise last_exc
+    if saw_bot_check:
+        if not _ip_block_hint_logged:
+            _ip_block_hint_logged = True
+            log.error(
+                "YOUTUBE_IP_BLOCKED: YouTube returned a bot-check / rate-limit response for every "
+                "player_client. Fix: configure YOUTUBE_PROXY or YOUTUBE_PROXY_LIST (residential "
+                "proxy), refresh YOUTUBE_COOKIES, or wait for the block to lift."
+            )
+        raise RuntimeError(f"YOUTUBE_IP_BLOCKED: all InnerTube clients blocked - {last_exc}") from last_exc
+    if not _no_formats_hint_logged:
+        _no_formats_hint_logged = True
+        log.error(
+            "YOUTUBE_NO_FORMATS: no player_client returned downloadable formats and NO bot-check "
+            "message was seen, so this is probably not a plain IP block. Check in this order: "
+            "(1) yt-dlp is current (pip install -U 'yt-dlp[default]'), (2) a JS runtime (deno or "
+            "node) is installed, (3) a PO-token provider (bgutil-ytdlp-pot-provider), "
+            "(4) YT_PLAYER_CLIENTS, (5) a proxy. Run `yt-dlp -v -F <url>` on the server to see "
+            "which formats each client really returns."
+        )
+    raise RuntimeError(
+        f"YOUTUBE_NO_FORMATS: no usable formats from any player_client - {last_exc}"
+    ) from last_exc
+
+
+def _yt_with_clients(key: str, outdir, configure, runner, *,
+                     use_proxy: bool = False, deadline: float | None = None):
+    """Run `runner(ydl_opts)` against YouTube, rotating player_client groups.
+
+    key       - identifies the target (URL / video id) for the circuit breaker
+    configure - callback that sets format / postprocessors on the opts dict
+    runner    - callback that performs the yt-dlp call and returns its result
+    deadline  - time.monotonic() value after which no NEW client is started
+    """
+    if not YOUTUBE_BREAKER.allow():
+        raise RuntimeError(
+            "YOUTUBE_CIRCUIT_OPEN: YouTube downloads are paused after repeated failures"
+        )
+    clients = _ordered_player_clients()
+    last_exc = None
+    saw_bot_check = False
+    for attempt, player_clients in enumerate(clients):
+        if attempt > 0 and deadline is not None and time.monotonic() > deadline:
+            break
+        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+        configure(ydl_opts)
+        if use_proxy:
+            proxy = _pick_youtube_proxy(attempt)
+            if proxy:
+                ydl_opts["proxy"] = proxy
+        try:
+            result = runner(ydl_opts)
+        except MediaTooLargeError:
+            YOUTUBE_BREAKER.success()  # YouTube answered fine; the track is just too long
+            raise
+        except Exception as e:
+            last_exc = e
+            if not _is_retryable_youtube_error(e):
+                # a definitive answer (private / removed / age-gated ...):
+                # YouTube itself is reachable, so this is not an outage.
+                YOUTUBE_BREAKER.success()
+                raise
+            saw_bot_check = saw_bot_check or _is_bot_check_error(e)
+            first = player_clients[0]
+            _YT_CLIENT_FAILURE_COUNTS[first] = _YT_CLIENT_FAILURE_COUNTS.get(first, 0) + 1
+            log.warning(
+                "YouTube player_client %s failed (%d/%d): %s",
+                player_clients, attempt + 1, len(clients), _short(e),
+            )
+            continue
+        # success: let this client's failure count decay and close the breaker
+        first = player_clients[0]
+        if first in _YT_CLIENT_FAILURE_COUNTS:
+            _YT_CLIENT_FAILURE_COUNTS[first] = max(0, _YT_CLIENT_FAILURE_COUNTS[first] - 1)
+        YOUTUBE_BREAKER.success()
+        return result
+    YOUTUBE_BREAKER.failure(key)
+    _raise_ytdlp_failure(last_exc, saw_bot_check)
 
 
 def _build_ydl_opts_base(outdir, player_clients):
     """Shared yt-dlp options for all download functions.
 
-    - skip_webpage : talk directly to InnerTube API, skip the watch page
-    - player_skip  : for clients with pre-signed URLs, skip JS player fetch
-    With valid cookies these settings make requests pass bot-check on Railway.
+    Only `player_client` is passed to the YouTube extractor. The old code also
+    sent `skip_webpage` (not an option yt-dlp knows) and `player_skip=
+    webpage,configs,js` for android/tv clients; yt-dlp documents that
+    skipping those requests "could cause some issues", and it also prevents
+    the JS challenge solver from working.
     """
-    _no_sig = {"android_testsuite", "android_creator", "tv_embedded"}
-    needs_player = not all(c in _no_sig for c in player_clients)
-
-    extractor_args = {
-        "player_client": player_clients,
-        "skip_webpage": ["1"],
-    }
-    if not needs_player:
-        extractor_args["player_skip"] = ["webpage", "configs", "js"]
-
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
         "restrictfilenames": True,
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {"youtube": extractor_args},
+        "extractor_args": {"youtube": {"player_client": list(player_clients)}},
         "http_headers": {"User-Agent": DEFAULT_UA},
         "geo_bypass": True,
         "retries": 3,
@@ -1991,6 +2272,34 @@ def _build_ydl_opts_base(outdir, player_clients):
     if cookie_copy:
         opts["cookiefile"] = cookie_copy
     return opts
+
+
+def _log_ytdlp_environment() -> None:
+    """One startup line with everything needed to diagnose YouTube failures
+    (the production logs never showed the yt-dlp version or JS runtime)."""
+    try:
+        from yt_dlp.version import __version__ as ytdlp_version
+    except Exception:
+        ytdlp_version = "?"
+    runtimes = [n for n in ("deno", "node", "bun", "qjs") if shutil.which(n)]
+    has_ejs = importlib.util.find_spec("yt_dlp_ejs") is not None
+    log.info(
+        "YTDLP_ENV: yt-dlp=%s | JS runtimes on PATH=%s | yt-dlp-ejs=%s | player_clients=%s | "
+        "max_attempts=%d | track_limit=%ds",
+        ytdlp_version, runtimes or "NONE", has_ejs,
+        ["+".join(g) for g in PLAYER_CLIENT_FALLBACKS], YT_MAX_CLIENT_ATTEMPTS, MAX_TRACK_SECONDS,
+    )
+    if not runtimes:
+        log.warning(
+            "YTDLP_ENV: no JS runtime (deno/node) found. Current yt-dlp needs one to solve YouTube's "
+            "JS challenges; without it most formats are missing and downloads fail with "
+            "'Requested format is not available'. Install Deno (or Node >= 20)."
+        )
+    if not has_ejs:
+        log.warning(
+            "YTDLP_ENV: yt-dlp-ejs is not installed. Use `pip install -U 'yt-dlp[default]'` "
+            "(includes yt-dlp-ejs)."
+        )
 
 
 def _private_cookie_copy(cookies_file: str | None, outdir: str | None) -> str | None:
@@ -2075,7 +2384,7 @@ def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = N
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts["cookiefile"] = cookies_file
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _YDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if "entries" in info:
             info = info["entries"][0]
@@ -2214,12 +2523,35 @@ def _is_instagram_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+_instagram_empty_hint_last = 0.0
+
+
+def _note_instagram_empty_response(exc: Exception) -> None:
+    """Admin-facing hint, at most once per hour. `Expecting value: line 1 column 1`
+    means Instagram sent an EMPTY body. That can be stale cookies, but equally a
+    rate-limit, a login wall or a blocked datacenter IP - the old code told the
+    END USER to export fresh cookies, which they cannot do."""
+    global _instagram_empty_hint_last
+    msg = str(exc).lower()
+    if "failed to parse json" not in msg and "expecting value" not in msg:
+        return
+    now = time.time()
+    if now - _instagram_empty_hint_last < 3600:
+        return
+    _instagram_empty_hint_last = now
+    log.error(
+        "INSTAGRAM_EMPTY_RESPONSE: Instagram returned an empty/non-JSON body. Possible causes: "
+        "stale INSTAGRAM_COOKIES, rate limit, login wall, or this datacenter IP being blocked "
+        "(try INSTAGRAM cookies from a fresh session and/or PROXY_URL)."
+    )
+
+
 def _execute_ytdlp_download(ydl_opts: dict, url: str, outdir: str):
     """Runs a single yt-dlp download attempt with the given (already fully
     built) options and returns (filepath, info). Shared by every
     platform-specific downloader below purely to avoid re-typing this exact
     extract+rename dance six times - it carries no platform decisions."""
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with _YDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if "entries" in info:
             info = info["entries"][0]
@@ -2232,42 +2564,19 @@ def _execute_ytdlp_download(ydl_opts: dict, url: str, outdir: str):
 
 
 def _download_youtube(url: str, outdir: str, use_proxy: bool):
-    """YouTube is the one platform that genuinely needs the InnerTube
-    player_client fallback loop - different clients dodge bot-check
-    differently depending on the datacenter IP. Merges best video+audio.
-    Clients are tried in order of least-recently-blocked first (see
-    _ordered_player_clients), and an optional proxy is layered on top via
-    YOUTUBE_PROXY / YOUTUBE_PROXY_LIST if configured."""
-    last_exc = None
-    for attempt, player_clients in enumerate(_ordered_player_clients()):
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+    """YouTube is the one platform that needs the InnerTube player_client
+    fallback loop. Merges best video+audio. The rotation, circuit breaker and
+    error tagging live in _yt_with_clients(); an optional proxy is layered on
+    top via YOUTUBE_PROXY / YOUTUBE_PROXY_LIST if configured."""
+
+    def configure(ydl_opts: dict) -> None:
         ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         ydl_opts["merge_output_format"] = "mp4"
-        if use_proxy:
-            proxy = _pick_youtube_proxy(attempt)
-            if proxy:
-                ydl_opts["proxy"] = proxy
-        try:
-            result = _execute_ytdlp_download(ydl_opts, url, outdir)
-            # a clean success on a client that previously failed means the
-            # block was likely temporary/IP-specific - let its count decay
-            # so it's not permanently deprioritized.
-            if player_clients[0] in _YT_CLIENT_FAILURE_COUNTS:
-                _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] = max(
-                    0, _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] - 1
-                )
-            return result
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            _YT_CLIENT_FAILURE_COUNTS[player_clients[0]] = _YT_CLIENT_FAILURE_COUNTS.get(player_clients[0], 0) + 1
-            log.warning(
-                "InnerTube client %s (attempt %d) blocked — trying next client",
-                player_clients, attempt + 1,
-            )
-            continue
-    _raise_ytdlp_failure(last_exc)
+
+    def runner(ydl_opts: dict):
+        return _execute_ytdlp_download(ydl_opts, url, outdir)
+
+    return _yt_with_clients(url, outdir, configure, runner, use_proxy=use_proxy)
 
 
 def _download_tiktok(url: str, outdir: str):
@@ -2300,6 +2609,7 @@ def _download_instagram(url: str, outdir: str, use_proxy: bool):
             if result:
                 return result
             raise
+        _note_instagram_empty_response(e)
         if _is_instagram_rate_limit_error(e):
             global _instagram_cookie_hint_logged
             if not INSTAGRAM_COOKIES_FILE and not _instagram_cookie_hint_logged:
@@ -2348,7 +2658,7 @@ def _download_pinterest(url: str, outdir: str, use_proxy: bool):
         probe_opts["proxy"] = GENERAL_PROXY
     is_video_pin = None  # None = couldn't determine
     try:
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        with _YDL(probe_opts) as ydl:
             probe_info = ydl.extract_info(url, download=False)
         if "entries" in probe_info:
             probe_info = probe_info["entries"][0]
@@ -2455,7 +2765,7 @@ def classify_download_error(exc: Exception) -> str:
     # Tagged errors raised deliberately elsewhere in this file - check
     # these first since they're unambiguous (see _raise_ytdlp_failure,
     # _download_pinterest).
-    if "youtube_ip_blocked" in msg:
+    if "youtube_ip_blocked" in msg or "youtube_no_formats" in msg or "youtube_circuit_open" in msg:
         return "ERROR_YOUTUBE_BLOCKED"
     if "pinterest_video_unavailable" in msg:
         return "ERROR_PINTEREST_VIDEO"
@@ -2469,9 +2779,14 @@ def classify_download_error(exc: Exception) -> str:
         return "ERROR_STALE_COOKIE"
     if "expired" in msg or "no longer available" in msg or "24 hours" in msg:
         return "ERROR_EXPIRED"
-    if "private" in msg or "login" in msg or "restricted" in msg or "log in" in msg:
+    if (
+        "private" in msg or "login" in msg or "restricted" in msg or "log in" in msg
+        or "--cookies" in msg or "content is unreachable" in msg  # e.g. Instagram stories
+    ):
         return "ERROR_PRIVATE"
-    if "not found" in msg or "404" in msg or "this post" in msg and "deleted" in msg or "deleted" in msg:
+    # NB: match "http error 404", not a bare "404" - a bare "404" also matches
+    # random video IDs that happen to contain those digits.
+    if "not found" in msg or "http error 404" in msg or "deleted" in msg:
         return "ERROR_DELETED"
     # After exhausting all InnerTube client fallbacks, "video is unavailable" /
     # "requested format is not available" almost always means the video is
@@ -2492,16 +2807,68 @@ async def download_media(url: str, outdir: str, platform: str):
 # ============================================================
 # SONG SEARCH: SoundCloud (primary) + VK Music (fallback)
 #
-# YouTube is deliberately NOT used here - Railway's datacenter IP gets
-# permanently bot-checked by YouTube regardless of client/cookies tricks.
+# YouTube is only a guarded middle step here (circuit breaker + deadline):
+# from datacenter IPs it can fail for every request.
 # SoundCloud has no such bot-check for public tracks. VK Music is used only
 # when a track is missing/copyright-blocked on SoundCloud, and requires a
 # real VK account (VK_LOGIN + VK_PASSWORD env vars) to authorize search.
 # ============================================================
 
+# --- SoundCloud DRM blocklist ----------------------------------------------
+# The logs showed the same DRM-protected (Go+) track failing twice within
+# 1.3 s: the user picked it (DRM error), then the "fall back to search" step
+# searched for the same artist+title, got the SAME track back and failed
+# again. Remember DRM tracks so they are skipped instead of re-tried, and so
+# they are not offered in search lists in the first place.
+_SC_DRM_BLOCKLIST: dict[str, float] = {}
+_SC_DRM_TTL_SECONDS = 24 * 3600
+_SC_DRM_MAX_ENTRIES = 2000
+_SC_ID_RE = re.compile(r"\[soundcloud[^\]]*\]\s+(\d+)")
+
+
+def _is_drm_error(exc: Exception) -> bool:
+    return "drm protected" in str(exc).lower()
+
+
+def _sc_entry_keys(entry: dict) -> list[str]:
+    keys = []
+    for field in ("id", "url", "webpage_url"):
+        value = entry.get(field)
+        if value:
+            keys.append(str(value))
+    return keys
+
+
+def _sc_ids_from_exc(exc: Exception) -> list[str]:
+    return _SC_ID_RE.findall(str(exc))
+
+
+def _mark_sc_drm(*keys: str) -> None:
+    now = time.time()
+    for key in keys:
+        if key:
+            _SC_DRM_BLOCKLIST[str(key)] = now
+    while len(_SC_DRM_BLOCKLIST) > _SC_DRM_MAX_ENTRIES:
+        _SC_DRM_BLOCKLIST.pop(next(iter(_SC_DRM_BLOCKLIST)), None)
+
+
+def _is_sc_drm_blocked(*keys: str) -> bool:
+    now = time.time()
+    for key in keys:
+        ts = _SC_DRM_BLOCKLIST.get(str(key))
+        if ts is None:
+            continue
+        if now - ts > _SC_DRM_TTL_SECONDS:
+            _SC_DRM_BLOCKLIST.pop(str(key), None)
+            continue
+        return True
+    return False
+
+
 def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] | None:
     """Search SoundCloud and download the first playable result, skipping
-    any DRM-protected (Go+) tracks it can't fetch. Returns (mp3_path,
+    DRM-protected (Go+) tracks it can't fetch (remembered in _SC_DRM_BLOCKLIST)
+    and tracks longer than MAX_TRACK_SECONDS. Returns (mp3_path,
     webpage_url) or None if nothing playable was found."""
     ydl_opts = {
         "format": "bestaudio/best",
@@ -2513,6 +2880,7 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
         "ffmpeg_location": FFMPEG_PATH,
         "socket_timeout": 30,
         "retries": 3,
+        "match_filter": _duration_match_filter(),
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
@@ -2526,18 +2894,29 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
     flat_opts = dict(ydl_opts)
     flat_opts["extract_flat"] = "in_playlist"
     flat_opts.pop("postprocessors", None)
+    flat_opts.pop("match_filter", None)
     try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+        with _YDL(flat_opts) as ydl:
             info = ydl.extract_info(f"scsearch5:{query}", download=False)
-            candidates = [e for e in (info.get("entries") or []) if e and e.get("url")]
+            candidates = [e for e in ((info or {}).get("entries") or []) if e and e.get("url")]
     except Exception as e:
-        log.warning("SoundCloud search failed for '%s': %s", query, e)
+        log.warning("SoundCloud search failed for '%s': %s", query, _short(e))
         return None
 
+    skipped_drm = 0
     for cand in candidates:
+        keys = _sc_entry_keys(cand)
+        if _is_sc_drm_blocked(*keys):
+            skipped_drm += 1
+            continue
+        duration = cand.get("duration")
+        if duration and duration > MAX_TRACK_SECONDS:
+            continue
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with _YDL(ydl_opts) as ydl:
                 dl_info = ydl.extract_info(cand["url"], download=True)
+                if not dl_info:
+                    continue  # rejected by match_filter (too long / live)
                 if "entries" in dl_info:
                     entries = [e for e in (dl_info.get("entries") or []) if e]
                     if not entries:
@@ -2550,8 +2929,12 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
                 webpage_url = dl_info.get("webpage_url") or dl_info.get("url") or ""
                 return mp3_path, webpage_url
         except Exception as e:
-            log.warning("SoundCloud candidate skipped for '%s': %s", query, e)
+            if _is_drm_error(e):
+                _mark_sc_drm(*keys, *_sc_ids_from_exc(e))
+            log.warning("SoundCloud candidate skipped for '%s': %s", query, _short(e))
             continue
+    if skipped_drm:
+        log.info("SoundCloud: skipped %d known DRM-protected candidate(s) for '%s'", skipped_drm, query)
     return None
 
 
@@ -2567,8 +2950,11 @@ _vk_auth_cooldown_until = 0.0
 _vk_hardcoded_token_invalid = False  # set True once VK confirms VK_ACCESS_TOKEN itself is bad
 
 
+_vk_missing_creds_logged = False
+
+
 async def _vk_get_token() -> str | None:
-    global _vk_auth_cooldown_until
+    global _vk_auth_cooldown_until, _vk_missing_creds_logged
     # Preferred path: a long-lived token obtained once via the Kate Mobile
     # OAuth implicit flow. No network call, no password-grant risk, no
     # cooldown - just use it directly every time, UNLESS VK itself has
@@ -2578,7 +2964,9 @@ async def _vk_get_token() -> str | None:
     if _vk_token_cache.get("token"):
         return _vk_token_cache["token"]
     if not VK_LOGIN or not VK_PASSWORD:
-        log.warning("VK fallback skipped: VK_LOGIN/VK_PASSWORD not set in environment")
+        if not _vk_missing_creds_logged:
+            _vk_missing_creds_logged = True
+            log.warning("VK fallback disabled: VK_ACCESS_TOKEN / VK_LOGIN+VK_PASSWORD not set in environment")
         return None
     now = time.time()
     if now < _vk_auth_cooldown_until:
@@ -2671,45 +3059,95 @@ async def vk_search_and_download(query: str, outdir: str) -> tuple[str, str] | N
     return await _vk_download_track(tracks[0], outdir)
 
 
-def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | None:
-    """Search YouTube (via our cookie-authenticated InnerTube clients) and
-    download the first playable result's audio. Returns (mp3_path, watch_url)
-    or None - never raises, since this is a fallback step in the search chain."""
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
+YT_SEARCH_CANDIDATES = max(1, int(os.getenv("YT_SEARCH_CANDIDATES", "3")))
+# No NEW player_client attempt / candidate is started once this many seconds
+# have passed since the search began (an attempt already running may finish).
+YT_SEARCH_DEADLINE_SECONDS = int(os.getenv("YT_SEARCH_DEADLINE_SECONDS", "25"))
+
+
+def _youtube_audio_download(url: str, outdir: str, deadline: float | None = None) -> str:
+    """Download the audio of ONE YouTube video as mp3 (client rotation +
+    circuit breaker via _yt_with_clients). Returns the mp3 path."""
+
+    def configure(ydl_opts: dict) -> None:
         ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["match_filter"] = _duration_match_filter()
         ydl_opts["postprocessors"] = [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ]
+
+    def runner(ydl_opts: dict) -> str:
+        with _YDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise MediaTooLargeError(
+                    f"video is live or longer than {MAX_TRACK_SECONDS // 60} min"
+                )
+            if "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    raise RuntimeError("yt-dlp returned an empty playlist")
+                info = entries[0]
+            filename = ydl.prepare_filename(info)
+            mp3_path = os.path.splitext(filename)[0] + ".mp3"
+            if not os.path.exists(mp3_path):
+                raise RuntimeError("mp3 file missing after yt-dlp post-processing")
+            return mp3_path
+
+    return _yt_with_clients(url, outdir, configure, runner, deadline=deadline)
+
+
+def _run_youtube_search_download(query: str, outdir: str) -> tuple[str, str] | None:
+    """Search YouTube and download the audio of the first playable result.
+    Returns (mp3_path, watch_url) or None - never raises, since this is a
+    fallback step in the search chain.
+
+    Old behaviour: `ytsearch1:` + download=True, i.e. ONLY the top hit was ever
+    tried (often a live/embed-restricted upload - see '(Live)' in the logs),
+    and the whole search+download was repeated for each of the 6 clients.
+    New behaviour: one cheap flat search, then up to YT_SEARCH_CANDIDATES
+    different videos are tried, all inside YT_SEARCH_DEADLINE_SECONDS, and the
+    circuit breaker makes the whole thing fail fast during an outage."""
+    if YOUTUBE_BREAKER.is_open() and not YOUTUBE_BREAKER.allow():
+        log.info("YouTube circuit open - skipping YouTube for '%s'", query)
+        return None
+    candidates = _run_youtube_list_search(query, YT_SEARCH_CANDIDATES)
+    if not candidates:
+        return None
+    deadline = time.monotonic() + YT_SEARCH_DEADLINE_SECONDS
+    for cand in candidates:
+        if time.monotonic() > deadline:
+            break
+        duration = cand.get("duration")
+        if duration and duration > MAX_TRACK_SECONDS:
+            continue
+        url = cand.get("url")
+        if not url:
+            continue
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-                if not info:
-                    return None
-                if "entries" in info:
-                    entries = [e for e in (info.get("entries") or []) if e]
-                    if not entries:
-                        return None
-                    info = entries[0]
-                filename = ydl.prepare_filename(info)
-                mp3_path = os.path.splitext(filename)[0] + ".mp3"
-                if not os.path.exists(mp3_path):
-                    return None
-                video_id = info.get("id")
-                watch_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else info.get("webpage_url", "")
-                return mp3_path, watch_url
+            return _youtube_audio_download(url, outdir, deadline=deadline), url
+        except MediaTooLargeError:
+            continue
         except Exception as e:
-            if not _is_bot_check_error(e):
-                log.warning("YouTube search failed for '%s': %s", query, e)
-                return None
-            log.warning("InnerTube client %s blocked for search '%s' — trying next client", player_clients, query)
+            log.warning("YouTube candidate %s skipped for '%s': %s", cand.get("id"), query, _short(e))
+            if "youtube_circuit_open" in str(e).lower():
+                break
             continue
     return None
 
 
+def _vk_configured() -> bool:
+    """True if VK can possibly work (avoids a pointless step + warning spam)."""
+    return bool(
+        (VK_ACCESS_TOKEN and not _vk_hardcoded_token_invalid)
+        or _vk_token_cache.get("token")
+        or (VK_LOGIN and VK_PASSWORD)
+    )
+
+
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> YouTube -> VK Music. Raises RuntimeError
-    if all three fail."""
+    """Search order: SoundCloud -> YouTube -> VK Music (VK only when
+    configured). Raises RuntimeError if everything fails."""
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
     if result:
@@ -2718,10 +3156,13 @@ async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
     if result:
         return result
-    log.info("YouTube had no usable result for '%s' - trying VK Music", query)
-    result = await vk_search_and_download(query, outdir)
-    if result:
-        return result
+    if _vk_configured():
+        log.info("YouTube had no usable result for '%s' - trying VK Music", query)
+        result = await vk_search_and_download(query, outdir)
+        if result:
+            return result
+    else:
+        log.info("YouTube had no usable result for '%s' (VK not configured)", query)
     raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
 
 
@@ -2759,7 +3200,7 @@ def _run_soundcloud_list_search(query: str, limit: int) -> list[dict]:
     if _sc_cookies:
         ydl_opts["cookiefile"] = _sc_cookies
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _YDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
             entries = [e for e in (info.get("entries") or []) if e]
     except Exception as e:
@@ -2768,6 +3209,8 @@ def _run_soundcloud_list_search(query: str, limit: int) -> list[dict]:
 
     results = []
     for e in entries:
+        if _is_sc_drm_blocked(*_sc_entry_keys(e)):
+            continue  # known DRM (Go+) track: it can never be downloaded
         results.append(
             {
                 "id": e.get("id"),
@@ -2803,35 +3246,34 @@ async def _vk_list_search(query: str, limit: int) -> list[dict]:
 
 
 def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(None, player_clients)
-        ydl_opts["extract_flat"] = "in_playlist"
-        ydl_opts["skip_download"] = True
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                entries = [e for e in (info.get("entries") or []) if e]
-                results = []
-                for e in entries:
-                    vid = e.get("id")
-                    results.append(
-                        {
-                            "id": vid,
-                            "title": e.get("title") or "Unknown",
-                            "uploader": e.get("uploader") or e.get("channel") or "",
-                            "duration": e.get("duration"),
-                            "view_count": e.get("view_count"),
-                            "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
-                            "source": "youtube",
-                        }
-                    )
-                return results
-        except Exception as e:
-            if not _is_bot_check_error(e):
-                log.warning("YouTube list search failed for '%s': %s", query, e)
-                return []
-            continue
-    return []
+    """Flat YouTube search (metadata only). It never touches the player API,
+    so rotating player_client groups gains nothing here - a single attempt is
+    enough (the old code looped over all 6 clients)."""
+    ydl_opts = _build_ydl_opts_base(None, PLAYER_CLIENT_FALLBACKS[0])
+    ydl_opts["extract_flat"] = "in_playlist"
+    ydl_opts["skip_download"] = True
+    try:
+        with _YDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    except Exception as e:
+        log.warning("YouTube list search failed for '%s': %s", query, _short(e))
+        return []
+    entries = [e for e in ((info or {}).get("entries") or []) if e]
+    results = []
+    for e in entries:
+        vid = e.get("id")
+        results.append(
+            {
+                "id": vid,
+                "title": e.get("title") or "Unknown",
+                "uploader": e.get("uploader") or e.get("channel") or "",
+                "duration": e.get("duration"),
+                "view_count": e.get("view_count"),
+                "url": f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"),
+                "source": "youtube",
+            }
+        )
+    return results
 
 
 async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
@@ -2862,6 +3304,7 @@ def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
         "ffmpeg_location": FFMPEG_PATH,
         "socket_timeout": 30,
         "retries": 3,
+        "match_filter": _duration_match_filter(),
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
@@ -2869,31 +3312,23 @@ def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
     _sc_cookies = _private_cookie_copy(SOUNDCLOUD_COOKIES_FILE, outdir)
     if _sc_cookies:
         ydl_opts["cookiefile"] = _sc_cookies
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        return os.path.splitext(filename)[0] + ".mp3"
+    try:
+        with _YDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise MediaTooLargeError(f"track is longer than {MAX_TRACK_SECONDS // 60} min")
+            filename = ydl.prepare_filename(info)
+            return os.path.splitext(filename)[0] + ".mp3"
+    except Exception as e:
+        if _is_drm_error(e):
+            # remember it, so the follow-up "fall back to search" does not
+            # pick this very same track again
+            _mark_sc_drm(url, *_sc_ids_from_exc(e))
+        raise
 
 
 def _run_youtube_audio_download_by_url(url: str, outdir: str) -> str:
-    last_exc = None
-    for player_clients in PLAYER_CLIENT_FALLBACKS:
-        ydl_opts = _build_ydl_opts_base(outdir, player_clients)
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + ".mp3"
-        except Exception as e:
-            last_exc = e
-            if not _is_bot_check_error(e):
-                raise
-            continue
-    _raise_ytdlp_failure(last_exc)
+    return _youtube_audio_download(url, outdir)
 
 
 async def download_song_by_url(url: str, outdir: str, source: str = "soundcloud") -> str:
@@ -3074,6 +3509,14 @@ async def handle_link(message: Message):
         return
 
     try:
+        _ensure_within_upload_limit(filepath)
+    except MediaTooLargeError as e:
+        log.info("media too large to send (%s): %s", platform, e)
+        shutil.rmtree(outdir, ignore_errors=True)
+        await status.edit_text(t(lang, "err_media_too_large"))
+        return
+
+    try:
         await status.delete()
     except Exception:
         pass
@@ -3130,6 +3573,12 @@ async def handle_own_media(message: Message):
     if not media:
         return
 
+    # Bot API getFile refuses files > 20 MB ('file is too big'). The logs showed this
+    # ending as a generic error after the user had already waited; say so up front.
+    if (getattr(media, "file_size", None) or 0) > TELEGRAM_GETFILE_LIMIT_BYTES:
+        await message.answer(t(lang, "err_file_too_big_input"))
+        return
+
     status = await message.answer(t(lang, "recognizing"))
     outdir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
@@ -3158,6 +3607,7 @@ async def handle_own_media(message: Message):
         try:
             async with HeavyJobSlot(status, lang, "downloading"):
                 mp3_path, song_link = await search_and_download_song(query, outdir)
+            _ensure_within_upload_limit(mp3_path)
         except Exception as e:
             log.info("own-media song download failed, falling back to YouTube link: %s", e)
             yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
@@ -3181,10 +3631,11 @@ async def handle_own_media(message: Message):
             pass
     except Exception as e:
         log.warning("own media recognition failed: %s", e)
+        err_key = "err_file_too_big_input" if "file is too big" in str(e).lower() else "error"
         try:
-            await status.edit_text(t(lang, "error"))
+            await status.edit_text(t(lang, err_key))
         except Exception:
-            await message.answer(t(lang, "error"))
+            await message.answer(t(lang, err_key))
     finally:
         shutil.rmtree(outdir, ignore_errors=True)
 
@@ -3275,19 +3726,24 @@ async def cb_search_action(call: CallbackQuery):
         source = entry.get("source", "soundcloud")
         title = entry.get("title") or "Unknown"
         performer = entry.get("uploader") or ""
-        try:
-            mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
-            link_for_button = entry.get("url") if source in ("soundcloud", "youtube") else None
-        except Exception as e:
-            if source == "soundcloud" and "drm protected" in str(e).lower():
-                # this specific track is Go+/DRM-locked - fall back to a
-                # fresh SoundCloud->VK search using its title/artist instead
-                log.info("picked track is DRM-protected, falling back to search: %s", title)
-                mp3_path, link_for_button = await search_and_download_song(
-                    f"{performer} {title}".strip(), work_dir
-                )
-            else:
-                raise
+        # Song picks used to bypass HEAVY_JOB_SEMAPHORE, so yt-dlp + ffmpeg jobs
+        # could pile up beyond the 2 slots the 1 GB plan is sized for.
+        async with HeavyJobSlot(status, lang, "downloading"):
+            try:
+                mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
+                link_for_button = entry.get("url") if source in ("soundcloud", "youtube") else None
+            except Exception as e:
+                if source == "soundcloud" and _is_drm_error(e):
+                    # this specific track is Go+/DRM-locked (now remembered in
+                    # the blocklist) - fall back to a fresh search using its
+                    # title/artist; the search skips the DRM track itself
+                    log.info("picked track is DRM-protected, falling back to search: %s", title)
+                    mp3_path, link_for_button = await search_and_download_song(
+                        f"{performer} {title}".strip(), work_dir
+                    )
+                else:
+                    raise
+        _ensure_within_upload_limit(mp3_path)
         await call.message.answer_audio(
             FSInputFile(mp3_path),
             title=title,
@@ -3299,15 +3755,27 @@ async def cb_search_action(call: CallbackQuery):
             await status.delete()
         except Exception:
             pass
-    except Exception as e:
-        log.info("song download (text search) failed, falling back to YouTube link: %s", e)
-        query = f"{entry.get('uploader', '')} {entry.get('title', '')}".strip()
-        yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
-        text = t(lang, "download_failed_yt_link", link=yt_link)
+    except MediaTooLargeError as e:
+        log.info("song too long/large (text search): %s", e)
         try:
-            await status.edit_text(text)
+            await status.edit_text(t(lang, "err_media_too_large"))
         except Exception:
             pass
+    except Exception as e:
+        if "memory_watermark_exceeded" in str(e).lower():
+            try:
+                await status.edit_text(t(lang, "err_busy"))
+            except Exception:
+                pass
+        else:
+            log.info("song download (text search) failed, falling back to YouTube link: %s", _short(e, 400))
+            query = f"{entry.get('uploader', '')} {entry.get('title', '')}".strip()
+            yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+            text = t(lang, "download_failed_yt_link", link=yt_link)
+            try:
+                await status.edit_text(text)
+            except Exception:
+                pass
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -3359,6 +3827,7 @@ async def cb_recognize_music(call: CallbackQuery):
         query = f"{song['artist']} {song['title']}"
         try:
             mp3_path, song_link = await search_and_download_song(query, work_dir)
+            _ensure_within_upload_limit(mp3_path)
         except Exception as e:
             log.info("music download failed, falling back to YouTube link: %s", e)
             yt_link = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
@@ -3504,6 +3973,7 @@ async def main():
     BOT_DISPLAY_NAME = me.first_name or me.username or "Bot"
     BOT_USERNAME = me.username or ""
     log.info("Bot started as @%s (%s)", me.username, BOT_DISPLAY_NAME)
+    _log_ytdlp_environment()
 
     await bot.delete_webhook(drop_pending_updates=True)
     # allowed_updates must be explicit: Telegram does NOT send chat_member or
@@ -3520,4 +3990,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
