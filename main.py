@@ -71,6 +71,13 @@ try:
         except Exception:
             shutil.copy(_real_ffmpeg, FFMPEG_PATH)
         os.chmod(FFMPEG_PATH, 0o755)
+    _system_ffprobe = shutil.which("ffprobe")
+    _ffprobe_link = os.path.join(_ffmpeg_dir, "ffprobe")
+    if _system_ffprobe and not os.path.exists(_ffprobe_link):
+        try:
+            os.symlink(_system_ffprobe, _ffprobe_link)
+        except Exception:
+            pass
     os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
     os.environ.setdefault("FFMPEG_BINARY", FFMPEG_PATH)
 except Exception as e:
@@ -1944,7 +1951,7 @@ class _YDLLogger:
 
     def warning(self, msg):
         text = str(msg)
-        key = re.sub(r"[A-Za-z0-9_-]{11}(?=:)", "<id>", text)[:120]
+        key = re.sub(r"(\[[^\]]+\])\s+[^\s:\]]+:", r"\1 <id>:", text)[:120]
         if key in self._seen or len(self._seen) > 200:
             return
         self._seen.add(key)
@@ -2084,6 +2091,10 @@ PLAYER_CLIENT_FALLBACKS = _parse_client_groups(
 ) or [["default"]]
 # Upper bound on how many client groups one request may burn through.
 YT_MAX_CLIENT_ATTEMPTS = max(1, int(os.getenv("YT_MAX_CLIENT_ATTEMPTS", "3")))
+# After every client failed WITH cookies, try once more WITHOUT them: exported YouTube
+# cookies rotate/expire within hours and a stale session can break otherwise-working requests.
+YT_COOKIELESS_RETRY = os.getenv("YT_COOKIELESS_RETRY", "true").strip().lower() in ("1", "true", "yes")
+_cookieless_hint_logged = False
 
 # Real bot-check / rate-limit signals (this is what the old code *claimed*
 # it was seeing; the logs never contained any of these strings).
@@ -2103,7 +2114,20 @@ _RETRYABLE_MARKERS = _BOT_CHECK_MARKERS + (
     "requested format is not available",  # this client returned no usable formats
     "no video formats found",
     "http error 403",                     # googlevideo URL rejected (missing PO token)
+    "page needs to be reloaded",          # seen in prod: every candidate, every request
 )
+
+# Answers that are about THIS video, not about YouTube being unreachable.
+_DEFINITIVE_MARKERS = (
+    "private video", "video is private", "has been removed", "has been terminated",
+    "members-only", "members only", "not available in your country",
+    "blocked it in your country", "copyright",
+)
+
+
+def _is_definitive_youtube_answer(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in _DEFINITIVE_MARKERS)
 
 
 def _is_bot_check_error(exc: Exception) -> bool:
@@ -2181,7 +2205,7 @@ def _raise_ytdlp_failure(last_exc, saw_bot_check: bool = False):
             "message was seen, so this is probably not a plain IP block. Check in this order: "
             "(1) yt-dlp is current (pip install -U 'yt-dlp[default]'), (2) a JS runtime (deno or "
             "node) is installed, (3) a PO-token provider (bgutil-ytdlp-pot-provider), "
-            "(4) YT_PLAYER_CLIENTS, (5) a proxy. Run `yt-dlp -v -F <url>` on the server to see "
+            "(4) YOUTUBE_COOKIES may be stale/rotated, (5) YT_PLAYER_CLIENTS, (6) a proxy. Run `yt-dlp -v -F <url>` on the server to see "
             "which formats each client really returns."
         )
     raise RuntimeError(
@@ -2222,9 +2246,14 @@ def _yt_with_clients(key: str, outdir, configure, runner, *,
         except Exception as e:
             last_exc = e
             if not _is_retryable_youtube_error(e):
-                # a definitive answer (private / removed / age-gated ...):
-                # YouTube itself is reachable, so this is not an outage.
-                YOUTUBE_BREAKER.success()
+                if _is_definitive_youtube_answer(e):
+                    # a clear answer about THIS video (private / removed / geo-blocked):
+                    # YouTube itself is reachable, so this is not an outage.
+                    YOUTUBE_BREAKER.success()
+                else:
+                    # unrecognised error: neither proof of health nor of an outage.
+                    # Never call success() here - and make new error types visible.
+                    log.warning("YouTube unrecognised error (not retried): %s", _short(e))
                 raise
             saw_bot_check = saw_bot_check or _is_bot_check_error(e)
             first = player_clients[0]
@@ -2240,6 +2269,37 @@ def _yt_with_clients(key: str, outdir, configure, runner, *,
             _YT_CLIENT_FAILURE_COUNTS[first] = max(0, _YT_CLIENT_FAILURE_COUNTS[first] - 1)
         YOUTUBE_BREAKER.success()
         return result
+    if (
+        last_exc is not None and YT_COOKIELESS_RETRY and COOKIES_FILE
+        and (deadline is None or time.monotonic() <= deadline)
+    ):
+        global _cookieless_hint_logged
+        ydl_opts = _build_ydl_opts_base(outdir, clients[0])
+        ydl_opts.pop("cookiefile", None)
+        configure(ydl_opts)
+        if use_proxy:
+            proxy = _pick_youtube_proxy(0)
+            if proxy:
+                ydl_opts["proxy"] = proxy
+        try:
+            result = runner(ydl_opts)
+        except MediaTooLargeError:
+            YOUTUBE_BREAKER.success()
+            raise
+        except Exception as e:
+            last_exc = e
+            saw_bot_check = saw_bot_check or _is_bot_check_error(e)
+            log.warning("YouTube retry WITHOUT cookies failed too: %s", _short(e))
+        else:
+            if not _cookieless_hint_logged:
+                _cookieless_hint_logged = True
+                log.error(
+                    "YOUTUBE_COOKIES_HARMFUL: the request failed with cookies but worked WITHOUT them - "
+                    "YOUTUBE_COOKIES is stale/rotated. Export fresh cookies from a private window "
+                    "(and close it), or remove YOUTUBE_COOKIES."
+                )
+            YOUTUBE_BREAKER.success()
+            return result
     YOUTUBE_BREAKER.failure(key)
     _raise_ytdlp_failure(last_exc, saw_bot_check)
 
@@ -2294,6 +2354,11 @@ def _log_ytdlp_environment() -> None:
             "YTDLP_ENV: no JS runtime (deno/node) found. Current yt-dlp needs one to solve YouTube's "
             "JS challenges; without it most formats are missing and downloads fail with "
             "'Requested format is not available'. Install Deno (or Node >= 20)."
+        )
+    if not shutil.which("ffprobe"):
+        log.warning(
+            "YTDLP_ENV: ffprobe not found (imageio-ffmpeg ships only ffmpeg). yt-dlp logs 'Unable to "
+            "extract metadata' and audio post-processing is less reliable. Install the system ffmpeg package."
         )
     if not has_ejs:
         log.warning(
@@ -3673,6 +3738,11 @@ async def handle_text_search(message: Message):
     await status.edit_text(text, reply_markup=kb)
 
 
+# (user_id, track) pairs currently being downloaded. The logs showed two identical picks handled
+# within 1 s of each other (double tap), each running the full SoundCloud->YouTube chain.
+_INFLIGHT_PICKS: set = set()
+
+
 @router.callback_query(F.data.startswith("srch:"))
 async def cb_search_action(call: CallbackQuery):
     lang = await get_user_lang(call.from_user.id)
@@ -3720,6 +3790,10 @@ async def cb_search_action(call: CallbackQuery):
     entry = data["results"][real_idx]
 
     await _safe_cb_answer(call)
+    pick_key = (call.from_user.id, str(entry.get("url") or entry.get("id")))
+    if pick_key in _INFLIGHT_PICKS:
+        return  # duplicate tap: this exact track is already being downloaded for this user
+    _INFLIGHT_PICKS.add(pick_key)
     status = await call.message.answer(t(lang, "downloading"))
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
@@ -3777,6 +3851,7 @@ async def cb_search_action(call: CallbackQuery):
             except Exception:
                 pass
     finally:
+        _INFLIGHT_PICKS.discard(pick_key)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
