@@ -1,5 +1,6 @@
 [phases.setup]
 aptPkgs = ["ffmpeg"]
+nixPkgs = ["deno"]
 
 [start]
 cmd = "python main.py"
