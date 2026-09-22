@@ -1036,6 +1036,45 @@ async def upsert_user_export(record: dict) -> bool:
 # ============================================================
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
+
+
+_MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+_admin_alert_last: dict[str, float] = {}
+_ADMIN_ALERT_COOLDOWN = int(os.getenv("ADMIN_ALERT_COOLDOWN", "3600"))  # 1 hour per alert key
+
+
+async def _send_admin_alert_async(text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            log.warning("could not deliver admin alert to %s: %s", admin_id, _short(e))
+
+
+def notify_admins(key: str, text: str, cooldown: int | None = None) -> None:
+    """Fire-and-forget admin alert, safe to call from a worker THREAD (yt-dlp
+    runs in an executor) or from async code. Throttled per `key` so a burst
+    of identical failures (e.g. every Instagram request for an hour) sends
+    ONE Telegram message, not one per request. Silently does nothing if no
+    ADMIN_IDS are configured or the event loop isn't up yet (e.g. during
+    startup diagnostics) - the log line is always written by the caller too.
+    """
+    if not ADMIN_IDS:
+        return
+    now = time.time()
+    last = _admin_alert_last.get(key, 0.0)
+    if now - last < (cooldown if cooldown is not None else _ADMIN_ALERT_COOLDOWN):
+        return
+    _admin_alert_last[key] = now
+    if _MAIN_EVENT_LOOP is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_send_admin_alert_async(text), _MAIN_EVENT_LOOP)
+    except Exception as e:
+        log.warning("could not schedule admin alert: %s", e)
+
+
+
 router = Router()
 dp.include_router(router)
 
@@ -2057,6 +2096,14 @@ class _FailureBreaker:
                         len({k for _, k in self._fails}), self.window,
                         self.cooldown, self.probe_interval,
                     )
+                    notify_admins(
+                        f"{self.name}_circuit_open",
+                        f"🚨 {self.name.capitalize()} downloads muvaffaqiyatsiz bo'lyapti "
+                        f"({len(self._fails)} marta, {len({k for _, k in self._fails})} xil manba).\n"
+                        "Sabab ehtimol: JS runtime (deno/node) o'rnatilmagan, cookie eskirgan yoki IP bloklangan.\n"
+                        "Loglarda YTDLP_ENV va YOUTUBE_COOKIES_HARMFUL qatorlarini tekshiring.",
+                        cooldown=1800,
+                    )
                 self._open_until = now + self.cooldown
                 self._next_probe = now + self.probe_interval
 
@@ -2270,7 +2317,7 @@ def _yt_with_clients(key: str, outdir, configure, runner, *,
         YOUTUBE_BREAKER.success()
         return result
     if (
-        last_exc is not None and YT_COOKIELESS_RETRY and COOKIES_FILE
+        last_exc is not None and YT_COOKIELESS_RETRY and COOKIES_FILE and saw_bot_check
         and (deadline is None or time.monotonic() <= deadline)
     ):
         global _cookieless_hint_logged
@@ -2304,7 +2351,7 @@ def _yt_with_clients(key: str, outdir, configure, runner, *,
     _raise_ytdlp_failure(last_exc, saw_bot_check)
 
 
-def _build_ydl_opts_base(outdir, player_clients):
+def _build_ydl_opts_base(outdir, player_clients, cookies_file: str | None = "__default__"):
     """Shared yt-dlp options for all download functions.
 
     Only `player_client` is passed to the YouTube extractor. The old code also
@@ -2312,6 +2359,12 @@ def _build_ydl_opts_base(outdir, player_clients):
     webpage,configs,js` for android/tv clients; yt-dlp documents that
     skipping those requests "could cause some issues", and it also prevents
     the JS challenge solver from working.
+
+    `cookies_file`: which cookies.txt to attach, if any.
+      - omitted (the default) -> COOKIES_FILE (YouTube's), for YouTube callers
+      - an explicit path       -> that platform's own cookie file
+      - None                   -> no cookies at all (e.g. a deliberate
+        cookieless retry, or a platform that doesn't use cookies)
     """
     opts = {
         "quiet": True,
@@ -2328,7 +2381,9 @@ def _build_ydl_opts_base(outdir, player_clients):
     }
     if outdir:
         opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
-    cookie_copy = _private_cookie_copy(COOKIES_FILE, outdir)
+    if cookies_file == "__default__":
+        cookies_file = COOKIES_FILE
+    cookie_copy = _private_cookie_copy(cookies_file, outdir)
     if cookie_copy:
         opts["cookiefile"] = cookie_copy
     return opts
@@ -2591,23 +2646,26 @@ def _is_instagram_rate_limit_error(exc: Exception) -> bool:
 _instagram_empty_hint_last = 0.0
 
 
-def _note_instagram_empty_response(exc: Exception) -> None:
-    """Admin-facing hint, at most once per hour. `Expecting value: line 1 column 1`
-    means Instagram sent an EMPTY body. That can be stale cookies, but equally a
-    rate-limit, a login wall or a blocked datacenter IP - the old code told the
-    END USER to export fresh cookies, which they cannot do."""
-    global _instagram_empty_hint_last
-    msg = str(exc).lower()
-    if "failed to parse json" not in msg and "expecting value" not in msg:
+def _note_instagram_empty_response(exc: Exception, retried_without_cookies: bool) -> None:
+    """Instagram returned an EMPTY body (`Expecting value: line 1 column 1`).
+    That alone doesn't say WHY - stale cookies, a rate limit, a login wall or
+    an IP block all look identical - but if it happens even WITHOUT cookies
+    (either because there were none to begin with, or the cookieless retry
+    failed the same way), cookies are not the explanation and someone should
+    look at it. Logged always; a Telegram alert to ADMIN_IDS is throttled to
+    once per hour so a burst of identical failures doesn't spam the chat."""
+    if not retried_without_cookies:
+        log.warning("INSTAGRAM_EMPTY_RESPONSE (retrying without cookies next): %s", _short(exc, 200))
         return
-    now = time.time()
-    if now - _instagram_empty_hint_last < 3600:
-        return
-    _instagram_empty_hint_last = now
     log.error(
-        "INSTAGRAM_EMPTY_RESPONSE: Instagram returned an empty/non-JSON body. Possible causes: "
-        "stale INSTAGRAM_COOKIES, rate limit, login wall, or this datacenter IP being blocked "
-        "(try INSTAGRAM cookies from a fresh session and/or PROXY_URL)."
+        "INSTAGRAM_EMPTY_RESPONSE: empty/non-JSON body even WITHOUT cookies - not a stale-cookie "
+        "issue. Likely a rate limit, login wall, or this IP being blocked by Instagram."
+    )
+    notify_admins(
+        "instagram_empty_response",
+        "🚨 Instagram hamma so'rovda bo'sh javob qaytaryapti (cookie bilan HAM, cookiesiz HAM).\n"
+        "Ehtimol: IP bloklangan yoki rate-limit. Cookie yangilash yordam bermaydi.\n"
+        "Tavsiya: PROXY_URL sozlang yoki biroz kuting.",
     )
 
 
@@ -2647,44 +2705,70 @@ def _download_youtube(url: str, outdir: str, use_proxy: bool):
 def _download_tiktok(url: str, outdir: str):
     """TikTok: never proxied (its CDN blocks most proxy ranges harder than
     going direct), single attempt, no cookies needed for public videos."""
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
     ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     ydl_opts["merge_output_format"] = "mp4"
     return _execute_ytdlp_download(ydl_opts, url, outdir)
+
+
+def _is_empty_response_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "failed to parse json" in msg or "expecting value" in msg
 
 
 def _download_instagram(url: str, outdir: str, use_proxy: bool):
     """Instagram: optional login cookies (rate-limit/private-account errors
     otherwise), a photo-only-post image fallback, and an iOS-compatibility
     remux/re-encode pass since it frequently serves a single progressive
-    stream that Telegram-iOS can't always play directly."""
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
-    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    ydl_opts["merge_output_format"] = "mp4"
-    _ig_cookies = _private_cookie_copy(INSTAGRAM_COOKIES_FILE, outdir)
-    if _ig_cookies:
-        ydl_opts["cookiefile"] = _ig_cookies
-    if use_proxy and GENERAL_PROXY:
-        ydl_opts["proxy"] = GENERAL_PROXY
+    stream that Telegram-iOS can't always play directly.
+
+    On an "empty response" failure (Instagram returned no JSON body - the
+    single symptom shared by stale cookies, a rate limit and a login wall,
+    see _note_instagram_empty_response) this retries once WITHOUT cookies:
+    if cookies are the problem that alone fixes it; if not, both attempts
+    fail the same way and that is a much stronger signal to alert on than
+    either failure alone.
+    """
+
+    def attempt(cookies_file: str | None):
+        opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=cookies_file)
+        opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        opts["merge_output_format"] = "mp4"
+        if use_proxy and GENERAL_PROXY:
+            opts["proxy"] = GENERAL_PROXY
+        return _execute_ytdlp_download(opts, url, outdir)
+
     try:
-        filename, info = _execute_ytdlp_download(ydl_opts, url, outdir)
+        filename, info = attempt(INSTAGRAM_COOKIES_FILE)
     except Exception as e:
         if "no video formats found" in str(e).lower():
             result = _download_image_fallback(url, outdir, INSTAGRAM_COOKIES_FILE)
             if result:
                 return result
             raise
-        _note_instagram_empty_response(e)
-        if _is_instagram_rate_limit_error(e):
-            global _instagram_cookie_hint_logged
-            if not INSTAGRAM_COOKIES_FILE and not _instagram_cookie_hint_logged:
-                _instagram_cookie_hint_logged = True
-                log.error(
-                    "Instagram is rate-limiting/blocking this IP. Fix: export cookies from a "
-                    "logged-in Instagram account (browser extension, same way as YouTube) and "
-                    "set INSTAGRAM_COOKIES in Railway environment variables."
-                )
-        raise
+        if not _is_empty_response_error(e):
+            _handle_instagram_hard_failure(e)
+            raise
+        if not INSTAGRAM_COOKIES_FILE:
+            # no cookies configured - this WAS already the (only) cookieless
+            # attempt, so there is nothing left to escalate to.
+            _note_instagram_empty_response(e, retried_without_cookies=True)
+            raise
+        log.info("Instagram empty response with cookies, retrying without cookies: %s", url)
+        try:
+            filename, info = attempt(None)
+        except Exception as e2:
+            if not _is_empty_response_error(e2):
+                _handle_instagram_hard_failure(e2)
+                raise e2
+            _note_instagram_empty_response(e2, retried_without_cookies=True)
+            raise e2
+        else:
+            log.warning(
+                "INSTAGRAM_COOKIES_HARMFUL: this request failed WITH cookies but worked "
+                "WITHOUT them - INSTAGRAM_COOKIES is likely stale. Export fresh cookies from "
+                "a logged-in session, or remove INSTAGRAM_COOKIES."
+            )
 
     ext = os.path.splitext(filename)[1].lower()
     if SKIP_IOS_NORMALIZE:
@@ -2698,6 +2782,18 @@ def _download_instagram(url: str, outdir: str, use_proxy: bool):
         except Exception as e:
             log.warning("iOS normalize failed, sending original file instead: %s", e)
     return filename, info
+
+
+def _handle_instagram_hard_failure(exc: Exception) -> None:
+    """Errors other than the empty-response pattern (rate-limit wording,
+    login walls, etc.) - still worth one throttled admin alert."""
+    if _is_instagram_rate_limit_error(exc):
+        notify_admins(
+            "instagram_rate_limit",
+            "⚠️ Instagram: rate-limit/login-wall javoblari kelyapti.\n"
+            f"So'nggi xato: {_short(exc, 300)}\n"
+            "Cookie yangilash yoki PROXY_URL sozlash kerak bo'lishi mumkin.",
+        )
 
 
 def _download_pinterest(url: str, outdir: str, use_proxy: bool):
@@ -2732,7 +2828,7 @@ def _download_pinterest(url: str, outdir: str, use_proxy: bool):
     except Exception as e:
         log.info("PINTEREST_PROBE_FAILED: could not pre-classify pin type for %s (%s)", url, e)
 
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
     ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best[ext=jpg]/best[ext=png]/best"
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
@@ -2761,12 +2857,9 @@ def _download_facebook(url: str, outdir: str, use_proxy: bool):
     (datacenter IP) requests, so cookies matter a lot more here than for
     other platforms. Prefers a single progressive format since Facebook's
     extractor often doesn't expose separate video+audio streams to merge."""
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=FACEBOOK_COOKIES_FILE)
     ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
     ydl_opts["merge_output_format"] = "mp4"
-    _fb_cookies = _private_cookie_copy(FACEBOOK_COOKIES_FILE, outdir)
-    if _fb_cookies:
-        ydl_opts["cookiefile"] = _fb_cookies
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
     try:
@@ -2786,7 +2879,7 @@ def _download_snapchat(url: str, outdir: str, use_proxy: bool):
     """Snapchat: public stories/spotlights only, single progressive format,
     and a shorter socket timeout since a story that has expired tends to
     hang rather than fail fast otherwise."""
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
     ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
     ydl_opts["merge_output_format"] = "mp4"
     ydl_opts["socket_timeout"] = 20
@@ -2813,7 +2906,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
     if platform == "snapchat":
         return _download_snapchat(url, outdir, use_proxy)
     # Unknown/unlisted platform - best-effort generic attempt.
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"])
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
     ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
@@ -4035,6 +4128,9 @@ async def main():
         raise RuntimeError("BOT_TOKEN environment variable is not set!")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is not set!")
+
+    global _MAIN_EVENT_LOOP
+    _MAIN_EVENT_LOOP = asyncio.get_running_loop()
 
     await init_db()
 
