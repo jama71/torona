@@ -19,7 +19,7 @@ from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart, Command
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1115,6 +1115,18 @@ async def handle_dispatcher_errors(event) -> bool:
     if isinstance(exc, TelegramRetryAfter):
         log.warning("TELEGRAM_RATE_LIMITED: sleeping %.1fs as instructed by Telegram", exc.retry_after)
         await asyncio.sleep(exc.retry_after)
+        return True
+    if isinstance(exc, TelegramForbiddenError):
+        # The person blocked the bot or deleted the chat - happens routinely
+        # and isn't actionable, so a short line is enough; the full
+        # traceback here would just bury real errors in the logs.
+        log.info("update dropped: bot was blocked by the user")
+        return True
+    if isinstance(exc, TelegramNetworkError):
+        # Transient Telegram/network hiccup (the request itself already
+        # timed out inside aiogram's own retry logic) - worth knowing about
+        # if it's frequent, but not a bug in this bot, so no full traceback.
+        log.warning("update dropped: Telegram network error (%s)", exc)
         return True
     log.exception("Unhandled exception while processing an update: %s", exc)
     return True
@@ -3887,9 +3899,14 @@ async def cb_search_action(call: CallbackQuery):
     if pick_key in _INFLIGHT_PICKS:
         return  # duplicate tap: this exact track is already being downloaded for this user
     _INFLIGHT_PICKS.add(pick_key)
-    status = await call.message.answer(t(lang, "downloading"))
+    # status/work_dir moved inside the try (below): they used to sit BEFORE it,
+    # so if the person had blocked the bot (or Telegram briefly timed out) right
+    # here, the exception skipped the finally entirely and pick_key was stuck
+    # in _INFLIGHT_PICKS forever - silently ignoring that exact track for that
+    # user on every future attempt, even after they unblocked the bot.
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_ROOT)
     try:
+        status = await call.message.answer(t(lang, "downloading"))
         source = entry.get("source", "soundcloud")
         title = entry.get("title") or "Unknown"
         performer = entry.get("uploader") or ""
@@ -3922,6 +3939,14 @@ async def cb_search_action(call: CallbackQuery):
             await status.delete()
         except Exception:
             pass
+    except TelegramForbiddenError:
+        # The person blocked the bot (or deleted the chat) sometime between
+        # tapping the result and now - there's nowhere left to deliver
+        # anything. Ordinary and frequent, not a bug: log it briefly instead
+        # of the full traceback the outer dispatcher error handler would
+        # otherwise print, and let `finally` below release pick_key so the
+        # same track isn't silently ignored forever if they unblock later.
+        log.info("song pick abandoned: user blocked the bot")
     except MediaTooLargeError as e:
         log.info("song too long/large (text search): %s", e)
         try:
