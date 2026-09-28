@@ -107,9 +107,12 @@ GENERAL_PROXY = os.getenv("PROXY_URL", "").strip() or None
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
 YOUTUBE_PROXY_LIST = [p.strip() for p in os.getenv("YOUTUBE_PROXY_LIST", "").split(",") if p.strip()]
 
-# Song search (text search + Shazam recognition) uses SoundCloud first, then
-# YouTube (guarded by a circuit breaker, see YOUTUBE_BREAKER) and finally VK
-# Music, but only if VK credentials are configured.
+# Song search (text search + Shazam recognition) uses YouTube first (guarded
+# by a circuit breaker, see YOUTUBE_BREAKER, so a future YouTube outage still
+# fails fast instead of stalling every search), then SoundCloud, then finally
+# VK Music if credentials are configured. Only the audio stream is ever
+# downloaded from YouTube (not the video track), so this is not slower or
+# heavier than the old SoundCloud-first order.
 SOUNDCLOUD_COOKIES_FILE = os.getenv("SOUNDCLOUD_COOKIES_FILE", "").strip() or None
 VK_LOGIN = os.getenv("VK_LOGIN", "").strip()
 VK_PASSWORD = os.getenv("VK_PASSWORD", "").strip()
@@ -2705,7 +2708,14 @@ def _download_youtube(url: str, outdir: str, use_proxy: bool):
     top via YOUTUBE_PROXY / YOUTUBE_PROXY_LIST if configured."""
 
     def configure(ydl_opts: dict) -> None:
-        ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        # Prefer H.264 (avc1) explicitly. `[ext=mp4]` only restricts the
+        # container: YouTube also serves AV1 inside mp4, which many phones /
+        # Telegram players can't decode - the result is a BLACK picture with
+        # working sound. Fallbacks keep the old behaviour if no H.264 exists.
+        ydl_opts["format"] = (
+            "bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]/"
+            "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
+        )
         ydl_opts["merge_output_format"] = "mp4"
 
     def runner(ydl_opts: dict):
@@ -3316,24 +3326,33 @@ def _vk_configured() -> bool:
 
 
 async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
-    """Search order: SoundCloud -> YouTube -> VK Music (VK only when
-    configured). Raises RuntimeError if everything fails."""
+    """Search order: YouTube -> SoundCloud -> VK Music (VK only when
+    configured). YouTube first because, once a JS runtime (Deno) and
+    yt-dlp-ejs are installed and cookies are valid, it resolves almost
+    everything and gives the most reliable/highest-quality match; the
+    circuit breaker (YOUTUBE_BREAKER) still makes this fail FAST during any
+    future YouTube outage instead of stalling every search. Only the audio
+    stream is downloaded (bestaudio, not the video track) and extracted to
+    mp3 - the end result the user gets is identical to downloading the full
+    video and stripping the picture, but without wasting bandwidth/time on
+    a video stream nobody asked for. Raises RuntimeError if everything fails.
+    """
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
-    if result:
-        return result
-    log.info("SoundCloud had no usable result for '%s' - trying YouTube", query)
     result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
     if result:
         return result
+    log.info("YouTube had no usable result for '%s' - trying SoundCloud", query)
+    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
+    if result:
+        return result
     if _vk_configured():
-        log.info("YouTube had no usable result for '%s' - trying VK Music", query)
+        log.info("SoundCloud had no usable result for '%s' - trying VK Music", query)
         result = await vk_search_and_download(query, outdir)
         if result:
             return result
     else:
-        log.info("YouTube had no usable result for '%s' (VK not configured)", query)
-    raise RuntimeError(f"'{query}' uchun SoundCloud, YouTube yoki VK Music'da hech narsa topilmadi")
+        log.info("SoundCloud had no usable result for '%s' (VK not configured)", query)
+    raise RuntimeError(f"'{query}' uchun YouTube, SoundCloud yoki VK Music'da hech narsa topilmadi")
 
 
 def format_duration(seconds) -> str:
@@ -3431,6 +3450,12 @@ def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
     entries = [e for e in ((info or {}).get("entries") or []) if e]
     results = []
     for e in entries:
+        # YouTube is now the PRIMARY song source, so keep hour-long mixes and
+        # live streams out of the list the user picks from: they would only
+        # be rejected at download time (MAX_TRACK_SECONDS / is_live).
+        dur = e.get("duration")
+        if (dur and dur > MAX_TRACK_SECONDS) or e.get("live_status") in ("is_live", "is_upcoming"):
+            continue
         vid = e.get("id")
         results.append(
             {
@@ -3447,14 +3472,15 @@ def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
 
 
 async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
-    """Search order: SoundCloud -> YouTube -> VK Music."""
+    """Search order: YouTube -> SoundCloud -> VK Music (matches
+    search_and_download_song's order - see its docstring)."""
     loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
+    results = await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
     if not results:
-        log.info("SoundCloud list search empty for '%s' - trying YouTube", query)
-        results = await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
+        log.info("YouTube list search empty for '%s' - trying SoundCloud", query)
+        results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
     if not results:
-        log.info("YouTube list search empty for '%s' - trying VK Music", query)
+        log.info("SoundCloud list search empty for '%s' - trying VK Music", query)
         results = await _vk_list_search(query, limit)
     return results
 
