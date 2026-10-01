@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import importlib.util
 import io
 import logging
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -58,6 +60,14 @@ except ImportError:
 # enough - we create a symlink (or copy) literally called "ffmpeg" in a
 # directory we control and put THAT directory on PATH.
 # ------------------------------------------------------------
+# Captured BEFORE the imageio-ffmpeg dir is prepended to PATH below, so this
+# is the host's OWN ffmpeg (apt/nix-installed), never our bundled symlink.
+# Some statically-linked imageio-ffmpeg builds (seen: 7.0.2) segfault when
+# demuxing raw MPEG-TS (used by _download_hls_to_mp4 for Pinterest HLS pins);
+# the system ffmpeg doesn't have that problem, so that one path prefers it
+# when available and only falls back to the bundled binary otherwise.
+SYSTEM_FFMPEG_PATH = shutil.which("ffmpeg")
+
 try:
     import imageio_ffmpeg
 
@@ -413,7 +423,7 @@ PLATFORM_PATTERNS = {
     "instagram": re.compile(r"instagram\.com"),
     "youtube": re.compile(r"(youtube\.com|youtu\.be)"),
     "tiktok": re.compile(r"tiktok\.com"),
-    "pinterest": re.compile(r"(pinterest\.com|pin\.it)"),
+    "pinterest": re.compile(r"(pinterest\.[a-z]{2,}(?:\.[a-z]{2,})?/|pin\.it/)"),
     "snapchat": re.compile(r"(snapchat\.com|snap\.com)"),
     "facebook": re.compile(r"(facebook\.com|fb\.watch)"),
 }
@@ -549,7 +559,7 @@ TEXTS = {
         "err_media_too_large": "⚠️ Fayl juda katta yoki uzun (Telegram bot limiti ~50 MB, treklar uchun ~20 daqiqa). Boshqa variantni tanlang.",
         "err_file_too_big_input": "⚠️ Yuborilgan fayl juda katta (bot 20 MB gacha fayllarni o'qiy oladi). Qisqaroq video yuboring.",
         "err_busy": "⏳ Bot hozir band (band xotira), birozdan keyin qayta urinib ko'ring.",
-        "err_pinterest_video": "🎬 Bu Pinterest videosini hozircha yuklab bo'lmadi.",
+        "err_pinterest_video": "📌 Bu Pinterest postini (rasm/video/GIF) hozircha yuklab bo'lmadi. Post o'chirilgan yoki yopiq bo'lishi mumkin.",
         "err_facebook_parse": "❌ Bu Facebook video'sini yuklab bo'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.",
         "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
         "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
@@ -650,7 +660,7 @@ TEXTS = {
         "err_media_too_large": "⚠️ Файл слишком большой или длинный (лимит бота Telegram ~50 МБ, для треков ~20 минут). Выберите другой вариант.",
         "err_file_too_big_input": "⚠️ Присланный файл слишком большой (бот читает файлы до 20 МБ). Отправьте видео покороче.",
         "err_busy": "⏳ Бот сейчас перегружен, попробуйте ещё раз через некоторое время.",
-        "err_pinterest_video": "🎬 Это видео с Pinterest сейчас не удалось скачать.",
+        "err_pinterest_video": "📌 Не удалось скачать этот пин Pinterest (фото/видео/GIF). Возможно, он удалён или закрыт.",
         "err_facebook_parse": "❌ Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.",
         "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
         "error": "❌ Произошла ошибка, попробуйте ещё раз.",
@@ -749,7 +759,7 @@ TEXTS = {
         "err_media_too_large": "⚠️ The file is too big or too long (Telegram bot limit is ~50 MB, ~20 min for tracks). Please pick another option.",
         "err_file_too_big_input": "⚠️ The file you sent is too large (the bot can read files up to 20 MB). Please send a shorter video.",
         "err_busy": "⏳ The bot is under heavy load right now, please try again in a bit.",
-        "err_pinterest_video": "🎬 This Pinterest video couldn't be downloaded right now.",
+        "err_pinterest_video": "📌 This Pinterest pin (image/video/GIF) couldn't be downloaded right now. It may have been removed or be private.",
         "err_facebook_parse": "❌ This Facebook video couldn't be downloaded, it may be private or restricted.",
         "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
         "error": "❌ Something went wrong, please try again.",
@@ -2171,19 +2181,23 @@ _BOT_CHECK_MARKERS = (
 _RETRYABLE_MARKERS = _BOT_CHECK_MARKERS + (
     "cookies",                            # "use --cookies-from-browser"
     "error code: 152",                    # embedded-player rejection
-    "video unavailable",
-    "video is unavailable",
     "requested format is not available",  # this client returned no usable formats
     "no video formats found",
     "http error 403",                     # googlevideo URL rejected (missing PO token)
     "page needs to be reloaded",          # seen in prod: every candidate, every request
 )
 
-# Answers that are about THIS video, not about YouTube being unreachable.
+# Answers that are about THIS video, not about YouTube being unreachable - no
+# point burning the other 2 player_client attempts on these. "video
+# unavailable" moved here from _RETRYABLE_MARKERS after production logs
+# showed it NEVER resolved by switching clients (always ended up exhausting
+# all 3 anyway) - unlike "requested format is not available" or "page needs
+# to be reloaded", which genuinely differ per client.
 _DEFINITIVE_MARKERS = (
     "private video", "video is private", "has been removed", "has been terminated",
     "members-only", "members only", "not available in your country",
     "blocked it in your country", "copyright",
+    "video unavailable", "video is unavailable",
 )
 
 
@@ -2487,15 +2501,19 @@ def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
         return None
     img_url = m.group(1).replace("&amp;", "&")
 
-    try:
-        req = urllib.request.Request(img_url, headers={"User-Agent": DEFAULT_UA})
-        filepath = os.path.join(outdir, f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg")
-        with urllib.request.urlopen(req, timeout=30) as resp, open(filepath, "wb") as f:
-            f.write(resp.read())
-    except Exception as e:
-        log.warning("og:image scrape failed to download image %s: %s", img_url, e)
-        return None
-    return filepath, {"id": filename_prefix, "title": filename_prefix, "ext": "jpg"}
+    last_err = None
+    for cand in _pinimg_candidates(img_url):  # Pinterest: /originals/ first, given size as fallback
+        try:
+            ext = os.path.splitext(urllib.parse.urlparse(cand).path)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                ext = ".jpg"
+            filepath = os.path.join(outdir, f"{filename_prefix}_{uuid.uuid4().hex[:8]}{ext}")
+            _http_download(cand, filepath, None, max_bytes=40 * 1024 * 1024)
+            return filepath, {"id": filename_prefix, "title": filename_prefix, "ext": ext.lstrip(".")}
+        except Exception as e:
+            last_err = e
+    log.warning("og:image scrape failed to download image %s: %s", img_url, last_err)
+    return None
 
 
 def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = None):
@@ -2600,7 +2618,7 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
         if not is_already_compatible:
             log.info("skipping re-encode for %.1fMB non-H264 file (OOM risk) - remuxing only", size_mb)
         cmd = [
-            FFMPEG_PATH, "-y", "-i", input_path,
+            FFMPEG_PATH, "-y", "-nostats", "-i", input_path,
             "-c", "copy",
             "-movflags", "+faststart",
             output_path,
@@ -2608,8 +2626,11 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
     else:
         # Slow path: the codec itself isn't iOS-safe, a real re-encode is
         # unavoidable - but keep quality high since this is now the rare case.
+        # Gated by its own semaphore (see REENCODE_SLOTS): this is the one
+        # step that actually risks an OOM kill, so only one of these runs at
+        # a time even if HEAVY_JOB_SLOTS allows two downloads concurrently.
         cmd = [
-            FFMPEG_PATH, "-y", "-i", input_path,
+            FFMPEG_PATH, "-y", "-nostats", "-i", input_path,
             # only cap truly oversized video, never touch normal Reels/Stories res
             "-vf", "scale='min(1920,iw)':'-2'",
             "-c:v", "libx264",
@@ -2624,10 +2645,17 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
             output_path,
         ]
 
+    needs_reencode_slot = not (is_already_compatible or size_mb > MAX_REENCODE_MB)  # the slow path only
+    if needs_reencode_slot:
+        _REENCODE_SEMAPHORE.acquire()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
+    finally:
+        if needs_reencode_slot:
+            _REENCODE_SEMAPHORE.release()
     stderr = proc.stderr or ""
     if proc.returncode != 0 or not os.path.exists(output_path):
         killed = " (likely OOM-killed by the host - out of memory)" if proc.returncode == -9 else ""
@@ -2645,6 +2673,9 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
 
 
 _instagram_cookie_hint_logged = False
+
+REENCODE_SLOTS = int(os.getenv("REENCODE_SLOTS", "1"))
+_REENCODE_SEMAPHORE = threading.Semaphore(REENCODE_SLOTS)
 
 
 def _is_instagram_rate_limit_error(exc: Exception) -> bool:
@@ -2818,60 +2849,462 @@ def _handle_instagram_hard_failure(exc: Exception) -> None:
         )
 
 
-def _download_pinterest(url: str, outdir: str, use_proxy: bool):
-    """Pinterest: pins can be a video OR a plain image. A lightweight probe
-    (metadata only, no download) first checks whether this pin actually has
-    a real video stream:
-      - image pin (no video formats) -> og:image scrape fallback is fine,
-        that IS the content.
-      - video pin whose format genuinely can't be fetched -> fallback is
-        NOT used, since silently handing back a single static thumbnail
-        frame when the user asked for a video would be misleading. A clear
-        "couldn't download this video" error is raised instead.
-      - probe itself failed (type unknown) -> same as video pin, err on
-        the side of not silently substituting a static image.
-    """
-    probe_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "http_headers": {"User-Agent": DEFAULT_UA},
-    }
-    if use_proxy and GENERAL_PROXY:
-        probe_opts["proxy"] = GENERAL_PROXY
-    is_video_pin = None  # None = couldn't determine
-    try:
-        with _YDL(probe_opts) as ydl:
-            probe_info = ydl.extract_info(url, download=False)
-        if "entries" in probe_info:
-            probe_info = probe_info["entries"][0]
-        formats = probe_info.get("formats") or []
-        is_video_pin = any(f.get("vcodec") not in (None, "none") for f in formats)
-    except Exception as e:
-        log.info("PINTEREST_PROBE_FAILED: could not pre-classify pin type for %s (%s)", url, e)
+# ============================================================
+# PINTEREST
+#
+# Pinterest has three kinds of pin and yt-dlp only understands one of them:
+#   video  -> yt-dlp works
+#   image  -> yt-dlp raises "No video formats found!" (prod log: pin.it/4UN5zHWt5,
+#             which the old code then reported as "video could not be downloaded")
+#   GIF    -> not handled at all (a .gif went to send_video)
+# So this reads the pin page itself, decides image / video / GIF from the pin's
+# own data, and downloads exactly that. yt-dlp stays as the fallback.
+# ============================================================
+PINTEREST_MAX_BYTES = 60 * 1024 * 1024
+TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024  # sendPhoto limit; bigger goes as a document
+_PIN_ID_RE = re.compile(r"/pin/(?:[^/?#]*?--)?(\d{6,})")
+_PIN_HEADERS = {
+    "User-Agent": DEFAULT_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_PIN_MEDIA_HEADERS = {"User-Agent": DEFAULT_UA, "Referer": "https://www.pinterest.com/"}
+_PIN_EXT_BY_CTYPE = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "video/mp4": ".mp4",
+}
+_PIN_KNOWN_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"}
 
+
+def _http_open(url: str, proxy: str | None = None, timeout: int = 20, headers: dict | None = None):
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    return opener.open(urllib.request.Request(url, headers=headers or _PIN_HEADERS), timeout=timeout)
+
+
+def _http_get_text(url: str, proxy: str | None = None, timeout: int = 20) -> tuple[str, str]:
+    """GET a page, following redirects (pin.it short links). Returns (final_url, text)."""
+    with _http_open(url, proxy, timeout) as resp:
+        raw = resp.read(8 * 1024 * 1024)
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.geturl(), raw.decode(charset, errors="ignore")
+
+
+def _http_download(url: str, dest: str, proxy: str | None = None,
+                   max_bytes: int = PINTEREST_MAX_BYTES, timeout: int = 30) -> str:
+    """Stream `url` into `dest` with a hard size cap. Returns the content type."""
+    with _http_open(url, proxy, timeout, headers=_PIN_MEDIA_HEADERS) as resp:
+        ctype = resp.headers.get_content_type() or ""
+        length = resp.headers.get("Content-Length")
+        if length and length.isdigit() and int(length) > max_bytes:
+            raise MediaTooLargeError(f"media is {int(length) / 1048576:.0f} MB")
+        total = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise MediaTooLargeError(f"media is larger than {max_bytes // 1048576} MB")
+                f.write(chunk)
+    if total == 0:
+        raise RuntimeError("empty download")
+    if ctype.startswith("text/"):
+        raise RuntimeError(f"got {ctype} instead of media")
+    return ctype
+
+
+def _pinterest_pin_id(text: str) -> str | None:
+    m = _PIN_ID_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def _pin_walk(obj):
+    """Yield every dict inside a JSON structure (iterative, no recursion limit)."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+def _pinterest_json_blobs(page: str) -> list:
+    blobs = []
+    for m in re.finditer(
+        r'<script[^>]*type=["\']application/(?:ld\+)?json["\'][^>]*>(.*?)</script>', page, re.S | re.I
+    ):
+        try:
+            blobs.append(json.loads(m.group(1)))
+        except Exception:
+            continue
+    return blobs
+
+
+def _pinterest_find_pin_node(blobs: list, pin_id: str) -> dict | None:
+    """The page JSON also carries dozens of RELATED pins. Only the node whose
+    own id equals this pin's id may be used, otherwise a related pin's video
+    could be delivered instead of the one that was asked for."""
+    best = None
+    keys = ("images", "videos", "story_pin_data", "carousel_data")
+    for blob in blobs:
+        for d in _pin_walk(blob):
+            if str(d.get("id")) == pin_id and any(k in d for k in keys):
+                score = sum(1 for k in keys if d.get(k))
+                if best is None or score > best[0]:
+                    best = (score, d)
+    return best[1] if best else None
+
+
+def _pin_url_path(u: str) -> str:
+    return urllib.parse.urlparse(u).path.lower()
+
+
+def _pinimg_candidates(url: str) -> list[str]:
+    """i.pinimg.com serves the same picture at many sizes; /originals/ is the
+    full-resolution one. Try it first, keep the given URL as the fallback
+    (the original may have a different extension and 404)."""
+    out = []
+    if "i.pinimg.com" in url:
+        out.append(re.sub(r"(i\.pinimg\.com)/(?:\d+x\d*(?:_\w+)?|originals)/", r"\1/originals/", url, count=1))
+    out.append(url)
+    return list(dict.fromkeys(out))
+
+
+def _pinterest_media_from_node(node: dict) -> dict | None:
+    """Decide image / video / gif from one pin's own data."""
+    images = node.get("images") if isinstance(node.get("images"), dict) else {}
+    orig = images.get("orig") if isinstance(images.get("orig"), dict) else {}
+    orig_url = orig.get("url") if isinstance(orig.get("url"), str) else None
+
+    # GIF: Pinterest keeps the animated original as .gif (it may ALSO expose an
+    # mp4 conversion under `videos`, so this check has to come before video).
+    if orig_url and _pin_url_path(orig_url).endswith(".gif"):
+        return {"kind": "gif", "urls": [orig_url]}
+
+    vlist = None
+    videos = node.get("videos")
+    if isinstance(videos, dict) and isinstance(videos.get("video_list"), dict):
+        vlist = videos["video_list"]
+    if not vlist:  # idea / story pins keep video_list nested inside pages/blocks
+        for d in _pin_walk(node):
+            if isinstance(d.get("video_list"), dict) and d["video_list"]:
+                vlist = d["video_list"]
+                break
+    if vlist:
+        mp4, hls = [], []
+        for v in vlist.values():
+            if not isinstance(v, dict) or not isinstance(v.get("url"), str):
+                continue
+            path = _pin_url_path(v["url"])
+            size = (v.get("height") or 0) * (v.get("width") or 0)
+            if path.endswith(".mp4"):
+                mp4.append((size, v["url"]))
+            elif path.endswith(".m3u8"):
+                hls.append((size, v["url"]))
+        mp4.sort(reverse=True)
+        hls.sort(reverse=True)
+        urls = [u for _, u in mp4] + [u for _, u in hls]
+        if urls:
+            return {"kind": "video", "urls": urls}
+
+    picked = orig_url
+    if not picked:
+        sized = [v for v in images.values() if isinstance(v, dict) and isinstance(v.get("url"), str)]
+        if sized:
+            picked = max(sized, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))["url"]
+    if not picked:  # carousel: first slide's image
+        for d in _pin_walk(node.get("carousel_data") or {}):
+            o = d.get("orig")
+            if isinstance(o, dict) and isinstance(o.get("url"), str):
+                picked = o["url"]
+                break
+    if picked:
+        if _pin_url_path(picked).endswith(".gif"):
+            return {"kind": "gif", "urls": [picked]}
+        return {"kind": "image", "urls": _pinimg_candidates(picked)}
+    return None
+
+
+def _pinterest_media_from_meta(page: str, blobs: list) -> dict | None:
+    """Fallback when the pin's JSON couldn't be located: og:/twitter: meta tags
+    and JSON-LD always describe the MAIN pin."""
+    metas: dict[str, str] = {}
+    for tag in re.findall(r"<meta\b[^>]*>", page, re.I):
+        key = re.search(r'(?:property|name)\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        val = re.search(r'content\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        if key and val:
+            metas.setdefault(key.group(1).lower(), _html.unescape(val.group(1)))
+
+    video_urls = [
+        metas[k] for k in ("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream")
+        if metas.get(k)
+    ]
+    for blob in blobs:
+        for d in _pin_walk(blob):
+            if d.get("@type") == "VideoObject" and isinstance(d.get("contentUrl"), str):
+                video_urls.append(d["contentUrl"])
+    mp4 = [u for u in video_urls if _pin_url_path(u).endswith(".mp4")]
+    hls = [u for u in video_urls if _pin_url_path(u).endswith(".m3u8")]
+    gif = [u for u in video_urls if _pin_url_path(u).endswith(".gif")]
+    if gif:
+        return {"kind": "gif", "urls": gif[:1]}
+    if mp4 or hls:
+        return {"kind": "video", "urls": list(dict.fromkeys(mp4 + hls))}
+
+    img = metas.get("og:image") or metas.get("twitter:image:src") or metas.get("twitter:image")
+    if not img:
+        return None
+    if _pin_url_path(img).endswith(".gif"):
+        return {"kind": "gif", "urls": [img]}
+    # A video pin whose video URL we could not find must NOT be answered with
+    # its thumbnail - leave that decision to the yt-dlp fallback.
+    if "video_list" in page or metas.get("og:type", "").lower().startswith("video"):
+        return None
+    return {"kind": "image", "urls": _pinimg_candidates(img)}
+
+
+def _pinterest_extract(url: str, proxy: str | None) -> tuple[str | None, dict | None, str]:
+    """Returns (pin_id, media, source). `media` is {"kind", "urls"} or None."""
+    final_url, page = _http_get_text(url, proxy)
+    pin_id = _pinterest_pin_id(final_url) or _pinterest_pin_id(url)
+    if not pin_id:
+        canon = re.search(r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+)', page, re.I)
+        pin_id = _pinterest_pin_id(canon.group(1)) if canon else None
+    blobs = _pinterest_json_blobs(page)
+    if pin_id:
+        node = _pinterest_find_pin_node(blobs, pin_id)
+        if node:
+            media = _pinterest_media_from_node(node)
+            if media:
+                return pin_id, media, "page-json"
+    media = _pinterest_media_from_meta(page, blobs)
+    if media:
+        return pin_id, media, "meta"
+    if pin_id:  # last data source: Pinterest's public widget endpoint
+        try:
+            _, txt = _http_get_text(
+                f"https://widgets.pinterest.com/v3/pidgets/pins/info/?pin_ids={pin_id}", proxy
+            )
+            node = _pinterest_find_pin_node([json.loads(txt)], pin_id)
+            media = _pinterest_media_from_node(node) if node else None
+            if media:
+                return pin_id, media, "widget-api"
+        except Exception as e:
+            log.info("PINTEREST_WIDGET_API_FAILED pin=%s: %s", pin_id, _short(e))
+    return pin_id, None, "none"
+
+
+def _probe_media_dims(path: str) -> tuple[int, int, int]:
+    """(width, height, duration_seconds) from ffmpeg's own banner (no ffprobe needed)."""
+    try:
+        proc = subprocess.run([FFMPEG_PATH, "-i", path], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return 0, 0, 0
+    err = proc.stderr or ""
+    w = h = dur = 0
+    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", err)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+    if m:
+        dur = int(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)))
+    return w, h, dur
+
+
+def _download_hls_to_mp4(m3u8_url: str, dest: str, proxy: str | None = None,
+                         max_bytes: int = PINTEREST_MAX_BYTES, deadline_seconds: int = 120) -> None:
+    """HLS-only pins. The playlist is parsed and its segments are downloaded and
+    joined here (MPEG-TS segments simply concatenate), then ffmpeg only does a
+    plain stream-copy remux of that ONE file. ffmpeg's own HLS demuxer is
+    deliberately not used: a static ffmpeg build was seen to segfault in it."""
+    started = time.monotonic()
+    base_url = m3u8_url
+    text = _http_get_text(base_url, proxy)[1]
+    if "#EXT-X-STREAM-INF" in text:  # master playlist -> the highest-bandwidth variant
+        best_bw, best_uri, pending_bw = -1, None, 0
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", line)
+                pending_bw = int(m.group(1)) if m else 0
+            elif line and not line.startswith("#"):
+                if pending_bw >= best_bw:
+                    best_bw, best_uri = pending_bw, line
+                pending_bw = 0
+        if not best_uri:
+            raise RuntimeError("HLS master playlist without variants")
+        base_url = urllib.parse.urljoin(base_url, best_uri)
+        text = _http_get_text(base_url, proxy)[1]
+
+    init_uri = None
+    segments = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-KEY") and "METHOD=NONE" not in line:
+            raise RuntimeError("encrypted HLS stream is not supported")
+        if line.startswith("#EXT-X-MAP"):
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                init_uri = urllib.parse.urljoin(base_url, m.group(1))
+        elif line and not line.startswith("#"):
+            segments.append(urllib.parse.urljoin(base_url, line))
+    if not segments:
+        raise RuntimeError("HLS playlist has no segments")
+    if len(segments) > 2000:
+        raise MediaTooLargeError("HLS stream has too many segments")
+
+    raw = dest + ".hls"
+    total = 0
+    try:
+        with open(raw, "wb") as out:
+            for seg_url in ([init_uri] if init_uri else []) + segments:
+                if time.monotonic() - started > deadline_seconds:
+                    raise RuntimeError("HLS download took too long")
+                with _http_open(seg_url, proxy, 30, headers=_PIN_MEDIA_HEADERS) as resp:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise MediaTooLargeError(f"media is larger than {max_bytes // 1048576} MB")
+                        out.write(chunk)
+        if total == 0:
+            raise RuntimeError("HLS segments were empty")
+        # Prefer the system ffmpeg for this specific remux - see
+        # SYSTEM_FFMPEG_PATH's docstring (the bundled binary can segfault on
+        # raw MPEG-TS input). Falls back to the bundled one if there is no
+        # system ffmpeg; if THAT also fails, the pin is reported unavailable
+        # rather than crashing anything.
+        for exe in ([SYSTEM_FFMPEG_PATH] if SYSTEM_FFMPEG_PATH else []) + [FFMPEG_PATH]:
+            proc = subprocess.run(
+                [exe, "-y", "-i", raw, "-c", "copy", "-movflags", "+faststart", dest],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0:
+                break
+        else:
+            raise RuntimeError(f"ffmpeg remux failed (code {proc.returncode}): {(proc.stderr or '')[-300:]}")
+    finally:
+        try:
+            os.remove(raw)
+        except OSError:
+            pass
+
+
+def _pinterest_fetch_media(media: dict, pin_id: str | None, outdir: str, proxy: str | None):
+    """Download the first working URL of `media`. Returns (filepath, info)."""
+    kind = media["kind"]
+    base = f"pin_{pin_id or uuid.uuid4().hex[:8]}"
+    last_exc: Exception | None = None
+    too_large: Exception | None = None
+    for u in media["urls"]:
+        try:
+            if _pin_url_path(u).endswith(".m3u8"):
+                path = os.path.join(outdir, base + ".mp4")
+                _download_hls_to_mp4(u, path, proxy)
+            else:
+                ext = os.path.splitext(_pin_url_path(u))[1]
+                path = os.path.join(outdir, base + (ext if ext in _PIN_KNOWN_EXTS else ".bin"))
+                ctype = _http_download(u, path, proxy)
+                if ext not in _PIN_KNOWN_EXTS:
+                    real = _PIN_EXT_BY_CTYPE.get(ctype)
+                    if not real:
+                        raise RuntimeError(f"unknown media type {ctype!r}")
+                    os.replace(path, os.path.join(outdir, base + real))
+                    path = os.path.join(outdir, base + real)
+        except MediaTooLargeError as e:
+            too_large = e  # a smaller rendition further down the list may still fit
+            continue
+        except Exception as e:
+            last_exc = e
+            log.info("PINTEREST_URL_FAILED kind=%s url=%s: %s", kind, u[:120], _short(e))
+            continue
+
+        info = {"id": pin_id or base, "title": "pinterest", "_media_kind": kind,
+                "ext": os.path.splitext(path)[1].lstrip(".")}
+        if kind == "video":
+            width = height = duration = 0
+            if not SKIP_IOS_NORMALIZE:
+                try:  # near-free remux for H.264: faststart + reliable width/height
+                    norm, width, height, duration = _ffmpeg_normalize_for_ios(path, outdir)
+                    os.remove(path)
+                    path = norm
+                except Exception as e:
+                    log.warning("Pinterest video normalize failed, sending as downloaded: %s", _short(e))
+            if not (width and height):
+                width, height, duration = _probe_media_dims(path)
+            info.update(width=width, height=height, duration=duration)
+        return path, info
+    if too_large and not last_exc:
+        raise too_large
+    raise last_exc or RuntimeError("no downloadable URL for this pin")
+
+
+def _pinterest_ytdlp(url: str, outdir: str, use_proxy: bool):
     ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
-    ydl_opts["format"] = "best[ext=mp4]/best[ext=webm]/best[ext=jpg]/best[ext=png]/best"
+    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
+    filename, info = _execute_ytdlp_download(ydl_opts, url, outdir)
+    info["_media_kind"] = "video"
+    return filename, info
+
+
+def _download_pinterest(url: str, outdir: str, use_proxy: bool):
+    """Pinterest, in order:
+      1. read the pin page ourselves -> exact kind (image / video / GIF) and URL
+      2. yt-dlp (videos), if 1 found nothing or its download failed
+      3. og:image, ONLY when yt-dlp says "No video formats found" and step 1 did
+         not positively identify a video (that message is what image pins
+         produce; a real video pin is never answered with its thumbnail).
+    """
+    proxy = GENERAL_PROXY if use_proxy else None
+    pin_id = media = None
+    source = "none"
     try:
-        return _execute_ytdlp_download(ydl_opts, url, outdir)
+        pin_id, media, source = _pinterest_extract(url, proxy)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            raise RuntimeError(f"HTTP Error {e.code}: Pinterest pin not found") from e
+        log.info("PINTEREST_PAGE_HTTP_%s for %s", e.code, url)
+    except Exception as e:
+        log.info("PINTEREST_SCRAPE_FAILED for %s: %s", url, _short(e))
+
+    if media:
+        try:
+            result = _pinterest_fetch_media(media, pin_id, outdir, proxy)
+            log.info("PINTEREST_OK kind=%s via=%s pin=%s", media["kind"], source, pin_id)
+            return result
+        except MediaTooLargeError:
+            raise
+        except Exception as e:
+            log.warning("PINTEREST_MEDIA_DOWNLOAD_FAILED kind=%s via=%s: %s", media["kind"], source, _short(e))
+
+    scraped_kind = media["kind"] if media else None
+    try:
+        result = _pinterest_ytdlp(url, outdir, use_proxy)
+        log.info("PINTEREST_OK kind=video via=yt-dlp pin=%s", pin_id)
+        return result
     except Exception as e:
         msg = str(e).lower()
-        if "no video formats found" in msg or "requested format is not available" in msg:
-            if is_video_pin is False:
-                # confirmed image pin - the image IS the real content
-                result = _download_image_fallback(url, outdir, None)
-                if result:
-                    return result
-            else:
-                log.warning(
-                    "PINTEREST_VIDEO_FORMAT_NOT_FOUND: %s (pin_type=%s): %s",
-                    url, "video" if is_video_pin else "unknown", e,
-                )
-                raise RuntimeError(f"PINTEREST_VIDEO_UNAVAILABLE: {e}") from e
-        raise
+        no_video = "no video formats found" in msg or "requested format is not available" in msg
+        if no_video and scraped_kind in (None, "image"):
+            result = _download_image_fallback(url, outdir, None)
+            if result:
+                path, info = result
+                info["_media_kind"] = "image"
+                log.info("PINTEREST_OK kind=image via=og:image pin=%s", pin_id)
+                return path, info
+        log.warning("PINTEREST_FAILED pin=%s scraped_kind=%s: %s", pin_id, scraped_kind, _short(e))
+        raise RuntimeError(f"PINTEREST_MEDIA_UNAVAILABLE: {e}") from e
 
 
 def _download_facebook(url: str, outdir: str, use_proxy: bool):
@@ -2947,7 +3380,9 @@ def classify_download_error(exc: Exception) -> str:
     # _download_pinterest).
     if "youtube_ip_blocked" in msg or "youtube_no_formats" in msg or "youtube_circuit_open" in msg:
         return "ERROR_YOUTUBE_BLOCKED"
-    if "pinterest_video_unavailable" in msg:
+    if isinstance(exc, MediaTooLargeError):
+        return "ERROR_TOO_LARGE"
+    if "pinterest_media_unavailable" in msg or "pinterest_video_unavailable" in msg:
         return "ERROR_PINTEREST_VIDEO"
     if "cannot parse data" in msg:
         return "ERROR_FACEBOOK_PARSE"
@@ -2973,7 +3408,7 @@ def classify_download_error(exc: Exception) -> str:
     # genuinely gone/region-blocked/age-restricted for this server, not a
     # bug in the format selector - treat it like a deleted/unavailable post
     # rather than a generic error.
-    if "video unavailable" in msg or "requested format is not available" in msg or "no video formats found" in msg:
+    if "video unavailable" in msg or "video is unavailable" in msg or "requested format is not available" in msg or "no video formats found" in msg:
         return "ERROR_DELETED"
     return "ERROR_UNKNOWN"
 
@@ -3690,6 +4125,8 @@ async def handle_link(message: Message):
                 await status.edit_text(t(lang, "err_busy"))
             elif code == "ERROR_YOUTUBE_BLOCKED":
                 await status.edit_text(t(lang, "err_youtube_blocked"))
+            elif code == "ERROR_TOO_LARGE":
+                await status.edit_text(t(lang, "err_media_too_large"))
             elif code == "ERROR_PINTEREST_VIDEO":
                 await status.edit_text(t(lang, "err_pinterest_video"))
             elif code == "ERROR_FACEBOOK_PARSE":
@@ -3720,21 +4157,44 @@ async def handle_link(message: Message):
     token = uuid.uuid4().hex[:12]
     ext = os.path.splitext(filepath)[1].lower()
     caption = build_media_caption(url)
-    keyboard = music_inline_kb(lang, token)
+    is_photo = ext in (".jpg", ".jpeg", ".png", ".webp")
+    is_gif = ext == ".gif" or info.get("_media_kind") == "gif"
+    # A picture / GIF has no soundtrack, so the "recognize music" button would
+    # only ever answer "not recognized".
+    keyboard = None if (is_photo or is_gif) else music_inline_kb(lang, token)
 
     try:
-        if ext in (".jpg", ".jpeg", ".png", ".webp"):
-            await message.answer_photo(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
+        if is_gif:
+            try:
+                await message.answer_animation(FSInputFile(filepath), caption=caption)
+            except TelegramBadRequest as e:
+                log.info("send_animation refused (%s), sending as document", _short(e))
+                await message.answer_document(FSInputFile(filepath), caption=caption)
+        elif is_photo:
+            # sendPhoto: max 10 MB and strict dimension limits; anything it
+            # refuses still reaches the user, uncompressed, as a document.
+            if os.path.getsize(filepath) > TELEGRAM_PHOTO_LIMIT_BYTES:
+                await message.answer_document(FSInputFile(filepath), caption=caption)
+            else:
+                try:
+                    await message.answer_photo(FSInputFile(filepath), caption=caption)
+                except TelegramBadRequest as e:
+                    log.info("send_photo refused (%s), sending as document", _short(e))
+                    await message.answer_document(FSInputFile(filepath), caption=caption)
         else:
-            await message.answer_video(
-                FSInputFile(filepath),
-                caption=caption,
-                reply_markup=keyboard,
-                supports_streaming=True,
-                width=info.get("width") or None,
-                height=info.get("height") or None,
-                duration=info.get("duration") or None,
-            )
+            try:
+                await message.answer_video(
+                    FSInputFile(filepath),
+                    caption=caption,
+                    reply_markup=keyboard,
+                    supports_streaming=True,
+                    width=info.get("width") or None,
+                    height=info.get("height") or None,
+                    duration=info.get("duration") or None,
+                )
+            except TelegramBadRequest as e:
+                log.info("send_video refused (%s), sending as document", _short(e))
+                await message.answer_document(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
         _cache_put(FILE_CACHE, token, {"filepath": filepath, "source_url": url}, FILE_CACHE_MAX_SIZE)
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
