@@ -525,64 +525,205 @@ class HeavyJobSlot:
 
 
 # ============================================================
+# ANIMATED TELEGRAM CUSTOM EMOJIS & COLORED BUTTONS (Bot API 9.4+)
+# ============================================================
+# Verified 19-digit animated Telegram custom_emoji_id catalog mapping:
+# key -> (custom_emoji_id, fallback_unicode_emoji)
+CUSTOM_EMOJI_MAP: dict[str, tuple[str, str]] = {
+    "wave": ("5397679249937155116", "👋"),
+    "point_down": ("5436256074959194181", "👇"),
+    "globe": ("5350469811233110106", "🌐"),
+    "flag_uz": ("5350469811233110106", "🇺🇿"),
+    "flag_ru": ("5461155860094921420", "🇷🇺"),
+    "flag_gb": ("5467887736000093669", "🇬🇧"),
+    "link": ("5271604874419647061", "🔗"),
+    "hourglass": ("5363826996314912469", "⏳"),
+    "clock": ("5348383560933850994", "⏰"),
+    "stopwatch": ("5348383560933850994", "⏱"),
+    "check": ("5206607081334906820", "✅"),
+    "cross": ("5435930383294170924", "❌"),
+    "music": ("5348201978306509336", "🎵"),
+    "notes": ("5348201978306509336", "🎶"),
+    "headphones": ("5354899958329784877", "🎧"),
+    "sad": ("5429231939414409061", "😔"),
+    "lyrics": ("5346132860631791153", "📜"),
+    "search": ("5348544647977254780", "🔍"),
+    "warning": ("5431445849026611010", "⚠️"),
+    "exclamation": ("5274099962655816924", "❗️"),
+    "alert": ("5424972470023104089", "🚨"),
+    "question": ("5436113877181941026", "❓"),
+    "info": ("5323442290708985472", "ℹ️"),
+    "lock": ("5296369303661067030", "🔐"),
+    "forbidden": ("5260293700088511294", "⛔"),
+    "pin": ("5346081186714246816", "📌"),
+    "paperclip": ("5305265301917549162", "📎"),
+    "settings": ("5341715473882955310", "🛠"),
+    "stats": ("5231200819986047254", "📊"),
+    "user": ("5280882957261770698", "👤"),
+    "edit": ("5395444784611480792", "✍️"),
+    "megaphone": ("5291895124559671372", "📢"),
+    "plus": ("5397916757333654639", "➕"),
+    "list": ("5345987742276797245", "📋"),
+    "trash": ("5255933371980223131", "🗑"),
+    "upload": ("5258166849463419417", "📤"),
+    "download": ("5301067323573047237", "📥"),
+    "package": ("5195169153928946332", "📦"),
+    "empty_box": ("5453996128137676323", "📭"),
+    "back": ("5255999157994297240", "⬅️"),
+    "prev": ("5255999157994297240", "◀️"),
+    "next": ("5456119091817384146", "▶️"),
+    "eye": ("5350654889963828012", "👁"),
+    "video": ("5255906670168543594", "🎬"),
+    "sparkles": ("5436020079391183032", "✨"),
+    "fire": ("5424972470023104089", "🔥"),
+    "star": ("5438496463044752972", "⭐️"),
+    "rocket": ("5361930420361378687", "🚀"),
+    "heart": ("5348576757152759323", "❤️"),
+    "thumbs_up": ("5368324170671202286", "👍"),
+}
+
+_ID_TO_FALLBACK: dict[str, str] = {v[0]: v[1] for v in CUSTOM_EMOJI_MAP.values()}
+_TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', re.DOTALL)
+
+
+def ce(key: str, fallback: str | None = None) -> str:
+    """Return an HTML <tg-emoji emoji-id="...">fallback</tg-emoji> tag for
+    animated Telegram custom emojis in messages and captions."""
+    emoji_id, default_fb = CUSTOM_EMOJI_MAP.get(key, ("5436020079391183032", "✨"))
+    fb = fallback if fallback is not None else default_fb
+    return f'<tg-emoji emoji-id="{emoji_id}">{fb}</tg-emoji>'
+
+
+def emoji_id_for(key: str) -> str:
+    """Return the 19-digit custom_emoji_id for `icon_custom_emoji_id` on buttons."""
+    return CUSTOM_EMOJI_MAP[key][0]
+
+
+def strip_tg_emoji(text: str | None) -> str:
+    """Replace <tg-emoji ...>fallback</tg-emoji> with its inner fallback emoji
+    (used for plain-text surfaces like callback popup alerts or fallback retries)."""
+    if not text:
+        return ""
+    return _TG_EMOJI_TAG_RE.sub(r"\1", text)
+
+
+def _strip_leading_emoji_label(text: str) -> str:
+    """Remove a leading emoji token + space from a button label (e.g. '🎵 Musiqani aniqlash' -> 'Musiqani aniqlash')
+    when `icon_custom_emoji_id` already renders the animated icon at the start of the button."""
+    cleaned = strip_tg_emoji(text).strip()
+    parts = cleaned.split(" ", 1)
+    if len(parts) == 2 and any(ord(ch) > 0x2000 for ch in parts[0]):
+        return parts[1].strip()
+    return cleaned
+
+
+def ikb(
+    text: str,
+    *,
+    style: str | None = None,
+    emoji_key: str | None = None,
+    keep_leading_emoji: bool = False,
+    **kwargs,
+) -> InlineKeyboardButton:
+    """Build an InlineKeyboardButton with Bot API 9.4+ colored `style`
+    ('primary' blue, 'success' green, 'danger' red) and animated `icon_custom_emoji_id`."""
+    label = strip_tg_emoji(text)
+    if emoji_key and not keep_leading_emoji:
+        stripped = _strip_leading_emoji_label(label)
+        if stripped:
+            label = stripped
+    extra: dict = {}
+    if style:
+        extra["style"] = style
+    if emoji_key and emoji_key in CUSTOM_EMOJI_MAP:
+        extra["icon_custom_emoji_id"] = CUSTOM_EMOJI_MAP[emoji_key][0]
+    return InlineKeyboardButton(text=label, **extra, **kwargs)
+
+
+def rkb(
+    text: str,
+    *,
+    style: str | None = None,
+    emoji_key: str | None = None,
+    keep_leading_emoji: bool = False,
+    **kwargs,
+) -> KeyboardButton:
+    """Build a Reply KeyboardButton with Bot API 9.4+ colored `style`
+    and animated `icon_custom_emoji_id`."""
+    label = strip_tg_emoji(text)
+    if emoji_key and not keep_leading_emoji:
+        stripped = _strip_leading_emoji_label(label)
+        if stripped:
+            label = stripped
+    extra: dict = {}
+    if style:
+        extra["style"] = style
+    if emoji_key and emoji_key in CUSTOM_EMOJI_MAP:
+        extra["icon_custom_emoji_id"] = CUSTOM_EMOJI_MAP[emoji_key][0]
+    return KeyboardButton(text=label, **extra, **kwargs)
+
+
+# ============================================================
 # TRANSLATIONS
 # ============================================================
 TEXTS = {
     "uz": {
-        "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
+        "choose_lang": f'{ce("globe")} Tilni tanlang / Выберите язык / Choose a language {ce("point_down")}',
         "welcome": (
-            "Assalomu alaykum! 👋\n\n<b>{bot_name}</b> ga xush kelibsiz!\n\n"
-            "Menga Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini "
-            "yuboring — men videoni/mediani yuklab beraman. Video ostidagi tugma orqali "
-            "esa undagi musiqani aniqlab, MP3 shaklda yuborib bera olaman 🎵"
+            f'Assalomu alaykum! {ce("wave")} {ce("sparkles")}\n\n'
+            f'{ce("rocket")} <b>{{bot_name}}</b> ga xush kelibsiz!\n\n'
+            f'{ce("video")} Menga Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini '
+            f'yuboring — men videoni/mediani tez va sifatli yuklab beraman {ce("fire")}\n\n'
+            f'{ce("headphones")} Video ostidagi rangli tugma orqali esa undagi musiqani aniqlab, '
+            f'MP3 shaklda yuborib bera olaman {ce("music")}'
         ),
-        "send_link": "🔗 Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Yuklanmoqda, biroz kuting...",
-        "queued": "⏳ Hozir band, navbatingiz kelishi bilan boshlanadi...",
-        "caption": "✅ Botimizdan foydalanganingiz uchun rahmat!",
+        "send_link": f'{ce("link")} Havolani yuboring (Instagram / YouTube / TikTok / Pinterest / Snapchat) {ce("sparkles")}',
+        "downloading": f'{ce("hourglass")} Yuklanmoqda, biroz kuting... {ce("download")}',
+        "queued": f'{ce("hourglass")} Hozir band, navbatingiz kelishi bilan boshlanadi... {ce("clock")}',
+        "caption": f'{ce("check")} Botimizdan foydalanganingiz uchun rahmat! {ce("heart")}',
         "detect_music_btn": "🎵 Musiqani aniqlash",
-        "recognizing": "🎧 Musiqa aniqlanmoqda...",
-        "not_recognized": "😔 Kechirasiz, bu videodagi musiqani aniqlab bo'lmadi.",
-        "found_song": "🎶 Topildi: {title} — {artist}\n⏳ Yuklab olinmoqda...",
-        "download_failed_yt_link": "❌ Musiqani yuklab bo'lmadi.\nQuyidagi havola orqali topishingiz mumkin:\n{link}",
-        "song_caption": "🎵 {title} — {artist}",
+        "recognizing": f'{ce("headphones")} Musiqa aniqlanmoqda... {ce("music")}',
+        "not_recognized": f'{ce("sad")} Kechirasiz, bu videodagi musiqani aniqlab bo\'lmadi.',
+        "found_song": f'{ce("notes")} Topildi: <b>{{title}}</b> — {ce("user")} {{artist}}\n{ce("hourglass")} Yuklab olinmoqda... {ce("download")}',
+        "download_failed_yt_link": f'{ce("cross")} Musiqani yuklab bo\'lmadi.\n{ce("link")} Quyidagi havola orqali topishingiz mumkin:\n{{link}}',
+        "song_caption": f'{ce("music")} {{title}} — {{artist}}',
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Rassom bo'yicha qidirish",
         "btn_youtube_link": "🔍 Manbada ochish",
-        "lyrics_notice": "📜 Qo'shiq matnini mualliflik huquqi tufayli to'liq ko'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin:",
-        "tiktok_unavailable": "⚠️ Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so'ng qayta urinib ko'ring.",
-        "link_not_found": "❌ Bu post topilmadi — o'chirilgan, yopiq (private) yoki linkda xatolik bo'lishi mumkin.",
-        "err_private": "🔐 Bu post yopiq (private) yoki yuklab olish cheklangan.\nUni ilova ichidan ulashib ko'ring yoki ochiq (public) qilishni so'rang.",
-        "err_expired": "⏰ Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.",
-        "err_stale_cookie": "⚠️ Instagram hozircha bu postni bermayapti. Birozdan so'ng qayta urinib ko'ring yoki havolani tekshiring.",
-        "err_youtube_blocked": "⏳ YouTube hozircha vaqtincha ishlamayapti, keyinroq urinib ko'ring.",
-        "err_media_too_large": "⚠️ Fayl juda katta yoki uzun (Telegram bot limiti ~50 MB, treklar uchun ~20 daqiqa). Boshqa variantni tanlang.",
-        "err_file_too_big_input": "⚠️ Yuborilgan fayl juda katta (bot 20 MB gacha fayllarni o'qiy oladi). Qisqaroq video yuboring.",
-        "err_busy": "⏳ Bot hozir band (band xotira), birozdan keyin qayta urinib ko'ring.",
-        "err_pinterest_video": "📌 Bu Pinterest postini (rasm/video/GIF) hozircha yuklab bo'lmadi. Post o'chirilgan yoki yopiq bo'lishi mumkin.",
-        "err_facebook_parse": "❌ Bu Facebook video'sini yuklab bo'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.",
-        "unsupported_link": "❌ Bu havola qo'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.",
-        "error": "❌ Xatolik yuz berdi, qaytadan urinib ko'ring.",
-        "no_link": "❗️ Iltimos, media havolasini yuboring.",
-        "admin_only": "⛔ Bu buyruq faqat administratorlar uchun.",
-        "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Statistika:\n\n👤 Jami foydalanuvchilar: {count}",
-        "broadcast_ask": "✍️ Yuboriladigan xabar matnini yuboring:",
-        "broadcast_done": "✅ Xabar {count} ta foydalanuvchiga yuborildi.",
-        "file_expired": "⏱ Vaqt tugadi, iltimos havolani qayta yuboring.",
-        "lang_set": "✅ Til o'zbekcha etib o'rnatildi.",
-        "searching": "🔍 Qidirilmoqda...",
-        "search_no_results": "😔 Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.",
-        "search_results_range": "Natijalar {start}-{end} / {total}",
+        "lyrics_notice": f'{ce("lyrics")} Qo\'shiq matnini mualliflik huquqi tufayli to\'liq ko\'rsata olmayman, lekin quyidagi havoladan uni topishingiz mumkin {ce("point_down")}',
+        "tiktok_unavailable": f'{ce("warning")} Kechirasiz, hozircha TikTok xizmatlari ishlamayapti. Birozdan so\'ng qayta urinib ko\'ring.',
+        "link_not_found": f'{ce("cross")} Bu post topilmadi — o\'chirilgan, yopiq (private) yoki linkda xatolik bo\'lishi mumkin.',
+        "err_private": f'{ce("lock")} Bu post yopiq (private) yoki yuklab olish cheklangan.\n{ce("info")} Uni ilova ichidan ulashib ko\'ring yoki ochiq (public) qilishni so\'rang.',
+        "err_expired": f'{ce("clock")} Bu kontent muddati tugagan (masalan, Snapchat story faqat 24 soat ochiq turadi) va endi mavjud emas.',
+        "err_stale_cookie": f'{ce("warning")} Instagram hozircha bu postni bermayapti. Birozdan so\'ng qayta urinib ko\'ring yoki havolani tekshiring.',
+        "err_youtube_blocked": f'{ce("hourglass")} YouTube hozircha vaqtincha ishlamayapti, keyinroq urinib ko\'ring.',
+        "err_media_too_large": f'{ce("warning")} Fayl juda katta yoki uzun (Telegram bot limiti ~50 MB, treklar uchun ~20 daqiqa). Boshqa variantni tanlang.',
+        "err_file_too_big_input": f'{ce("warning")} Yuborilgan fayl juda katta (bot 20 MB gacha fayllarni o\'qiy oladi). Qisqaroq video yuboring.',
+        "err_busy": f'{ce("hourglass")} Bot hozir band (band xotira), birozdan keyin qayta urinib ko\'ring.',
+        "err_pinterest_video": f'{ce("pin")} Bu Pinterest postini (rasm/video/GIF) hozircha yuklab bo\'lmadi. Post o\'chirilgan yoki yopiq bo\'lishi mumkin.',
+        "err_facebook_parse": f'{ce("cross")} Bu Facebook video\'sini yuklab bo\'lmadi, ehtimol u shaxsiy (private) yoki cheklangan.',
+        "unsupported_link": f'{ce("cross")} Bu havola qo\'llab-quvvatlanmaydi. Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring {ce("link")}',
+        "error": f'{ce("cross")} Xatolik yuz berdi, qaytadan urinib ko\'ring.',
+        "no_link": f'{ce("exclamation")} Iltimos, media havolasini yuboring {ce("link")}',
+        "admin_only": f'{ce("forbidden")} Bu buyruq faqat administratorlar uchun.',
+        "admin_panel": f'{ce("settings")} <b>Admin panel</b> {ce("sparkles")}',
+        "stats": f'{ce("stats")} <b>Statistika:</b>\n\n{ce("user")} Jami foydalanuvchilar: <b>{{count}}</b> {ce("sparkles")}',
+        "broadcast_ask": f'{ce("edit")} Yuboriladigan xabar matnini yuboring {ce("megaphone")}:',
+        "broadcast_done": f'{ce("check")} Xabar <b>{{count}}</b> ta foydalanuvchiga muvaffaqiyatli yuborildi {ce("rocket")}',
+        "file_expired": f'{ce("stopwatch")} Vaqt tugadi, iltimos havolani qayta yuboring.',
+        "lang_set": f'{ce("check")} Til o\'zbekcha etib o\'rnatildi {ce("sparkles")}',
+        "searching": f'{ce("search")} Qidirilmoqda... {ce("music")}',
+        "search_no_results": f'{ce("sad")} Hech narsa topilmadi. Boshqa nom bilan urinib ko\'ring {ce("search")}',
+        "search_results_range": f'{ce("list")} Natijalar <b>{{start}}-{{end}}</b> / <b>{{total}}</b>',
         "help": (
-            "ℹ️ <b>Yordam</b>\n\n"
-            "1) Instagram, YouTube, TikTok, Pinterest yoki Snapchat havolasini yuboring.\n"
-            "2) Bot mediani yuklab beradi.\n"
-            "3) Video ostidagi 🎵 tugmasini bosing — bot videodagi musiqani aniqlab, "
-            "MP3 shaklida yuboradi.\n"
-            "4) Yoki shunchaki qo'shiq/ijrochi nomini yozib yuboring — bot YouTube'dan "
-            "qidirib, ro'yxatdan tanlaganingizni MP3 shaklida yuboradi.\n\n"
-            "Tilni o'zgartirish uchun pastdagi \"🌐 Til\" tugmasidan foydalaning."
+            f'{ce("info")} <b>Yordam</b> {ce("sparkles")}\n\n'
+            f'{ce("link")} <b>1)</b> Instagram, YouTube, TikTok, Pinterest, Facebook yoki Snapchat havolasini yuboring.\n'
+            f'{ce("video")} <b>2)</b> Bot mediani tez va sifatli yuklab beradi.\n'
+            f'{ce("music")} <b>3)</b> Video ostidagi {ce("headphones")} tugmasini bosing — bot videodagi musiqani aniqlab, '
+            f'MP3 shaklida yuboradi.\n'
+            f'{ce("search")} <b>4)</b> Yoki shunchaki qo\'shiq/ijrochi nomini yozib yuboring — bot YouTube\'dan '
+            f'qidirib, ro\'yxatdan tanlaganingizni MP3 shaklida yuboradi {ce("notes")}\n\n'
+            f'{ce("globe")} Tilni o\'zgartirish uchun pastdagi <b>"Til"</b> tugmasidan foydalaning.'
         ),
         "btn_lang": "🌐 Til",
         "btn_help": "❓ Yordam",
@@ -595,94 +736,101 @@ TEXTS = {
         "btn_clear_cache": "🗑 Cache tozalash",
         "btn_db_export": "📤 DB export",
         "btn_db_import": "📥 DB import",
-        "cache_cleared": "✅ Vaqtinchalik cache tozalandi ({count} ta yozuv).",
-        "db_export_empty": "📭 Bazada foydalanuvchilar topilmadi.",
-        "db_export_caption": "📦 DB export — {count} ta foydalanuvchi (.vk fayllar zip ichida).",
-        "db_export_fail": "❌ DB export qilishda xatolik yuz berdi.",
-        "db_import_ask": "📥 Import qilish uchun avval yuborilgan .zip yoki .vk fayl(lar)ni yuboring.",
-        "db_import_done": "✅ Import tugadi: {added} ta qo'shildi, {updated} ta yangilandi, {failed} ta xato.",
-        "db_import_fail": "❌ Faylni o'qib bo'lmadi. To'g'ri .zip yoki .vk fayl yuboring.",
-        "db_import_no_file": "❗️ Iltimos, .zip yoki .vk fayl yuboring.",
-        "ask_channel": (
-            "📎 Kanal/gurux qo'shish uchun:\n\n"
-            "1) Botni o'sha kanal/guruhga <b>administrator</b> qilib qo'ying.\n"
-            "2) Shu yerga o'sha kanal/guruhdagi istalgan xabarni forward qiling, "
-            "yoki uning @username'ini, yoki chat_id sini yuboring.\n\n"
-            "⚠️ Yopiq (private) kanal bo'lsa, botga <b>'Invite Users via Link'</b> huquqini ham bering.\n"
-            "ℹ️ Taklif havolasi (https://t.me/+...) yuborish ishlamaydi — forward qiling."
+        "cache_cleared": f'{ce("check")} Vaqtinchalik cache tozalandi (<b>{{count}}</b> ta yozuv) {ce("trash")}',
+        "db_export_empty": f'{ce("empty_box")} Bazada foydalanuvchilar topilmadi.',
+        "db_export_caption": f'{ce("package")} DB export — <b>{{count}}</b> ta foydalanuvchi (.vk fayllar zip ichida) {ce("check")}',
+        "db_export_fail": f'{ce("cross")} DB export qilishda xatolik yuz berdi.',
+        "db_import_ask": f'{ce("download")} Import qilish uchun avval yuborilgan .zip yoki .vk fayl(lar)ni yuboring {ce("package")}',
+        "db_import_done": (
+            f'{ce("check")} Import tugadi:\n'
+            f'{ce("plus")} Qo\'shildi: <b>{{added}}</b> ta\n'
+            f'{ce("edit")} Yangilandi: <b>{{updated}}</b> ta\n'
+            f'{ce("cross")} Xato: <b>{{failed}}</b> ta'
         ),
-        "channel_added": "✅ \"{title}\" majburiy obunalar ro'yxatiga qo'shildi.",
-        "channel_add_fail_not_admin": "❌ Botni avval o'sha kanal/guruhga administrator qiling, keyin qaytadan urinib ko'ring.",
-        "channel_add_fail_link": "❌ Kanal uchun taklif havolasi (invite link) yaratib bo'lmadi, shuning uchun kanal saqlanmadi. Botning o'sha kanalda 'Invite Users via Link' huquqi borligini tekshirib, qaytadan urinib ko'ring.",
-        "channel_add_fail_not_found": "❌ Bunday kanal/guruh topilmadi. Username'ni tekshiring (@kanal), yoki eng ishonchlisi — o'sha kanaldan istalgan xabarni menga forward qiling.",
-        "channel_add_fail_invite_link": "❌ Taklif havolasi (https://t.me/+...) orqali kanalni qo'shib bo'lmaydi — Telegram bunga ruxsat bermaydi.\n\nBuning o'rniga: o'sha kanaldan istalgan xabarni menga <b>forward</b> qiling, yoki ochiq kanal bo'lsa @username yuboring.",
-        "channel_add_fail_wrong_type": "❌ Faqat kanal yoki guruhni majburiy obuna sifatida qo'shish mumkin.",
-        "channel_add_fail_no_invite_perm": "❌ Botda bu kanalda taklif havolasi yaratish huquqi yo'q.\n\nKanal sozlamalari → Administratorlar → Bot → <b>'Invite Users via Link'</b> huquqini yoqing va qayta urinib ko'ring.",
-        "channel_add_fail": "❌ Kanal/guruhni aniqlab bo'lmadi. Forward yoki @username/ID yuboring.",
-        "channel_list_empty": "📭 Hozircha majburiy obunalar yo'q.",
-        "channel_list_title": "📋 Majburiy obunalar ro'yxati:",
-        "channel_removed": "🗑 Kanal ro'yxatdan olib tashlandi.",
-        "subscribe_required": "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga a'zo bo'ling:",
+        "db_import_fail": f'{ce("cross")} Faylni o\'qib bo\'lmadi. To\'g\'ri .zip yoki .vk fayl yuboring.',
+        "db_import_no_file": f'{ce("exclamation")} Iltimos, .zip yoki .vk fayl yuboring {ce("package")}',
+        "ask_channel": (
+            f'{ce("paperclip")} <b>Kanal/gurux qo\'shish uchun:</b>\n\n'
+            f'{ce("settings")} <b>1)</b> Botni o\'sha kanal/guruhga <b>administrator</b> qilib qo\'ying.\n'
+            f'{ce("megaphone")} <b>2)</b> Shu yerga o\'sha kanal/guruhdagi istalgan xabarni forward qiling, '
+            f'yoki uning @username\'ini, yoki chat_id sini yuboring.\n\n'
+            f'{ce("warning")} Yopiq (private) kanal bo\'lsa, botga <b>\'Invite Users via Link\'</b> huquqini ham bering.\n'
+            f'{ce("info")} Taklif havolasi (https://t.me/+...) yuborish ishlamaydi — forward qiling.'
+        ),
+        "channel_added": f'{ce("check")} <b>"{{title}}"</b> majburiy obunalar ro\'yxatiga qo\'shildi {ce("sparkles")}',
+        "channel_add_fail_not_admin": f'{ce("cross")} Botni avval o\'sha kanal/guruhga administrator qiling, keyin qaytadan urinib ko\'ring.',
+        "channel_add_fail_link": f'{ce("cross")} Kanal uchun taklif havolasi (invite link) yaratib bo\'lmadi, shuning uchun kanal saqlanmadi. Botning o\'sha kanalda \'Invite Users via Link\' huquqi borligini tekshirib, qaytadan urinib ko\'ring.',
+        "channel_add_fail_not_found": f'{ce("cross")} Bunday kanal/guruh topilmadi. Username\'ni tekshiring (@kanal), yoki eng ishonchlisi — o\'sha kanaldan istalgan xabarni menga forward qiling.',
+        "channel_add_fail_invite_link": f'{ce("cross")} Taklif havolasi (https://t.me/+...) orqali kanalni qo\'shib bo\'lmaydi — Telegram bunga ruxsat bermaydi.\n\n{ce("info")} Buning o\'rniga: o\'sha kanaldan istalgan xabarni menga <b>forward</b> qiling, yoki ochiq kanal bo\'lsa @username yuboring.',
+        "channel_add_fail_wrong_type": f'{ce("cross")} Faqat kanal yoki guruhni majburiy obuna sifatida qo\'shish mumkin.',
+        "channel_add_fail_no_invite_perm": f'{ce("cross")} Botda bu kanalda taklif havolasi yaratish huquqi yo\'q.\n\n{ce("settings")} Kanal sozlamalari → Administratorlar → Bot → <b>\'Invite Users via Link\'</b> huquqini yoqing va qayta urinib ko\'ring.',
+        "channel_add_fail": f'{ce("cross")} Kanal/guruhni aniqlab bo\'lmadi. Forward yoki @username/ID yuboring.',
+        "channel_list_empty": f'{ce("empty_box")} Hozircha majburiy obunalar yo\'q.',
+        "channel_list_title": f'{ce("list")} <b>Majburiy obunalar ro\'yxati:</b>',
+        "channel_removed": f'{ce("trash")} Kanal ro\'yxatdan olib tashlandi.',
+        "subscribe_required": f'{ce("warning")} Botdan foydalanish uchun quyidagi kanal(lar)ga a\'zo bo\'ling {ce("point_down")}',
         "check_sub_btn": "✅ Tekshirish",
-        "still_not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz.",
-        "now_subscribed": "✅ Rahmat! Endi botdan foydalanishingiz mumkin, havolani yuboring.",
+        "still_not_subscribed": f'{ce("cross")} Siz hali barcha kanallarga a\'zo bo\'lmadingiz.',
+        "now_subscribed": f'{ce("check")} Rahmat! Endi botdan foydalanishingiz mumkin, havolani yuboring {ce("sparkles")}',
         "channel_type_public": "ochiq kanal/gurux",
         "channel_subs_label": "{count} a'zo",
         "channel_type_private": "yopiq kanal/gurux",
     },
     "ru": {
-        "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
+        "choose_lang": f'{ce("globe")} Tilni tanlang / Выберите язык / Choose a language {ce("point_down")}',
         "welcome": (
-            "Привет! 👋\n\nДобро пожаловать в <b>{bot_name}</b>!\n\n"
-            "Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat — "
-            "я скачаю видео. А кнопкой под видео можно распознать музыку и получить её в MP3 🎵"
+            f'Привет! {ce("wave")} {ce("sparkles")}\n\n'
+            f'{ce("rocket")} Добро пожаловать в <b>{{bot_name}}</b>!\n\n'
+            f'{ce("video")} Отправьте мне ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat — '
+            f'я быстро скачаю видео/медиа {ce("fire")}\n\n'
+            f'{ce("headphones")} А цветной кнопкой под видео можно распознать музыку и получить её в MP3 {ce("music")}'
         ),
-        "send_link": "🔗 Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Загружается, подождите...",
-        "queued": "⏳ Сейчас все занято, начнём, как только освободится место в очереди...",
-        "caption": "✅ Спасибо, что пользуетесь ботом!",
+        "send_link": f'{ce("link")} Отправьте ссылку (Instagram / YouTube / TikTok / Pinterest / Snapchat) {ce("sparkles")}',
+        "downloading": f'{ce("hourglass")} Загружается, подождите... {ce("download")}',
+        "queued": f'{ce("hourglass")} Сейчас все занято, начнём, как только освободится место в очереди... {ce("clock")}',
+        "caption": f'{ce("check")} Спасибо, что пользуетесь ботом! {ce("heart")}',
         "detect_music_btn": "🎵 Распознать музыку",
-        "recognizing": "🎧 Распознаём музыку...",
-        "not_recognized": "😔 Не удалось распознать музыку в этом видео.",
-        "found_song": "🎶 Найдено: {title} — {artist}\n⏳ Загружается...",
-        "download_failed_yt_link": "❌ Не удалось скачать музыку.\nВы можете найти её по этой ссылке:\n{link}",
-        "song_caption": "🎵 {title} — {artist}",
+        "recognizing": f'{ce("headphones")} Распознаём музыку... {ce("music")}',
+        "not_recognized": f'{ce("sad")} Не удалось распознать музыку в этом видео.',
+        "found_song": f'{ce("notes")} Найдено: <b>{{title}}</b> — {ce("user")} {{artist}}\n{ce("hourglass")} Загружается... {ce("download")}',
+        "download_failed_yt_link": f'{ce("cross")} Не удалось скачать музыку.\n{ce("link")} Вы можете найти её по этой ссылке:\n{{link}}',
+        "song_caption": f'{ce("music")} {{title}} — {{artist}}',
         "btn_lyrics": "📜 Текст песни",
         "btn_artist_search": "🔍 Поиск по исполнителю",
         "btn_youtube_link": "🔍 Открыть источник",
-        "lyrics_notice": "📜 Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже:",
-        "tiktok_unavailable": "⚠️ Извините, сервисы TikTok сейчас не работают. Попробуйте позже.",
-        "link_not_found": "❌ Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.",
-        "err_private": "🔐 Этот пост закрыт (private) или загрузка ограничена владельцем.\nПопробуйте поделиться им из самого приложения или попросите сделать его публичным.",
-        "err_expired": "⏰ Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.",
-        "err_stale_cookie": "⚠️ Instagram сейчас не отдаёт этот пост. Попробуйте ещё раз чуть позже или проверьте ссылку.",
-        "err_youtube_blocked": "⏳ YouTube сейчас временно не работает, попробуйте позже.",
-        "err_media_too_large": "⚠️ Файл слишком большой или длинный (лимит бота Telegram ~50 МБ, для треков ~20 минут). Выберите другой вариант.",
-        "err_file_too_big_input": "⚠️ Присланный файл слишком большой (бот читает файлы до 20 МБ). Отправьте видео покороче.",
-        "err_busy": "⏳ Бот сейчас перегружен, попробуйте ещё раз через некоторое время.",
-        "err_pinterest_video": "📌 Не удалось скачать этот пин Pinterest (фото/видео/GIF). Возможно, он удалён или закрыт.",
-        "err_facebook_parse": "❌ Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.",
-        "unsupported_link": "❌ Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.",
-        "error": "❌ Произошла ошибка, попробуйте ещё раз.",
-        "no_link": "❗️ Пожалуйста, отправьте ссылку на медиа.",
-        "admin_only": "⛔ Эта команда только для администраторов.",
-        "admin_panel": "🛠 Админ-панель",
-        "stats": "📊 Статистика:\n\n👤 Всего пользователей: {count}",
-        "broadcast_ask": "✍️ Отправьте текст рассылки:",
-        "broadcast_done": "✅ Сообщение отправлено {count} пользователям.",
-        "file_expired": "⏱ Время истекло, отправьте ссылку заново.",
-        "lang_set": "✅ Язык установлен: русский.",
-        "searching": "🔍 Ищем...",
-        "search_no_results": "😔 Ничего не найдено. Попробуйте другой запрос.",
-        "search_results_range": "Результаты {start}-{end} / {total}",
+        "lyrics_notice": f'{ce("lyrics")} Не могу показать полный текст песни из-за авторских прав, но вы можете найти его по ссылке ниже {ce("point_down")}',
+        "tiktok_unavailable": f'{ce("warning")} Извините, сервисы TikTok сейчас не работают. Попробуйте позже.',
+        "link_not_found": f'{ce("cross")} Пост не найден — он мог быть удалён, закрыт (private) или ссылка неверна.',
+        "err_private": f'{ce("lock")} Этот пост закрыт (private) или загрузка ограничена владельцем.\n{ce("info")} Попробуйте поделиться им из самого приложения или попросите сделать его публичным.',
+        "err_expired": f'{ce("clock")} Срок действия этого контента истёк (например, Snapchat-истории доступны только 24 часа) и он больше не доступен.',
+        "err_stale_cookie": f'{ce("warning")} Instagram сейчас не отдаёт этот пост. Попробуйте ещё раз чуть позже или проверьте ссылку.',
+        "err_youtube_blocked": f'{ce("hourglass")} YouTube сейчас временно не работает, попробуйте позже.',
+        "err_media_too_large": f'{ce("warning")} Файл слишком большой или длинный (лимит бота Telegram ~50 МБ, для треков ~20 минут). Выберите другой вариант.',
+        "err_file_too_big_input": f'{ce("warning")} Присланный файл слишком большой (бот читает файлы до 20 МБ). Отправьте видео покороче.',
+        "err_busy": f'{ce("hourglass")} Бот сейчас перегружен, попробуйте ещё раз через некоторое время.',
+        "err_pinterest_video": f'{ce("pin")} Не удалось скачать этот пин Pinterest (фото/видео/GIF). Возможно, он удалён или закрыт.',
+        "err_facebook_parse": f'{ce("cross")} Не удалось скачать это видео с Facebook, возможно оно приватное или ограничено.',
+        "unsupported_link": f'{ce("cross")} Эта ссылка не поддерживается. Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat {ce("link")}',
+        "error": f'{ce("cross")} Произошла ошибка, попробуйте ещё раз.',
+        "no_link": f'{ce("exclamation")} Пожалуйста, отправьте ссылку на медиа {ce("link")}',
+        "admin_only": f'{ce("forbidden")} Эта команда только для администраторов.',
+        "admin_panel": f'{ce("settings")} <b>Админ-панель</b> {ce("sparkles")}',
+        "stats": f'{ce("stats")} <b>Статистика:</b>\n\n{ce("user")} Всего пользователей: <b>{{count}}</b> {ce("sparkles")}',
+        "broadcast_ask": f'{ce("edit")} Отправьте текст рассылки {ce("megaphone")}:',
+        "broadcast_done": f'{ce("check")} Сообщение отправлено <b>{{count}}</b> пользователям {ce("rocket")}',
+        "file_expired": f'{ce("stopwatch")} Время истекло, отправьте ссылку заново.',
+        "lang_set": f'{ce("check")} Язык установлен: русский {ce("sparkles")}',
+        "searching": f'{ce("search")} Ищем... {ce("music")}',
+        "search_no_results": f'{ce("sad")} Ничего не найдено. Попробуйте другой запрос {ce("search")}',
+        "search_results_range": f'{ce("list")} Результаты <b>{{start}}-{{end}}</b> / <b>{{total}}</b>',
         "help": (
-            "ℹ️ <b>Помощь</b>\n\n"
-            "1) Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest или Snapchat.\n"
-            "2) Бот скачает медиа.\n"
-            "3) Нажмите кнопку 🎵 под видео — бот распознает музыку и пришлёт её в MP3.\n"
-            "4) Или просто напишите название песни/исполнителя — бот найдёт на YouTube "
-            "и пришлёт выбранный трек в MP3.\n\n"
-            "Чтобы сменить язык, используйте кнопку \"🌐 Язык\" внизу."
+            f'{ce("info")} <b>Помощь</b> {ce("sparkles")}\n\n'
+            f'{ce("link")} <b>1)</b> Отправьте ссылку с Instagram, YouTube, TikTok, Pinterest, Facebook или Snapchat.\n'
+            f'{ce("video")} <b>2)</b> Бот быстро скачает медиа.\n'
+            f'{ce("music")} <b>3)</b> Нажмите кнопку {ce("headphones")} под видео — бот распознает музыку и пришлёт её в MP3.\n'
+            f'{ce("search")} <b>4)</b> Или просто напишите название песни/исполнителя — бот найдёт на YouTube '
+            f'и пришлёт выбранный трек в MP3 {ce("notes")}\n\n'
+            f'{ce("globe")} Чтобы сменить язык, используйте кнопку <b>"Язык"</b> внизу.'
         ),
         "btn_lang": "🌐 Язык",
         "btn_help": "❓ Помощь",
@@ -695,93 +843,101 @@ TEXTS = {
         "btn_clear_cache": "🗑 Очистить кэш",
         "btn_db_export": "📤 Экспорт БД",
         "btn_db_import": "📥 Импорт БД",
-        "cache_cleared": "✅ Временный кэш очищен ({count} записей).",
-        "db_export_empty": "📭 Пользователи в базе не найдены.",
-        "db_export_caption": "📦 Экспорт БД — {count} пользователей (.vk файлы в zip).",
-        "db_export_fail": "❌ Ошибка при экспорте БД.",
-        "db_import_ask": "📥 Для импорта отправьте ранее выгруженный .zip или .vk файл(ы).",
-        "db_import_done": "✅ Импорт завершён: добавлено {added}, обновлено {updated}, ошибок {failed}.",
-        "db_import_fail": "❌ Не удалось прочитать файл. Отправьте корректный .zip или .vk файл.",
-        "db_import_no_file": "❗️ Пожалуйста, отправьте .zip или .vk файл.",
-        "ask_channel": (
-            "📎 Чтобы добавить канал/группу:\n\n"
-            "1) Сделайте бота <b>администратором</b> в этом канале/группе.\n"
-            "2) Перешлите сюда любое сообщение из него, либо отправьте его @username "
-            "или chat_id."
+        "cache_cleared": f'{ce("check")} Временный кэш очищен (<b>{{count}}</b> записей) {ce("trash")}',
+        "db_export_empty": f'{ce("empty_box")} Пользователи в базе не найдены.',
+        "db_export_caption": f'{ce("package")} Экспорт БД — <b>{{count}}</b> пользователей (.vk файлы в zip) {ce("check")}',
+        "db_export_fail": f'{ce("cross")} Ошибка при экспорте БД.',
+        "db_import_ask": f'{ce("download")} Для импорта отправьте ранее выгруженный .zip или .vk файл(ы) {ce("package")}',
+        "db_import_done": (
+            f'{ce("check")} Импорт завершён:\n'
+            f'{ce("plus")} Добавлено: <b>{{added}}</b>\n'
+            f'{ce("edit")} Обновлено: <b>{{updated}}</b>\n'
+            f'{ce("cross")} Ошибок: <b>{{failed}}</b>'
         ),
-        "channel_added": "✅ \"{title}\" добавлен в обязательные подписки.",
-        "channel_add_fail_not_admin": "❌ Сначала сделайте бота администратором канала/группы, затем попробуйте снова.",
-        "channel_add_fail_link": "❌ Не удалось создать пригласительную ссылку для канала, поэтому канал не сохранён. Проверьте, что у бота есть право «Invite Users via Link» в этом канале, и попробуйте снова.",
-        "channel_add_fail_not_found": "❌ Такой канал/группа не найдены. Проверьте username (@канал) или, что надёжнее, перешлите мне любое сообщение из этого канала.",
-        "channel_add_fail_invite_link": "❌ Добавить канал по пригласительной ссылке (https://t.me/+...) нельзя — Telegram этого не поддерживает.\n\nВместо этого: <b>перешлите</b> мне любое сообщение из канала, либо отправьте @username, если канал публичный.",
-        "channel_add_fail_wrong_type": "❌ В качестве обязательной подписки можно добавить только канал или группу.",
-        "channel_add_fail_no_invite_perm": "❌ У бота нет права создавать пригласительные ссылки в этом канале.\n\nНастройки канала → Администраторы → Бот → включите <b>«Invite Users via Link»</b> и попробуйте снова.",
-        "channel_add_fail": "❌ Не удалось определить канал/группу. Перешлите сообщение или отправьте @username/ID.",
-        "channel_list_empty": "📭 Обязательных подписок пока нет.",
-        "channel_list_title": "📋 Список обязательных подписок:",
-        "channel_removed": "🗑 Канал удалён из списка.",
-        "subscribe_required": "⚠️ Чтобы пользоваться ботом, подпишитесь на следующие канал(ы):",
+        "db_import_fail": f'{ce("cross")} Не удалось прочитать файл. Отправьте корректный .zip или .vk файл.',
+        "db_import_no_file": f'{ce("exclamation")} Пожалуйста, отправьте .zip или .vk файл {ce("package")}',
+        "ask_channel": (
+            f'{ce("paperclip")} <b>Чтобы добавить канал/группу:</b>\n\n'
+            f'{ce("settings")} <b>1)</b> Сделайте бота <b>администратором</b> в этом канале/группе.\n'
+            f'{ce("megaphone")} <b>2)</b> Перешлите сюда любое сообщение из него, либо отправьте его @username '
+            f'или chat_id.\n\n'
+            f'{ce("warning")} Для закрытого канала также включите право <b>«Invite Users via Link»</b>.'
+        ),
+        "channel_added": f'{ce("check")} <b>"{{title}}"</b> добавлен в обязательные подписки {ce("sparkles")}',
+        "channel_add_fail_not_admin": f'{ce("cross")} Сначала сделайте бота администратором канала/группы, затем попробуйте снова.',
+        "channel_add_fail_link": f'{ce("cross")} Не удалось создать пригласительную ссылку для канала, поэтому канал не сохранён. Проверьте, что у бота есть право «Invite Users via Link» в этом канале, и попробуйте снова.',
+        "channel_add_fail_not_found": f'{ce("cross")} Такой канал/группа не найдены. Проверьте username (@канал) или, что надёжнее, перешлите мне любое сообщение из этого канала.',
+        "channel_add_fail_invite_link": f'{ce("cross")} Добавить канал по пригласительной ссылке (https://t.me/+...) нельзя — Telegram этого не поддерживает.\n\n{ce("info")} Вместо этого: <b>перешлите</b> мне любое сообщение из канала, либо отправьте @username, если канал публичный.',
+        "channel_add_fail_wrong_type": f'{ce("cross")} В качестве обязательной подписки можно добавить только канал или группу.',
+        "channel_add_fail_no_invite_perm": f'{ce("cross")} У бота нет права создавать пригласительные ссылки в этом канале.\n\n{ce("settings")} Настройки канала → Администраторы → Бот → включите <b>«Invite Users via Link»</b> и попробуйте снова.',
+        "channel_add_fail": f'{ce("cross")} Не удалось определить канал/группу. Перешлите сообщение или отправьте @username/ID.',
+        "channel_list_empty": f'{ce("empty_box")} Обязательных подписок пока нет.',
+        "channel_list_title": f'{ce("list")} <b>Список обязательных подписок:</b>',
+        "channel_removed": f'{ce("trash")} Канал удалён из списка.',
+        "subscribe_required": f'{ce("warning")} Чтобы пользоваться ботом, подпишитесь на следующие канал(ы) {ce("point_down")}',
         "check_sub_btn": "✅ Проверить",
-        "still_not_subscribed": "❌ Вы ещё не подписаны на все каналы.",
-        "now_subscribed": "✅ Спасибо! Теперь вы можете пользоваться ботом, отправьте ссылку.",
+        "still_not_subscribed": f'{ce("cross")} Вы ещё не подписаны на все каналы.',
+        "now_subscribed": f'{ce("check")} Спасибо! Теперь вы можете пользоваться ботом, отправьте ссылку {ce("sparkles")}',
         "channel_type_public": "открытый канал/группа",
         "channel_subs_label": "{count} подписчиков",
         "channel_type_private": "закрытый канал/группа",
     },
     "en": {
-        "choose_lang": "Tilni tanlang / Выберите язык / Choose a language 👇",
+        "choose_lang": f'{ce("globe")} Tilni tanlang / Выберите язык / Choose a language {ce("point_down")}',
         "welcome": (
-            "Hello! 👋\n\nWelcome to <b>{bot_name}</b>!\n\n"
-            "Send me a link from Instagram, YouTube, TikTok, Pinterest or Snapchat — "
-            "I'll download the media for you. Use the button under the video to recognize "
-            "the music in it and get it as an MP3 🎵"
+            f'Hello! {ce("wave")} {ce("sparkles")}\n\n'
+            f'{ce("rocket")} Welcome to <b>{{bot_name}}</b>!\n\n'
+            f'{ce("video")} Send me a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat — '
+            f'I\'ll quickly download the media for you {ce("fire")}\n\n'
+            f'{ce("headphones")} Use the colored button under the video to recognize '
+            f'the music in it and get it as an MP3 {ce("music")}'
         ),
-        "send_link": "🔗 Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat).",
-        "downloading": "⏳ Downloading, please wait...",
-        "queued": "⏳ All slots are busy right now, this will start as soon as one frees up...",
-        "caption": "✅ Thanks for using our bot!",
+        "send_link": f'{ce("link")} Send a link (Instagram / YouTube / TikTok / Pinterest / Snapchat) {ce("sparkles")}',
+        "downloading": f'{ce("hourglass")} Downloading, please wait... {ce("download")}',
+        "queued": f'{ce("hourglass")} All slots are busy right now, this will start as soon as one frees up... {ce("clock")}',
+        "caption": f'{ce("check")} Thanks for using our bot! {ce("heart")}',
         "detect_music_btn": "🎵 Recognize music",
-        "recognizing": "🎧 Recognizing the music...",
-        "not_recognized": "😔 Sorry, couldn't recognize the music in this video.",
-        "found_song": "🎶 Found: {title} — {artist}\n⏳ Downloading...",
-        "download_failed_yt_link": "❌ Could not download the music.\nYou can find it via this link:\n{link}",
-        "song_caption": "🎵 {title} — {artist}",
+        "recognizing": f'{ce("headphones")} Recognizing the music... {ce("music")}',
+        "not_recognized": f'{ce("sad")} Sorry, couldn\'t recognize the music in this video.',
+        "found_song": f'{ce("notes")} Found: <b>{{title}}</b> — {ce("user")} {{artist}}\n{ce("hourglass")} Downloading... {ce("download")}',
+        "download_failed_yt_link": f'{ce("cross")} Could not download the music.\n{ce("link")} You can find it via this link:\n{{link}}',
+        "song_caption": f'{ce("music")} {{title}} — {{artist}}',
         "btn_lyrics": "📜 Lyrics",
         "btn_artist_search": "🔍 Search by artist",
         "btn_youtube_link": "🔍 Open source",
-        "lyrics_notice": "📜 I can't display full lyrics due to copyright, but you can find them via the link below:",
-        "tiktok_unavailable": "⚠️ Sorry, TikTok services aren't working right now. Please try again later.",
-        "link_not_found": "❌ Post not found — it may have been deleted, made private, or the link is wrong.",
-        "err_private": "🔐 This post is private or downloads are restricted by the owner.\nTry sharing it from within the app itself, or ask for it to be made public.",
-        "err_expired": "⏰ This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.",
-        "err_stale_cookie": "⚠️ Instagram is not serving this post right now. Please try again a bit later or check the link.",
-        "err_youtube_blocked": "⏳ YouTube is temporarily unavailable, please try again later.",
-        "err_media_too_large": "⚠️ The file is too big or too long (Telegram bot limit is ~50 MB, ~20 min for tracks). Please pick another option.",
-        "err_file_too_big_input": "⚠️ The file you sent is too large (the bot can read files up to 20 MB). Please send a shorter video.",
-        "err_busy": "⏳ The bot is under heavy load right now, please try again in a bit.",
-        "err_pinterest_video": "📌 This Pinterest pin (image/video/GIF) couldn't be downloaded right now. It may have been removed or be private.",
-        "err_facebook_parse": "❌ This Facebook video couldn't be downloaded, it may be private or restricted.",
-        "unsupported_link": "❌ This link isn't supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.",
-        "error": "❌ Something went wrong, please try again.",
-        "no_link": "❗️ Please send a media link.",
-        "admin_only": "⛔ This command is for admins only.",
-        "admin_panel": "🛠 Admin panel",
-        "stats": "📊 Stats:\n\n👤 Total users: {count}",
-        "broadcast_ask": "✍️ Send the broadcast text:",
-        "broadcast_done": "✅ Message sent to {count} users.",
-        "file_expired": "⏱ Session expired, please send the link again.",
-        "lang_set": "✅ Language set to English.",
-        "searching": "🔍 Searching...",
-        "search_no_results": "😔 Nothing found. Try a different search term.",
-        "search_results_range": "Results {start}-{end} / {total}",
+        "lyrics_notice": f'{ce("lyrics")} I can\'t display full lyrics due to copyright, but you can find them via the link below {ce("point_down")}',
+        "tiktok_unavailable": f'{ce("warning")} Sorry, TikTok services aren\'t working right now. Please try again later.',
+        "link_not_found": f'{ce("cross")} Post not found — it may have been deleted, made private, or the link is wrong.',
+        "err_private": f'{ce("lock")} This post is private or downloads are restricted by the owner.\n{ce("info")} Try sharing it from within the app itself, or ask for it to be made public.',
+        "err_expired": f'{ce("clock")} This content has expired (e.g. Snapchat stories only stay up for 24 hours) and is no longer available.',
+        "err_stale_cookie": f'{ce("warning")} Instagram is not serving this post right now. Please try again a bit later or check the link.',
+        "err_youtube_blocked": f'{ce("hourglass")} YouTube is temporarily unavailable, please try again later.',
+        "err_media_too_large": f'{ce("warning")} The file is too big or too long (Telegram bot limit is ~50 MB, ~20 min for tracks). Please pick another option.',
+        "err_file_too_big_input": f'{ce("warning")} The file you sent is too large (the bot can read files up to 20 MB). Please send a shorter video.',
+        "err_busy": f'{ce("hourglass")} The bot is under heavy load right now, please try again in a bit.',
+        "err_pinterest_video": f'{ce("pin")} This Pinterest pin (image/video/GIF) couldn\'t be downloaded right now. It may have been removed or be private.',
+        "err_facebook_parse": f'{ce("cross")} This Facebook video couldn\'t be downloaded, it may be private or restricted.',
+        "unsupported_link": f'{ce("cross")} This link isn\'t supported. Please send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat {ce("link")}',
+        "error": f'{ce("cross")} Something went wrong, please try again.',
+        "no_link": f'{ce("exclamation")} Please send a media link {ce("link")}',
+        "admin_only": f'{ce("forbidden")} This command is for admins only.',
+        "admin_panel": f'{ce("settings")} <b>Admin panel</b> {ce("sparkles")}',
+        "stats": f'{ce("stats")} <b>Stats:</b>\n\n{ce("user")} Total users: <b>{{count}}</b> {ce("sparkles")}',
+        "broadcast_ask": f'{ce("edit")} Send the broadcast text {ce("megaphone")}:',
+        "broadcast_done": f'{ce("check")} Message sent to <b>{{count}}</b> users {ce("rocket")}',
+        "file_expired": f'{ce("stopwatch")} Session expired, please send the link again.',
+        "lang_set": f'{ce("check")} Language set to English {ce("sparkles")}',
+        "searching": f'{ce("search")} Searching... {ce("music")}',
+        "search_no_results": f'{ce("sad")} Nothing found. Try a different search term {ce("search")}',
+        "search_results_range": f'{ce("list")} Results <b>{{start}}-{{end}}</b> / <b>{{total}}</b>',
         "help": (
-            "ℹ️ <b>Help</b>\n\n"
-            "1) Send a link from Instagram, YouTube, TikTok, Pinterest or Snapchat.\n"
-            "2) The bot downloads the media.\n"
-            "3) Tap the 🎵 button under the video — the bot recognizes the music and sends it as MP3.\n"
-            "4) Or just type a song/artist name — the bot will search YouTube and send the "
-            "track you pick as MP3.\n\n"
-            "To change language, use the \"🌐 Language\" button below."
+            f'{ce("info")} <b>Help</b> {ce("sparkles")}\n\n'
+            f'{ce("link")} <b>1)</b> Send a link from Instagram, YouTube, TikTok, Pinterest, Facebook or Snapchat.\n'
+            f'{ce("video")} <b>2)</b> The bot quickly downloads the media.\n'
+            f'{ce("music")} <b>3)</b> Tap the {ce("headphones")} button under the video — the bot recognizes the music and sends it as MP3.\n'
+            f'{ce("search")} <b>4)</b> Or just type a song/artist name — the bot will search YouTube and send the '
+            f'track you pick as MP3 {ce("notes")}\n\n'
+            f'{ce("globe")} To change language, use the <b>"Language"</b> button below.'
         ),
         "btn_lang": "🌐 Language",
         "btn_help": "❓ Help",
@@ -794,34 +950,40 @@ TEXTS = {
         "btn_clear_cache": "🗑 Clear cache",
         "btn_db_export": "📤 DB export",
         "btn_db_import": "📥 DB import",
-        "cache_cleared": "✅ Temporary cache cleared ({count} entries).",
-        "db_export_empty": "📭 No users found in the database.",
-        "db_export_caption": "📦 DB export — {count} users (.vk files inside a zip).",
-        "db_export_fail": "❌ DB export failed.",
-        "db_import_ask": "📥 To import, send a previously exported .zip or .vk file(s).",
-        "db_import_done": "✅ Import finished: {added} added, {updated} updated, {failed} failed.",
-        "db_import_fail": "❌ Could not read the file. Send a valid .zip or .vk file.",
-        "db_import_no_file": "❗️ Please send a .zip or .vk file.",
-        "ask_channel": (
-            "📎 To add a channel/group:\n\n"
-            "1) Make the bot an <b>administrator</b> there.\n"
-            "2) Forward any message from it here, or send its @username or chat_id."
+        "cache_cleared": f'{ce("check")} Temporary cache cleared (<b>{{count}}</b> entries) {ce("trash")}',
+        "db_export_empty": f'{ce("empty_box")} No users found in the database.',
+        "db_export_caption": f'{ce("package")} DB export — <b>{{count}}</b> users (.vk files inside a zip) {ce("check")}',
+        "db_export_fail": f'{ce("cross")} DB export failed.',
+        "db_import_ask": f'{ce("download")} To import, send a previously exported .zip or .vk file(s) {ce("package")}',
+        "db_import_done": (
+            f'{ce("check")} Import finished:\n'
+            f'{ce("plus")} Added: <b>{{added}}</b>\n'
+            f'{ce("edit")} Updated: <b>{{updated}}</b>\n'
+            f'{ce("cross")} Failed: <b>{{failed}}</b>'
         ),
-        "channel_added": "✅ \"{title}\" added to mandatory subscriptions.",
-        "channel_add_fail_not_admin": "❌ Make the bot an administrator of that channel/group first, then try again.",
-        "channel_add_fail_link": "❌ Couldn't create an invite link for the channel, so it wasn't saved. Check the bot has the \"Invite Users via Link\" permission there, then try again.",
-        "channel_add_fail_not_found": "❌ No such channel/group found. Check the username (@channel), or more reliably, forward me any message from that channel.",
-        "channel_add_fail_invite_link": "❌ A channel can't be added via an invite link (https://t.me/+...) — Telegram doesn't allow it.\n\nInstead: <b>forward</b> me any message from the channel, or send @username if it's public.",
-        "channel_add_fail_wrong_type": "❌ Only a channel or a group can be added as a mandatory subscription.",
-        "channel_add_fail_no_invite_perm": "❌ The bot doesn't have permission to create invite links in that channel.\n\nChannel settings → Administrators → the bot → enable <b>\"Invite Users via Link\"</b>, then try again.",
-        "channel_add_fail": "❌ Couldn't detect the channel/group. Forward a message, or send its @username/ID.",
-        "channel_list_empty": "📭 No mandatory subscriptions yet.",
-        "channel_list_title": "📋 Mandatory subscriptions:",
-        "channel_removed": "🗑 Channel removed from the list.",
-        "subscribe_required": "⚠️ To use the bot, please subscribe to the following channel(s):",
+        "db_import_fail": f'{ce("cross")} Could not read the file. Send a valid .zip or .vk file.',
+        "db_import_no_file": f'{ce("exclamation")} Please send a .zip or .vk file {ce("package")}',
+        "ask_channel": (
+            f'{ce("paperclip")} <b>To add a channel/group:</b>\n\n'
+            f'{ce("settings")} <b>1)</b> Make the bot an <b>administrator</b> there.\n'
+            f'{ce("megaphone")} <b>2)</b> Forward any message from it here, or send its @username or chat_id.\n\n'
+            f'{ce("warning")} For private channels, also enable <b>"Invite Users via Link"</b>.'
+        ),
+        "channel_added": f'{ce("check")} <b>"{{title}}"</b> added to mandatory subscriptions {ce("sparkles")}',
+        "channel_add_fail_not_admin": f'{ce("cross")} Make the bot an administrator of that channel/group first, then try again.',
+        "channel_add_fail_link": f'{ce("cross")} Couldn\'t create an invite link for the channel, so it wasn\'t saved. Check the bot has the "Invite Users via Link" permission there, then try again.',
+        "channel_add_fail_not_found": f'{ce("cross")} No such channel/group found. Check the username (@channel), or more reliably, forward me any message from that channel.',
+        "channel_add_fail_invite_link": f'{ce("cross")} A channel can\'t be added via an invite link (https://t.me/+...) — Telegram doesn\'t allow it.\n\n{ce("info")} Instead: <b>forward</b> me any message from the channel, or send @username if it\'s public.',
+        "channel_add_fail_wrong_type": f'{ce("cross")} Only a channel or a group can be added as a mandatory subscription.',
+        "channel_add_fail_no_invite_perm": f'{ce("cross")} The bot doesn\'t have permission to create invite links in that channel.\n\n{ce("settings")} Channel settings → Administrators → the bot → enable <b>"Invite Users via Link"</b>, then try again.',
+        "channel_add_fail": f'{ce("cross")} Couldn\'t detect the channel/group. Forward a message, or send its @username/ID.',
+        "channel_list_empty": f'{ce("empty_box")} No mandatory subscriptions yet.',
+        "channel_list_title": f'{ce("list")} <b>Mandatory subscriptions:</b>',
+        "channel_removed": f'{ce("trash")} Channel removed from the list.',
+        "subscribe_required": f'{ce("warning")} To use the bot, please subscribe to the following channel(s) {ce("point_down")}',
         "check_sub_btn": "✅ Check",
-        "still_not_subscribed": "❌ You haven't subscribed to all channels yet.",
-        "now_subscribed": "✅ Thanks! You can use the bot now, send a link.",
+        "still_not_subscribed": f'{ce("cross")} You haven\'t subscribed to all channels yet.',
+        "now_subscribed": f'{ce("check")} Thanks! You can use the bot now, send a link {ce("sparkles")}',
         "channel_type_public": "public channel/group",
         "channel_subs_label": "{count} subs",
         "channel_type_private": "private channel/group",
@@ -832,7 +994,27 @@ TEXTS = {
 def t(lang: str, key: str, **kwargs) -> str:
     lang = lang if lang in TEXTS else "uz"
     text = TEXTS[lang].get(key, TEXTS["uz"][key])
-    return text.format(**kwargs) if kwargs else text
+    if not kwargs:
+        return text
+    safe_kwargs = {
+        k: (_html.escape(v) if isinstance(v, str) and "<tg-emoji" not in v else v)
+        for k, v in kwargs.items()
+    }
+    return text.format(**safe_kwargs)
+
+
+def _btn_texts(key: str) -> set[str]:
+    """Return both full and stripped button labels across all languages so
+    ReplyKeyboardMarkup handlers match whether or not leading emojis are stripped."""
+    matches: set[str] = set()
+    for v in TEXTS.values():
+        raw = v[key]
+        matches.add(raw)
+        matches.add(strip_tg_emoji(raw))
+        stripped = _strip_leading_emoji_label(raw)
+        if stripped:
+            matches.add(stripped)
+    return matches
 
 
 # ============================================================
@@ -1051,6 +1233,50 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher(storage=MemoryStorage())
 
 
+async def _custom_emoji_fallback_middleware(make_request, b: Bot, method):
+    """Resilient Bot API 9.4+ middleware: if the bot owner does not have
+    Telegram Premium yet or Telegram rejects a custom emoji ID on a message
+    or button, automatically strip <tg-emoji> tags (keeping fallback emojis)
+    and `icon_custom_emoji_id` (keeping button `style` colors!) and retry."""
+    try:
+        return await make_request(b, method)
+    except TelegramBadRequest as e:
+        err_msg = str(e).lower()
+        if any(
+            token in err_msg
+            for token in ("custom_emoji", "document_invalid", "button_icon", "emoji_id", "can't use custom emoji")
+        ):
+            log.warning("Custom emoji rejected by Telegram (%s) - retrying with standard emoji fallback", e)
+            for attr in ("text", "caption"):
+                val = getattr(method, attr, None)
+                if isinstance(val, str) and "<tg-emoji" in val:
+                    object.__setattr__(method, attr, strip_tg_emoji(val))
+            markup = getattr(method, "reply_markup", None)
+            if markup is not None:
+                rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None)
+                if rows:
+                    for row in rows:
+                        for btn in row:
+                            cid = getattr(btn, "icon_custom_emoji_id", None)
+                            extra = getattr(btn, "__pydantic_extra__", None)
+                            if not cid and isinstance(extra, dict):
+                                cid = extra.get("icon_custom_emoji_id")
+                            if cid:
+                                fb = _ID_TO_FALLBACK.get(str(cid))
+                                cur_text = getattr(btn, "text", "") or ""
+                                if fb and fb not in cur_text:
+                                    object.__setattr__(btn, "text", f"{fb} {cur_text}".strip())
+                                if getattr(btn, "icon_custom_emoji_id", None):
+                                    object.__setattr__(btn, "icon_custom_emoji_id", None)
+                                if isinstance(extra, dict):
+                                    extra.pop("icon_custom_emoji_id", None)
+            return await make_request(b, method)
+        raise
+
+
+bot.session.middleware(_custom_emoji_fallback_middleware)
+
+
 _MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 _admin_alert_last: dict[str, float] = {}
 _ADMIN_ALERT_COOLDOWN = int(os.getenv("ADMIN_ALERT_COOLDOWN", "3600"))  # 1 hour per alert key
@@ -1106,6 +1332,10 @@ async def _safe_cb_answer(call: CallbackQuery, *args, **kwargs) -> None:
 
     Swallowing it here keeps the logs honest about real failures.
     """
+    if args and isinstance(args[0], str):
+        args = (strip_tg_emoji(args[0]), *args[1:])
+    if isinstance(kwargs.get("text"), str):
+        kwargs["text"] = strip_tg_emoji(kwargs["text"])
     try:
         await call.answer(*args, **kwargs)
     except TelegramBadRequest as e:
@@ -1178,9 +1408,9 @@ def lang_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang:uz"),
-                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
-                InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en"),
+                ikb(text="🇺🇿 O'zbekcha", callback_data="lang:uz", style="success", emoji_key="flag_uz"),
+                ikb(text="🇷🇺 Русский", callback_data="lang:ru", style="primary", emoji_key="flag_ru"),
+                ikb(text="🇬🇧 English", callback_data="lang:en", style="primary", emoji_key="flag_gb"),
             ]
         ]
     )
@@ -1189,7 +1419,14 @@ def lang_inline_kb() -> InlineKeyboardMarkup:
 def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=t(lang, "detect_music_btn"), callback_data=f"music:{token}")]
+            [
+                ikb(
+                    text=t(lang, "detect_music_btn"),
+                    callback_data=f"music:{token}",
+                    style="primary",
+                    emoji_key="music",
+                )
+            ]
         ]
     )
 
@@ -1197,18 +1434,24 @@ def music_inline_kb(lang: str, token: str) -> InlineKeyboardMarkup:
 def build_media_caption(source_url: str) -> str:
     """"BotName | Shazam | source" line shown under a downloaded video/photo
     (see reference screenshot), before music recognition is triggered."""
+    safe_bot_name = _html.escape(BOT_DISPLAY_NAME)
     bot_link = f"https://t.me/{BOT_USERNAME}?start=video" if BOT_USERNAME else ""
-    bot_part = f'<a href="{bot_link}">{BOT_DISPLAY_NAME}</a>' if bot_link else BOT_DISPLAY_NAME
+    bot_part = f'<a href="{bot_link}">{safe_bot_name}</a>' if bot_link else safe_bot_name
     shazam_part = '<a href="https://www.shazam.com">Shazam</a>'
     source_part = f'<a href="{source_url}">source</a>' if source_url else "source"
-    return f"{bot_part} | {shazam_part} | {source_part}"
+    return f'{ce("video")} {bot_part} | {ce("headphones")} {shazam_part} | {ce("link")} {source_part}'
 
 
 def build_recognized_caption(title: str, artist: str, source_url: str) -> str:
     """Caption the video is edited to once music recognition succeeds
     (see reference screenshot): song title line, blank line, then the
     same "BotName | Shazam | source" row as before."""
-    header = f"{title} — {artist}".strip(" —") or title
+    safe_title = _html.escape(title)
+    safe_artist = _html.escape(artist)
+    if safe_title and safe_artist:
+        header = f'{ce("notes")} <b>{safe_title}</b> — {ce("user")} {safe_artist}'
+    else:
+        header = f'{ce("notes")} <b>{safe_title or safe_artist}</b>'
     return f"{header}\n\n{build_media_caption(source_url)}"
 
 
@@ -1219,11 +1462,18 @@ def recognized_song_kb(lang: str, title: str, artist: str, artist_token: str) ->
     query = urllib.parse.quote(f"{artist} {title}".strip())
     rows = [
         [
-            InlineKeyboardButton(text="Google", url=f"https://www.google.com/search?q={query}"),
-            InlineKeyboardButton(text="YouTube Music", url=f"https://music.youtube.com/search?q={query}"),
-            InlineKeyboardButton(text="Spotify", url=f"https://open.spotify.com/search/{query}"),
+            ikb(text="Google", url=f"https://www.google.com/search?q={query}", style="primary", emoji_key="globe"),
+            ikb(text="YouTube Music", url=f"https://music.youtube.com/search?q={query}", style="danger", emoji_key="video"),
+            ikb(text="Spotify", url=f"https://open.spotify.com/search/{query}", style="success", emoji_key="headphones"),
         ],
-        [InlineKeyboardButton(text=t(lang, "btn_artist_search"), callback_data=f"asearch:{artist_token}")],
+        [
+            ikb(
+                text=t(lang, "btn_artist_search"),
+                callback_data=f"asearch:{artist_token}",
+                style="primary",
+                emoji_key="search",
+            )
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1234,9 +1484,9 @@ def build_song_caption(song_link: str | None) -> str:
     via the deep-link start parameter; tapping "info" opens the song's
     source page (SoundCloud), when we have one."""
     bot_link = f"https://t.me/{BOT_USERNAME}?start=song" if BOT_USERNAME else ""
-    bot_part = f'<a href="{bot_link}">@{BOT_USERNAME}</a>' if bot_link else f"@{BOT_USERNAME}"
+    bot_part = f'{ce("music")} <a href="{bot_link}">@{BOT_USERNAME}</a>' if bot_link else f'{ce("music")} @{BOT_USERNAME}'
     if song_link:
-        return f'{bot_part} | <a href="{song_link}">info</a>'
+        return f'{bot_part} | {ce("info")} <a href="{song_link}">info</a>'
     return bot_part
 
 
@@ -1245,33 +1495,42 @@ def song_result_kb(lang: str, title: str, artist: str, song_link: str | None) ->
     Single row under the sent MP3 (see reference screenshot):
     - wide "Lyrics" button links out to a lyrics search page instead of
       reproducing the full copyrighted lyrics text inside the bot.
-    - narrow 🔍 icon-only button opens the song's source page.
+    - second button opens the song's source page.
     """
     query = f"{artist} {title}".strip() or title
     lyrics_url = "https://genius.com/search?q=" + urllib.parse.quote(query)
-    row = [InlineKeyboardButton(text=t(lang, "btn_lyrics"), url=lyrics_url)]
+    row = [ikb(text=t(lang, "btn_lyrics"), url=lyrics_url, style="primary", emoji_key="lyrics")]
     if song_link:
-        row.append(InlineKeyboardButton(text="🔍", url=song_link))
+        row.append(ikb(text=t(lang, "btn_youtube_link"), url=song_link, style="success", emoji_key="search"))
     return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def user_reply_kb(lang: str, is_admin: bool) -> ReplyKeyboardMarkup:
-    row = [KeyboardButton(text=t(lang, "btn_lang")), KeyboardButton(text=t(lang, "btn_help"))]
+    row = [
+        rkb(text=t(lang, "btn_lang"), style="primary", emoji_key="globe"),
+        rkb(text=t(lang, "btn_help"), style="success", emoji_key="question"),
+    ]
     keyboard = [row]
     if is_admin:
-        keyboard.append([KeyboardButton(text=t(lang, "btn_admin"))])
+        keyboard.append([rkb(text=t(lang, "btn_admin"), style="danger", emoji_key="settings")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def admin_reply_kb(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=t(lang, "btn_stats")), KeyboardButton(text=t(lang, "btn_broadcast"))],
-            [KeyboardButton(text=t(lang, "btn_add_channel"))],
-            [KeyboardButton(text=t(lang, "btn_list_channels"))],
-            [KeyboardButton(text=t(lang, "btn_clear_cache")), KeyboardButton(text=t(lang, "btn_db_export"))],
-            [KeyboardButton(text=t(lang, "btn_db_import"))],
-            [KeyboardButton(text=t(lang, "btn_back"))],
+            [
+                rkb(text=t(lang, "btn_stats"), style="primary", emoji_key="stats"),
+                rkb(text=t(lang, "btn_broadcast"), style="success", emoji_key="megaphone"),
+            ],
+            [rkb(text=t(lang, "btn_add_channel"), style="success", emoji_key="plus")],
+            [rkb(text=t(lang, "btn_list_channels"), style="primary", emoji_key="list")],
+            [
+                rkb(text=t(lang, "btn_clear_cache"), style="danger", emoji_key="trash"),
+                rkb(text=t(lang, "btn_db_export"), style="primary", emoji_key="upload"),
+            ],
+            [rkb(text=t(lang, "btn_db_import"), style="primary", emoji_key="download")],
+            [rkb(text=t(lang, "btn_back"), style="danger", emoji_key="back")],
         ],
         resize_keyboard=True,
     )
@@ -1292,7 +1551,7 @@ def is_admin(user_id: int) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await add_user_if_missing(message.from_user.id)
-    await message.answer(f"<b>{BOT_DISPLAY_NAME}</b>")
+    await message.answer(f'{ce("sparkles")} <b>{_html.escape(BOT_DISPLAY_NAME)}</b> {ce("rocket")}')
     await message.answer(t("uz", "choose_lang"), reply_markup=lang_inline_kb())
 
 
@@ -1312,18 +1571,18 @@ async def cb_lang(call: CallbackQuery):
 # ============================================================
 # HANDLERS: persistent reply-keyboard buttons (user side)
 # ============================================================
-@router.message(F.text.in_({v["btn_lang"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_lang")))
 async def btn_change_lang(message: Message):
     await message.answer(t("uz", "choose_lang"), reply_markup=lang_inline_kb())
 
 
-@router.message(F.text.in_({v["btn_help"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_help")))
 async def btn_help(message: Message):
     lang = await get_user_lang(message.from_user.id)
     await message.answer(t(lang, "help"))
 
 
-@router.message(F.text.in_({v["btn_admin"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_admin")))
 async def btn_admin_panel(message: Message):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1331,7 +1590,7 @@ async def btn_admin_panel(message: Message):
     await message.answer(t(lang, "admin_panel"), reply_markup=admin_reply_kb(lang))
 
 
-@router.message(F.text.in_({v["btn_back"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_back")))
 async def btn_back_to_user(message: Message, state: FSMContext):
     await state.clear()
     lang = await get_user_lang(message.from_user.id)
@@ -1341,7 +1600,7 @@ async def btn_back_to_user(message: Message, state: FSMContext):
 # ============================================================
 # HANDLERS: admin - stats / broadcast
 # ============================================================
-@router.message(F.text.in_({v["btn_stats"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_stats")))
 async def btn_stats(message: Message):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1349,7 +1608,7 @@ async def btn_stats(message: Message):
     await message.answer(t(lang, "stats", count=await count_users()))
 
 
-@router.message(F.text.in_({v["btn_broadcast"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_broadcast")))
 async def btn_broadcast_ask(message: Message, state: FSMContext):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1378,7 +1637,7 @@ async def do_broadcast(message: Message, state: FSMContext):
 # ============================================================
 # HANDLERS: admin - clear in-memory cache
 # ============================================================
-@router.message(F.text.in_({v["btn_clear_cache"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_clear_cache")))
 async def btn_clear_cache(message: Message):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1401,7 +1660,7 @@ async def btn_clear_cache(message: Message):
 # ============================================================
 # HANDLERS: admin - DB export (zip of one .vk file per user)
 # ============================================================
-@router.message(F.text.in_({v["btn_db_export"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_db_export")))
 async def btn_db_export(message: Message):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1437,7 +1696,7 @@ async def btn_db_export(message: Message):
 # ============================================================
 # HANDLERS: admin - DB import (admin resends exported .zip / .vk files)
 # ============================================================
-@router.message(F.text.in_({v["btn_db_import"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_db_import")))
 async def btn_db_import_ask(message: Message, state: FSMContext):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1535,7 +1794,7 @@ async def cmd_admin(message: Message):
 # ============================================================
 # HANDLERS: admin - mandatory subscriptions (add / list / remove)
 # ============================================================
-@router.message(F.text.in_({v["btn_add_channel"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_add_channel")))
 async def btn_add_channel_ask(message: Message, state: FSMContext):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1720,15 +1979,19 @@ async def _build_channel_rows(lang: str, channels) -> list:
         count = await count_channel_subscribers(c["chat_id"])
         subs_label = t(lang, "channel_subs_label", count=count)
         rows.append(
-            [InlineKeyboardButton(
-                text=f"❌ {c['title']} ({kind}, {subs_label})",
-                callback_data=f"delchan:{c['id']}",
-            )]
+            [
+                ikb(
+                    text=f"❌ {c['title']} ({kind}, {subs_label})",
+                    callback_data=f"delchan:{c['id']}",
+                    style="danger",
+                    emoji_key="trash",
+                )
+            ]
         )
     return rows
 
 
-@router.message(F.text.in_({v["btn_list_channels"] for v in TEXTS.values()}))
+@router.message(F.text.in_(_btn_texts("btn_list_channels")))
 async def btn_list_channels(message: Message):
     lang = await get_user_lang(message.from_user.id)
     if not is_admin(message.from_user.id):
@@ -1901,7 +2164,7 @@ def subscribe_kb(lang: str, channels) -> InlineKeyboardMarkup:
             # Telegram rejects the whole keyboard if any button text is empty,
             # and silently truncates very long ones - guard both.
             label = (c["title"] or "Kanal").strip()[:40] or "Kanal"
-            rows.append([InlineKeyboardButton(text=f"➕ {label}", url=url)])
+            rows.append([ikb(text=f"➕ {label}", url=url, style="primary", emoji_key="plus")])
         else:
             # A channel with no usable link can't be joined by the user, so
             # showing it as a requirement would trap them with no way out.
@@ -1912,7 +2175,7 @@ def subscribe_kb(lang: str, channels) -> InlineKeyboardMarkup:
                 "- users cannot join it. Remove and re-add it from the admin panel.",
                 c["title"], c["chat_id"],
             )
-    rows.append([InlineKeyboardButton(text=t(lang, "check_sub_btn"), callback_data="checksub")])
+    rows.append([ikb(text=t(lang, "check_sub_btn"), callback_data="checksub", style="success", emoji_key="check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2123,10 +2386,10 @@ class _FailureBreaker:
                     )
                     notify_admins(
                         f"{self.name}_circuit_open",
-                        f"🚨 {self.name.capitalize()} downloads muvaffaqiyatsiz bo'lyapti "
-                        f"({len(self._fails)} marta, {len({k for _, k in self._fails})} xil manba).\n"
-                        "Sabab ehtimol: JS runtime (deno/node) o'rnatilmagan, cookie eskirgan yoki IP bloklangan.\n"
-                        "Loglarda YTDLP_ENV va YOUTUBE_COOKIES_HARMFUL qatorlarini tekshiring.",
+                        f'{ce("alert")} <b>{_html.escape(self.name.capitalize())}</b> downloads muvaffaqiyatsiz bo\'lyapti '
+                        f'({len(self._fails)} marta, {len({k for _, k in self._fails})} xil manba).\n'
+                        f'{ce("warning")} Sabab ehtimol: JS runtime (deno/node) o\'rnatilmagan, cookie eskirgan yoki IP bloklangan.\n'
+                        f'{ce("info")} Loglarda YTDLP_ENV va YOUTUBE_COOKIES_HARMFUL qatorlarini tekshiring.',
                         cooldown=1800,
                     )
                 self._open_until = now + self.cooldown
@@ -2709,9 +2972,9 @@ def _note_instagram_empty_response(exc: Exception, retried_without_cookies: bool
     )
     notify_admins(
         "instagram_empty_response",
-        "🚨 Instagram hamma so'rovda bo'sh javob qaytaryapti (cookie bilan HAM, cookiesiz HAM).\n"
-        "Ehtimol: IP bloklangan yoki rate-limit. Cookie yangilash yordam bermaydi.\n"
-        "Tavsiya: PROXY_URL sozlang yoki biroz kuting.",
+        f'{ce("alert")} <b>Instagram</b> hamma so\'rovda bo\'sh javob qaytaryapti (cookie bilan HAM, cookiesiz HAM).\n'
+        f'{ce("warning")} Ehtimol: IP bloklangan yoki rate-limit. Cookie yangilash yordam bermaydi.\n'
+        f'{ce("info")} Tavsiya: PROXY_URL sozlang yoki biroz kuting.',
     )
 
 
@@ -2843,9 +3106,9 @@ def _handle_instagram_hard_failure(exc: Exception) -> None:
     if _is_instagram_rate_limit_error(exc):
         notify_admins(
             "instagram_rate_limit",
-            "⚠️ Instagram: rate-limit/login-wall javoblari kelyapti.\n"
-            f"So'nggi xato: {_short(exc, 300)}\n"
-            "Cookie yangilash yoki PROXY_URL sozlash kerak bo'lishi mumkin.",
+            f'{ce("warning")} <b>Instagram:</b> rate-limit/login-wall javoblari kelyapti.\n'
+            f'{ce("info")} So\'nggi xato: <code>{_html.escape(_short(exc, 300))}</code>\n'
+            f'{ce("settings")} Cookie yangilash yoki PROXY_URL sozlash kerak bo\'lishi mumkin.',
         )
 
 
@@ -3993,20 +4256,28 @@ def render_search_page(lang: str, token: str):
     page_items = results[start:end]
 
     lines = [
-        f"🔍 {data['query']}",
+        f'{ce("search")} <b>{_html.escape(str(data["query"]))}</b> {ce("notes")}',
         t(lang, "search_results_range", start=start + 1, end=end, total=len(results)),
         "",
     ]
     for i, item in enumerate(page_items, start=1):
         dur = format_duration(item.get("duration"))
         views = format_count(item.get("view_count"))
-        lines.append(f"{i}. {item['title']} — {dur} · 👁 {views}")
+        safe_title = _html.escape(str(item.get("title") or "Unknown"))
+        lines.append(f'{ce("music")} <b>{i}.</b> {safe_title} — {ce("clock")} {dur} · {ce("eye")} {views}')
     text = "\n".join(lines)
 
     number_rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for i in range(1, len(page_items) + 1):
-        row.append(InlineKeyboardButton(text=str(i), callback_data=f"srch:{token}:{i}"))
+        row.append(
+            ikb(
+                text=str(i),
+                callback_data=f"srch:{token}:{i}",
+                style="primary",
+                emoji_key="music",
+            )
+        )
         if len(row) == 4:
             number_rows.append(row)
             row = []
@@ -4015,10 +4286,10 @@ def render_search_page(lang: str, token: str):
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"srch:{token}:prev"))
-    nav_row.append(InlineKeyboardButton(text="❌", callback_data=f"srch:{token}:cancel"))
+        nav_row.append(ikb(text="«", callback_data=f"srch:{token}:prev", style="primary", emoji_key="prev"))
+    nav_row.append(ikb(text="✕", callback_data=f"srch:{token}:cancel", style="danger", emoji_key="cross"))
     if end < len(results):
-        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"srch:{token}:next"))
+        nav_row.append(ikb(text="»", callback_data=f"srch:{token}:next", style="success", emoji_key="next"))
 
     return text, InlineKeyboardMarkup(inline_keyboard=number_rows + [nav_row])
 
