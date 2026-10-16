@@ -1,6 +1,7 @@
 aiogram>=3.6.0
 shazamio
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
+curl_cffi
 pydub
 requests
 aiohttp
