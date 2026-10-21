@@ -3,6 +3,7 @@ import html as _html
 import importlib.util
 import io
 import logging
+import math
 import os
 import re
 import shutil
@@ -19,16 +20,9 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart, Command
-from aiogram.exceptions import (
-    TelegramRetryAfter,
-    TelegramBadRequest,
-    TelegramForbiddenError,
-    TelegramNetworkError,
-    TelegramServerError,
-)
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -326,26 +320,6 @@ INSTAGRAM_COOKIES_FILE = _setup_instagram_cookies()
 # Optional: Facebook login-wall cookies. See _setup_facebook_cookies().
 FACEBOOK_COOKIES_FILE = _setup_facebook_cookies()
 
-# Runtime invalidation flags: when yt-dlp detects that exported cookies have
-# been rotated/expired in the browser ("The provided ... account cookies are
-# no longer valid"), we automatically stop passing the dead cookie file on
-# subsequent requests so we don't poison every player_client attempt.
-_YOUTUBE_COOKIES_INVALIDATED = False
-_INSTAGRAM_COOKIES_INVALIDATED = False
-_FACEBOOK_COOKIES_INVALIDATED = False
-
-
-def _active_youtube_cookies() -> str | None:
-    return None if _YOUTUBE_COOKIES_INVALIDATED else COOKIES_FILE
-
-
-def _active_instagram_cookies() -> str | None:
-    return None if _INSTAGRAM_COOKIES_INVALIDATED else INSTAGRAM_COOKIES_FILE
-
-
-def _active_facebook_cookies() -> str | None:
-    return None if _FACEBOOK_COOKIES_INVALIDATED else FACEBOOK_COOKIES_FILE
-
 
 def _check_cookies_expiry(path):
     """Startup da cookie muddatini tekshiradi va ogohlantiradi."""
@@ -426,7 +400,27 @@ def _cache_put(cache: dict, key, value, max_size: int):
 # process is already using a lot of RAM, instead of letting Railway's OOM
 # killer take down the whole bot mid-request. Purely a safety valve - on a
 # healthy 1GB plan this basically never triggers.
-MEMORY_WATERMARK_MB = int(os.getenv("MEMORY_WATERMARK_MB", "750"))
+import ctypes
+import gc
+
+MEMORY_WATERMARK_MB = int(os.getenv("MEMORY_WATERMARK_MB", "900"))
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except Exception:
+    _LIBC = None
+
+
+def _reclaim_memory() -> None:
+    """Force Python GC and ask glibc to release freed heap arenas back to the
+    OS so /proc/self/status VmRSS drops after yt-dlp/shazamio jobs finish
+    instead of staying pinned at 780-806 MB forever."""
+    try:
+        gc.collect()
+        if _LIBC is not None and hasattr(_LIBC, "malloc_trim"):
+            _LIBC.malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _current_rss_mb() -> float | None:
@@ -523,9 +517,15 @@ class HeavyJobSlot:
         # things - caches, a job that just finished - can still be holding it).
         rss = _current_rss_mb()
         if rss is not None and rss > MEMORY_WATERMARK_MB:
+            _reclaim_memory()
+            rss = _current_rss_mb()
+        # Only reject if another heavy job is ALREADY running (or RSS is critically > 950MB).
+        # Never permanently lock out the bot when 0 heavy jobs are active!
+        active_jobs = HEAVY_JOB_SLOTS - getattr(HEAVY_JOB_SEMAPHORE, "_value", HEAVY_JOB_SLOTS)
+        if rss is not None and rss > MEMORY_WATERMARK_MB and (active_jobs > 0 or rss > 950):
             log.warning(
-                "MEMORY_WATERMARK_EXCEEDED: RSS=%.0fMB > %dMB limit, rejecting new heavy job",
-                rss, MEMORY_WATERMARK_MB,
+                "MEMORY_WATERMARK_EXCEEDED: RSS=%.0fMB > %dMB limit (active_jobs=%d), rejecting new heavy job",
+                rss, MEMORY_WATERMARK_MB, active_jobs,
             )
             raise RuntimeError(f"MEMORY_WATERMARK_EXCEEDED: server is using {rss:.0f}MB RAM right now")
 
@@ -536,9 +536,6 @@ class HeavyJobSlot:
             except Exception:
                 pass
         await HEAVY_JOB_SEMAPHORE.acquire()
-        # Only touch the status text again if we actually showed the
-        # "queued" message above - otherwise leave whatever the caller
-        # had already put there (e.g. a "found: <song>" message).
         if was_queued:
             try:
                 await self.status.edit_text(t(self.lang, self.busy_text_key))
@@ -548,6 +545,7 @@ class HeavyJobSlot:
 
     async def __aexit__(self, exc_type, exc, tb):
         HEAVY_JOB_SEMAPHORE.release()
+        _reclaim_memory()
         return False
 
 
@@ -558,49 +556,49 @@ class HeavyJobSlot:
 # key -> (custom_emoji_id, fallback_unicode_emoji)
 CUSTOM_EMOJI_MAP: dict[str, tuple[str, str]] = {
     "wave": ("5397679249937155116", "👋"),
-    "point_down": ("5436256074959194181", "👇"),
-    "globe": ("5350469811233110106", "🌐"),
+    "point_down": ("5436256074959194181", "⬇️"),
+    "globe": ("5350469811233110106", "🌎"),
     "flag_uz": ("5350469811233110106", "🇺🇿"),
     "flag_ru": ("5461155860094921420", "🇷🇺"),
     "flag_gb": ("5467887736000093669", "🇬🇧"),
     "link": ("5271604874419647061", "🔗"),
     "hourglass": ("5363826996314912469", "⏳"),
     "clock": ("5348383560933850994", "⏰"),
-    "stopwatch": ("5348383560933850994", "⏱"),
+    "stopwatch": ("5348383560933850994", "⏰"),
     "check": ("5206607081334906820", "✅"),
     "cross": ("5435930383294170924", "❌"),
     "music": ("5348201978306509336", "🎵"),
-    "notes": ("5348201978306509336", "🎶"),
+    "notes": ("5348201978306509336", "🎵"),
     "headphones": ("5354899958329784877", "🎧"),
     "sad": ("5429231939414409061", "😔"),
-    "lyrics": ("5346132860631791153", "📜"),
+    "lyrics": ("5346132860631791153", "📚"),
     "search": ("5348544647977254780", "🔍"),
     "warning": ("5431445849026611010", "⚠️"),
     "exclamation": ("5274099962655816924", "❗️"),
-    "alert": ("5424972470023104089", "🚨"),
+    "alert": ("5424972470023104089", "🔥"),
     "question": ("5436113877181941026", "❓"),
     "info": ("5323442290708985472", "ℹ️"),
-    "lock": ("5296369303661067030", "🔐"),
-    "forbidden": ("5260293700088511294", "⛔"),
-    "pin": ("5346081186714246816", "📌"),
+    "lock": ("5296369303661067030", "🔒"),
+    "forbidden": ("5260293700088511294", "🚫"),
+    "pin": ("5346081186714246816", "🔖"),
     "paperclip": ("5305265301917549162", "📎"),
-    "settings": ("5341715473882955310", "🛠"),
+    "settings": ("5341715473882955310", "⚙️"),
     "stats": ("5231200819986047254", "📊"),
     "user": ("5280882957261770698", "👤"),
-    "edit": ("5395444784611480792", "✍️"),
-    "megaphone": ("5291895124559671372", "📢"),
+    "edit": ("5395444784611480792", "✏️"),
+    "megaphone": ("5291895124559671372", "📣"),
     "plus": ("5397916757333654639", "➕"),
-    "list": ("5345987742276797245", "📋"),
-    "trash": ("5255933371980223131", "🗑"),
-    "upload": ("5258166849463419417", "📤"),
-    "download": ("5301067323573047237", "📥"),
+    "list": ("5345987742276797245", "📁"),
+    "trash": ("5255933371980223131", "🗑️"),
+    "upload": ("5258166849463419417", "⬆️"),
+    "download": ("5301067323573047237", "⬇️"),
     "package": ("5195169153928946332", "📦"),
-    "empty_box": ("5453996128137676323", "📭"),
-    "back": ("5255999157994297240", "⬅️"),
+    "empty_box": ("5453996128137676323", "📩"),
+    "back": ("5255999157994297240", "◀️"),
     "prev": ("5255999157994297240", "◀️"),
-    "next": ("5456119091817384146", "▶️"),
-    "eye": ("5350654889963828012", "👁"),
-    "video": ("5255906670168543594", "🎬"),
+    "next": ("5456119091817384146", "➡️"),
+    "eye": ("5350654889963828012", "👀"),
+    "video": ("5255906670168543594", "📹"),
     "sparkles": ("5436020079391183032", "✨"),
     "fire": ("5424972470023104089", "🔥"),
     "star": ("5438496463044752972", "⭐️"),
@@ -1045,45 +1043,15 @@ def _btn_texts(key: str) -> set[str]:
 
 
 # ============================================================
-# DATABASE (PostgreSQL via asyncpg) + IN-MEMORY CACHING
-#
-# Production logs showed unhandled asyncpg TimeoutErrors inside `get_lang`
-# and `list_channels` during heavy download/ffmpeg spikes because EVERY
-# single message and callback executed 2-3 DB queries (`add_user_if_missing`,
-# `get_lang`, `list_channels`). Caching known users, user languages, and
-# mandatory channels in memory eliminates >95% of routine DB queries and
-# provides an instant fallback if the DB briefly stalls.
+# DATABASE (PostgreSQL via asyncpg)
 # ============================================================
-_KNOWN_USERS: set[int] = set()
-_USER_LANG_CACHE: dict[int, str] = {}
-_USER_CACHE_MAX_SIZE = 50000
-_CHANNELS_CACHE: list | None = None
-_CHANNELS_CACHE_TS: float = 0.0
-_CHANNELS_CACHE_TTL: float = 60.0
-_JOIN_REQUEST_CACHE: set[tuple[int, int]] = set()
-
-
-def _remember_user_lang(user_id: int, lang: str) -> None:
-    _KNOWN_USERS.add(user_id)
-    if len(_KNOWN_USERS) > _USER_CACHE_MAX_SIZE:
-        _KNOWN_USERS.clear()
-        _KNOWN_USERS.add(user_id)
-    _cache_put(_USER_LANG_CACHE, user_id, lang, _USER_CACHE_MAX_SIZE)
-
-
-def _invalidate_channels_cache() -> None:
-    global _CHANNELS_CACHE_TS
-    _CHANNELS_CACHE_TS = 0.0
-
-
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
-        max_size=10,
-        command_timeout=15,
-        timeout=10,
+        max_size=5,
+        command_timeout=5,  # fail fast instead of hanging a whole request if the DB is slow/unreachable
     )
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1121,45 +1089,25 @@ async def init_db():
 
 
 async def add_user_if_missing(user_id: int):
-    if user_id in _KNOWN_USERS:
-        return
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            await conn.execute(
-                "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id
-            )
-        _KNOWN_USERS.add(user_id)
-    except Exception as e:
-        log.warning("DB add_user_if_missing skipped (user=%s): %s", user_id, _short(e))
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id
+        )
 
 
 async def set_lang(user_id: int, lang: str):
-    _remember_user_lang(user_id, lang)
-    try:
-        async with pool.acquire(timeout=8) as conn:
-            await conn.execute(
-                """INSERT INTO users (user_id, lang) VALUES ($1, $2)
-                   ON CONFLICT (user_id) DO UPDATE SET lang = EXCLUDED.lang""",
-                user_id, lang,
-            )
-    except Exception as e:
-        log.warning("DB set_lang failed (cached in memory for user=%s): %s", user_id, _short(e))
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO users (user_id, lang) VALUES ($1, $2)
+               ON CONFLICT (user_id) DO UPDATE SET lang = EXCLUDED.lang""",
+            user_id, lang,
+        )
 
 
 async def get_lang(user_id: int) -> str | None:
-    cached = _USER_LANG_CACHE.get(user_id)
-    if cached:
-        return cached
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            row = await conn.fetchrow("SELECT lang FROM users WHERE user_id=$1", user_id)
-        if row and row["lang"]:
-            _remember_user_lang(user_id, row["lang"])
-            return row["lang"]
-        return None
-    except Exception as e:
-        log.warning("DB get_lang timeout/error for user=%s (falling back to 'uz'): %s", user_id, _short(e))
-        return _USER_LANG_CACHE.get(user_id, "uz")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT lang FROM users WHERE user_id=$1", user_id)
+        return row["lang"] if row else None
 
 
 async def get_all_user_ids() -> list[int]:
@@ -1183,29 +1131,16 @@ async def add_channel(chat_id: int, title: str, username: str | None, is_private
                  is_private=EXCLUDED.is_private, invite_link=EXCLUDED.invite_link""",
             chat_id, title, username, is_private, invite_link,
         )
-    _invalidate_channels_cache()
 
 
 async def list_channels():
-    global _CHANNELS_CACHE, _CHANNELS_CACHE_TS
-    now = time.monotonic()
-    if _CHANNELS_CACHE is not None and (now - _CHANNELS_CACHE_TS) < _CHANNELS_CACHE_TTL:
-        return _CHANNELS_CACHE
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            rows = await conn.fetch("SELECT * FROM mandatory_channels ORDER BY id")
-        _CHANNELS_CACHE = rows
-        _CHANNELS_CACHE_TS = now
-        return rows
-    except Exception as e:
-        log.warning("DB list_channels timeout/error (using cached channels): %s", _short(e))
-        return _CHANNELS_CACHE if _CHANNELS_CACHE is not None else []
+    async with pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM mandatory_channels ORDER BY id")
 
 
 async def remove_channel(channel_id: int):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM mandatory_channels WHERE id=$1", channel_id)
-    _invalidate_channels_cache()
 
 
 async def get_channel(channel_id: int):
@@ -1214,57 +1149,39 @@ async def get_channel(channel_id: int):
 
 
 async def log_join_request(chat_id: int, user_id: int):
-    _JOIN_REQUEST_CACHE.add((chat_id, user_id))
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            await conn.execute(
-                "INSERT INTO join_requests (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                chat_id, user_id,
-            )
-    except Exception as e:
-        log.warning("DB log_join_request failed (cached in memory): %s", _short(e))
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO join_requests (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            chat_id, user_id,
+        )
 
 
 async def has_join_request(chat_id: int, user_id: int) -> bool:
-    if (chat_id, user_id) in _JOIN_REQUEST_CACHE:
-        return True
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            row = await conn.fetchrow(
-                "SELECT 1 FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
-            )
-        if row is not None:
-            _JOIN_REQUEST_CACHE.add((chat_id, user_id))
-            return True
-        return False
-    except Exception as e:
-        log.warning("DB has_join_request timeout/error: %s", _short(e))
-        return (chat_id, user_id) in _JOIN_REQUEST_CACHE
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
+        )
+        return row is not None
 
 
 async def clear_join_request(chat_id: int, user_id: int):
-    """Drop a logged join request."""
-    _JOIN_REQUEST_CACHE.discard((chat_id, user_id))
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            await conn.execute(
-                "DELETE FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
-            )
-    except Exception as e:
-        log.warning("DB clear_join_request error: %s", _short(e))
+    """Drop a logged join request.
+
+    Needed because a pending request counts as satisfying the mandatory
+    subscription. If the user later leaves the channel (or an admin removes
+    them), the stale row would otherwise keep them marked as subscribed
+    forever, letting them use the bot without being in the channel at all.
+    Clearing it means they have to request again.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM join_requests WHERE chat_id=$1 AND user_id=$2", chat_id, user_id
+        )
 
 
 async def get_channel_by_chat_id(chat_id: int):
-    if _CHANNELS_CACHE is not None:
-        for c in _CHANNELS_CACHE:
-            if c["chat_id"] == chat_id:
-                return c
-    try:
-        async with pool.acquire(timeout=5) as conn:
-            return await conn.fetchrow("SELECT * FROM mandatory_channels WHERE chat_id=$1", chat_id)
-    except Exception as e:
-        log.warning("DB get_channel_by_chat_id timeout/error: %s", _short(e))
-        return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM mandatory_channels WHERE chat_id=$1", chat_id)
 
 
 async def mark_channel_subscriber(chat_id: int, user_id: int):
@@ -1317,7 +1234,6 @@ async def upsert_user_export(record: dict) -> bool:
     existing one."""
     user_id = int(record["user_id"])
     lang = record.get("lang") or "uz"
-    _remember_user_lang(user_id, lang)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO users (user_id, lang) VALUES ($1, $2)
@@ -1338,35 +1254,58 @@ async def upsert_user_export(record: dict) -> bool:
 # ============================================================
 # BOT / DISPATCHER
 # ============================================================
-# Increase HTTP request timeout from default 60s to 180s so 30-50 MB video
-# uploads don't fail with `HTTP Client says - Request timeout error` (seen in logs).
-_bot_session = AiohttpSession(timeout=180)
-bot = Bot(
-    token=BOT_TOKEN,
-    session=_bot_session,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL", "").strip() or None
+if LOCAL_BOT_API_URL:
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiogram.client.telegram import TelegramAPIServer
+
+    _bot_session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_BOT_API_URL))
+    bot = Bot(token=BOT_TOKEN, session=_bot_session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+else:
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 
-async def _send_with_retry(coro_factory, retries: int = 2):
-    """Execute a Telegram send/upload call, retrying once on transient
-    TelegramNetworkError / TelegramServerError (e.g. Request timeout or Bad Gateway)."""
-    for attempt in range(retries):
-        try:
-            return await coro_factory()
-        except (TelegramNetworkError, TelegramServerError) as e:
-            if attempt + 1 >= retries:
-                raise
-            log.warning("Telegram send transient error (%s), retrying (%d/%d)...", _short(e), attempt + 1, retries)
-            await asyncio.sleep(2 * (attempt + 1))
+def _strip_button_custom_emojis(method) -> bool:
+    changed = False
+    markup = getattr(method, "reply_markup", None)
+    if markup is not None:
+        rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None)
+        if rows:
+            for row in rows:
+                for btn in row:
+                    cid = getattr(btn, "icon_custom_emoji_id", None)
+                    extra = getattr(btn, "__pydantic_extra__", None)
+                    if not cid and isinstance(extra, dict):
+                        cid = extra.get("icon_custom_emoji_id")
+                    if cid:
+                        changed = True
+                        fb = _ID_TO_FALLBACK.get(str(cid))
+                        cur_text = getattr(btn, "text", "") or ""
+                        if fb and fb not in cur_text:
+                            object.__setattr__(btn, "text", f"{fb} {cur_text}".strip())
+                        if getattr(btn, "icon_custom_emoji_id", None):
+                            object.__setattr__(btn, "icon_custom_emoji_id", None)
+                        if isinstance(extra, dict):
+                            extra.pop("icon_custom_emoji_id", None)
+    return changed
+
+
+def _strip_text_custom_emojis(method) -> bool:
+    changed = False
+    for attr in ("text", "caption"):
+        val = getattr(method, attr, None)
+        if isinstance(val, str) and "<tg-emoji" in val:
+            object.__setattr__(method, attr, strip_tg_emoji(val))
+            changed = True
+    return changed
 
 
 async def _custom_emoji_fallback_middleware(make_request, b: Bot, method):
-    """Resilient Bot API 9.4+ middleware: if the bot owner does not have
-    Telegram Premium yet or Telegram rejects a custom emoji ID on a message
-    or button, automatically strip <tg-emoji> tags (keeping fallback emojis)
-    and `icon_custom_emoji_id` (keeping button `style` colors!) and retry."""
+    """Two-stage resilient Bot API 9.4+ middleware:
+    1) If Telegram rejects a button `icon_custom_emoji_id`, strip ONLY button custom emoji IDs
+       while preserving all `<tg-emoji>` animations in the message text/caption and button `style` colors.
+    2) Only if the retry (or a text-only call) still fails due to custom emojis, fall back to plain emojis."""
     try:
         return await make_request(b, method)
     except TelegramBadRequest as e:
@@ -1375,30 +1314,13 @@ async def _custom_emoji_fallback_middleware(make_request, b: Bot, method):
             token in err_msg
             for token in ("custom_emoji", "document_invalid", "button_icon", "emoji_id", "can't use custom emoji")
         ):
-            log.warning("Custom emoji rejected by Telegram (%s) - retrying with standard emoji fallback", e)
-            for attr in ("text", "caption"):
-                val = getattr(method, attr, None)
-                if isinstance(val, str) and "<tg-emoji" in val:
-                    object.__setattr__(method, attr, strip_tg_emoji(val))
-            markup = getattr(method, "reply_markup", None)
-            if markup is not None:
-                rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None)
-                if rows:
-                    for row in rows:
-                        for btn in row:
-                            cid = getattr(btn, "icon_custom_emoji_id", None)
-                            extra = getattr(btn, "__pydantic_extra__", None)
-                            if not cid and isinstance(extra, dict):
-                                cid = extra.get("icon_custom_emoji_id")
-                            if cid:
-                                fb = _ID_TO_FALLBACK.get(str(cid))
-                                cur_text = getattr(btn, "text", "") or ""
-                                if fb and fb not in cur_text:
-                                    object.__setattr__(btn, "text", f"{fb} {cur_text}".strip())
-                                if getattr(btn, "icon_custom_emoji_id", None):
-                                    object.__setattr__(btn, "icon_custom_emoji_id", None)
-                                if isinstance(extra, dict):
-                                    extra.pop("icon_custom_emoji_id", None)
+            log.warning("Custom emoji error from Telegram (%s) - attempting stage-1 button fallback", e)
+            if _strip_button_custom_emojis(method):
+                try:
+                    return await make_request(b, method)
+                except TelegramBadRequest as e2:
+                    log.warning("Stage-1 retry failed (%s) - falling back to standard text emojis", e2)
+            _strip_text_custom_emojis(method)
             return await make_request(b, method)
         raise
 
@@ -1494,13 +1416,11 @@ async def handle_dispatcher_errors(event) -> bool:
         # traceback here would just bury real errors in the logs.
         log.info("update dropped: bot was blocked by the user")
         return True
-    if isinstance(exc, (TelegramNetworkError, TelegramServerError)):
+    if isinstance(exc, TelegramNetworkError):
         # Transient Telegram/network hiccup (the request itself already
-        # timed out inside aiogram's own retry logic or Telegram returned 502 Bad Gateway)
-        log.warning("update dropped: Telegram network/server error (%s)", exc)
-        return True
-    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
-        log.warning("update dropped: operation timed out (%s)", exc)
+        # timed out inside aiogram's own retry logic) - worth knowing about
+        # if it's frequent, but not a bug in this bot, so no full traceback.
+        log.warning("update dropped: Telegram network error (%s)", exc)
         return True
     log.exception("Unhandled exception while processing an update: %s", exc)
     return True
@@ -2360,10 +2280,41 @@ def detect_platform(url: str) -> str | None:
 #   * size/duration caps- a 77 MB / 404-fragment track was downloaded for
 #                         2m12s and then rejected by Telegram (50 MB limit).
 # ============================================================
-MAX_TRACK_SECONDS = int(os.getenv("MAX_TRACK_SECONDS", "1200"))  # 20 min
-# Bot API limits: 50 MB for uploads, 20 MB for getFile downloads.
-TELEGRAM_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024
-TELEGRAM_GETFILE_LIMIT_BYTES = 20 * 1024 * 1024
+MAX_TRACK_SECONDS = int(os.getenv("MAX_TRACK_SECONDS", "3600"))  # 60 min (smart audio selector fits <49 MB)
+# Standard Bot API limits: 50 MB for uploads, 20 MB for getFile downloads.
+# Automatically expands to 2000 MB if LOCAL_BOT_API_URL is configured.
+TELEGRAM_UPLOAD_LIMIT_BYTES = (1950 if LOCAL_BOT_API_URL else 49) * 1024 * 1024
+TELEGRAM_GETFILE_LIMIT_BYTES = (1950 if LOCAL_BOT_API_URL else 20) * 1024 * 1024
+SPLIT_PART_TARGET_BYTES = 43 * 1024 * 1024  # Safe target (<49 MB) for lossless ffmpeg segment splitting
+MAX_SPLIT_PARTS = int(os.getenv("MAX_SPLIT_PARTS", "8"))  # Up to ~350 MB total video split into parts
+
+# Smart size-aware format selectors for Railway Free (1 GB RAM / 1 GB /tmp):
+# Picks highest resolution (1080p for short clips, 720p/480p/360p for long videos)
+# that fits inside Telegram's 50 MB limit BEFORE downloading, saving RAM & disk.
+SMART_YOUTUBE_VIDEO_FORMAT = (
+    "bv*[vcodec^=avc1][filesize<40M]+ba[ext=m4a][filesize<8M]/"
+    "bv*[vcodec^=avc1][filesize_approx<40M]+ba[ext=m4a][filesize_approx<8M]/"
+    "b[vcodec^=avc1][filesize<48M]/b[vcodec^=avc1][filesize_approx<48M]/"
+    "bv*[vcodec^=avc1][height<=720][filesize_approx<45M]+ba[ext=m4a]/"
+    "bv*[vcodec^=avc1][height<=480]+ba[ext=m4a]/"
+    "bv*[vcodec^=avc1][height<=360]+ba[ext=m4a]/"
+    "bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]/"
+    "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
+)
+
+SMART_GENERIC_VIDEO_FORMAT = (
+    "bestvideo[ext=mp4][filesize<40M]+bestaudio[ext=m4a][filesize<8M]/"
+    "bestvideo[ext=mp4][filesize_approx<40M]+bestaudio[ext=m4a][filesize_approx<8M]/"
+    "best[ext=mp4][filesize<48M]/best[ext=mp4][filesize_approx<48M]/"
+    "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/"
+    "bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/"
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+)
+
+SMART_AUDIO_FORMAT = (
+    "bestaudio[filesize<45M]/bestaudio[filesize_approx<45M]/"
+    "bestaudio[abr<=160]/bestaudio/best"
+)
 
 
 class MediaTooLargeError(RuntimeError):
@@ -2379,8 +2330,83 @@ def _ensure_within_upload_limit(path: str) -> None:
         return
     if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
         raise MediaTooLargeError(
-            f"file is {size / 1048576:.1f} MB, Telegram bot upload limit is 50 MB"
+            f"file is {size / 1048576:.1f} MB, Telegram bot upload limit is {TELEGRAM_UPLOAD_LIMIT_BYTES // 1048576} MB"
         )
+
+
+def _split_large_media_lossless(filepath: str, outdir: str) -> list[str]:
+    """Railway Free friendly large-file handler:
+    If `filepath` is within TELEGRAM_UPLOAD_LIMIT_BYTES (49 MB), returns `[filepath]`.
+    If it is larger (e.g. 60-350 MB video/audio), splits it into <=45 MB parts
+    using `ffmpeg -c copy -f segment` (zero re-encoding, <15 MB RAM, 1-2s CPU)
+    and removes the oversized original file immediately so /tmp disk never fills up."""
+    try:
+        size = os.path.getsize(filepath)
+    except OSError:
+        return [filepath]
+    if size <= TELEGRAM_UPLOAD_LIMIT_BYTES:
+        return [filepath]
+
+    ext = os.path.splitext(filepath)[1].lower() or ".mp4"
+    if ext not in (".mp4", ".mov", ".mkv", ".webm", ".mp3", ".m4a"):
+        raise MediaTooLargeError(f"file is {size / 1048576:.1f} MB and cannot be segmented")
+
+    num_parts = max(2, math.ceil(size / SPLIT_PART_TARGET_BYTES))
+    if num_parts > MAX_SPLIT_PARTS:
+        raise MediaTooLargeError(
+            f"file is {size / 1048576:.1f} MB ({num_parts} parts > max {MAX_SPLIT_PARTS})"
+        )
+
+    _, _, duration = _probe_media_dims(filepath)
+    if duration and duration > 0:
+        seg_time = max(8, int(duration / num_parts))
+    else:
+        # Fallback if duration banner wasn't parsed: assume ~2.5 MB/s average bitrate
+        seg_time = max(15, int(SPLIT_PART_TARGET_BYTES / (2.5 * 1024 * 1024)))
+
+    out_Ext = ".mp4" if ext in (".mp4", ".mov", ".mkv", ".webm") else ext
+    pattern = os.path.join(outdir, f"part_%03d{out_Ext}")
+    cmd = [
+        FFMPEG_PATH, "-y", "-nostats", "-i", filepath,
+        "-c", "copy",
+        "-f", "segment",
+        "-segment_time", str(seg_time),
+        "-reset_timestamps", "1",
+        pattern,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    parts = sorted(
+        os.path.join(outdir, f)
+        for f in os.listdir(outdir)
+        if f.startswith("part_") and f.endswith(out_Ext)
+    )
+    if proc.returncode != 0 or not parts:
+        for p in parts:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        raise MediaTooLargeError(f"file is {size / 1048576:.1f} MB and lossless split failed")
+
+    # Verify each part is within limit
+    for p in parts:
+        if os.path.getsize(p) > TELEGRAM_UPLOAD_LIMIT_BYTES:
+            for cleanup_p in parts:
+                try:
+                    os.remove(cleanup_p)
+                except OSError:
+                    pass
+            raise MediaTooLargeError(
+                f"split segment {os.path.basename(p)} still exceeds {TELEGRAM_UPLOAD_LIMIT_BYTES // 1048576} MB"
+            )
+
+    # Free the oversized original file right away so Railway's 1 GB /tmp disk stays clean!
+    try:
+        os.remove(filepath)
+    except OSError:
+        pass
+    log.info("Split %.1f MB media into %d lossless parts (%ds each)", size / 1048576, len(parts), seg_time)
+    return parts
 
 
 def _short(value, limit: int = 220) -> str:
@@ -2408,40 +2434,7 @@ class _YDLLogger:
         pass
 
     def warning(self, msg):
-        global _YOUTUBE_COOKIES_INVALIDATED, _INSTAGRAM_COOKIES_INVALIDATED, _FACEBOOK_COOKIES_INVALIDATED
         text = str(msg)
-        low = text.lower()
-        # Automatically disable rotated/invalid cookies at runtime so we stop
-        # passing dead cookies to every subsequent yt-dlp request.
-        if "cookies are no longer valid" in low:
-            if "[youtube" in low and not _YOUTUBE_COOKIES_INVALIDATED:
-                _YOUTUBE_COOKIES_INVALIDATED = True
-                log.error(
-                    "YOUTUBE_COOKIES_ROTATED: yt-dlp reported YouTube cookies are no longer valid - "
-                    "auto-disabling YOUTUBE_COOKIES for this session and switching to cookieless clients."
-                )
-                notify_admins(
-                    "youtube_cookies_rotated",
-                    f'{ce("warning")} <b>YouTube cookies</b> muddati tugagan yoki brauzerda yangilangan (rotated).\n'
-                    f'{ce("info")} Bot avtomatik ravishda cookiesiz rejimga o\'tdi. Yangi cookies eksport qilib YOUTUBE_COOKIES ni yangilang.',
-                )
-            elif "[instagram" in low and not _INSTAGRAM_COOKIES_INVALIDATED:
-                _INSTAGRAM_COOKIES_INVALIDATED = True
-                log.error(
-                    "INSTAGRAM_COOKIES_ROTATED: yt-dlp reported Instagram cookies are no longer valid - "
-                    "auto-disabling INSTAGRAM_COOKIES for this session."
-                )
-                notify_admins(
-                    "instagram_cookies_rotated",
-                    f'{ce("warning")} <b>Instagram cookies</b> eskirgan (no longer valid).\n'
-                    f'{ce("info")} Bot avtomatik ravishda cookiesiz rejimga o\'tdi. INSTAGRAM_COOKIES ni yangilang.',
-                )
-            elif "[facebook" in low and not _FACEBOOK_COOKIES_INVALIDATED:
-                _FACEBOOK_COOKIES_INVALIDATED = True
-                log.error(
-                    "FACEBOOK_COOKIES_ROTATED: yt-dlp reported Facebook cookies are no longer valid - "
-                    "auto-disabling FACEBOOK_COOKIES for this session."
-                )
         key = re.sub(r"(\[[^\]]+\])\s+[^\s:\]]+:", r"\1 <id>:", text)[:120]
         if key in self._seen or len(self._seen) > 200:
             return
@@ -2625,7 +2618,6 @@ _DEFINITIVE_MARKERS = (
     "members-only", "members only", "not available in your country",
     "blocked it in your country", "copyright",
     "video unavailable", "video is unavailable",
-    "video is not available", "this video is not available",
 )
 
 
@@ -2773,57 +2765,39 @@ def _yt_with_clients(key: str, outdir, configure, runner, *,
             _YT_CLIENT_FAILURE_COUNTS[first] = max(0, _YT_CLIENT_FAILURE_COUNTS[first] - 1)
         YOUTUBE_BREAKER.success()
         return result
-    active_yt_cookies = _active_youtube_cookies()
     if (
-        last_exc is not None and YT_COOKIELESS_RETRY and active_yt_cookies and saw_bot_check
+        last_exc is not None and YT_COOKIELESS_RETRY and COOKIES_FILE and saw_bot_check
         and (deadline is None or time.monotonic() <= deadline)
     ):
-        global _cookieless_hint_logged, _YOUTUBE_COOKIES_INVALIDATED
-        # Try cookieless-friendly clients (android_vr and tv/mweb) rather than only clients[0]
-        cookieless_candidates = [["android_vr"], ["tv"], ["mweb"], clients[0]]
-        seen_c = set()
-        dedup_cookieless = []
-        for c in cookieless_candidates:
-            k = tuple(c)
-            if k not in seen_c:
-                seen_c.add(k)
-                dedup_cookieless.append(c)
-        for idx, cl_client in enumerate(dedup_cookieless[:2]):
-            if idx > 0 and deadline is not None and time.monotonic() > deadline:
-                break
-            ydl_opts = _build_ydl_opts_base(outdir, cl_client, cookies_file=None)
-            configure(ydl_opts)
-            if use_proxy:
-                proxy = _pick_youtube_proxy(idx)
-                if proxy:
-                    ydl_opts["proxy"] = proxy
-            try:
-                result = runner(ydl_opts)
-            except MediaTooLargeError:
-                YOUTUBE_BREAKER.success()
-                raise
-            except Exception as e:
-                last_exc = e
-                saw_bot_check = saw_bot_check or _is_bot_check_error(e)
-                log.warning("YouTube retry WITHOUT cookies (%s) failed too: %s", cl_client, _short(e))
-            else:
-                _YOUTUBE_COOKIES_INVALIDATED = True
-                if not _cookieless_hint_logged:
-                    _cookieless_hint_logged = True
-                    log.error(
-                        "YOUTUBE_COOKIES_HARMFUL: the request failed with cookies but worked WITHOUT them - "
-                        "auto-disabling YOUTUBE_COOKIES for this session. Export fresh cookies from a private window "
-                        "(and close it), or remove YOUTUBE_COOKIES."
-                    )
-                YOUTUBE_BREAKER.success()
-                return result
+        global _cookieless_hint_logged
+        ydl_opts = _build_ydl_opts_base(outdir, clients[0])
+        ydl_opts.pop("cookiefile", None)
+        configure(ydl_opts)
+        if use_proxy:
+            proxy = _pick_youtube_proxy(0)
+            if proxy:
+                ydl_opts["proxy"] = proxy
+        try:
+            result = runner(ydl_opts)
+        except MediaTooLargeError:
+            YOUTUBE_BREAKER.success()
+            raise
+        except Exception as e:
+            last_exc = e
+            saw_bot_check = saw_bot_check or _is_bot_check_error(e)
+            log.warning("YouTube retry WITHOUT cookies failed too: %s", _short(e))
+        else:
+            if not _cookieless_hint_logged:
+                _cookieless_hint_logged = True
+                log.error(
+                    "YOUTUBE_COOKIES_HARMFUL: the request failed with cookies but worked WITHOUT them - "
+                    "YOUTUBE_COOKIES is stale/rotated. Export fresh cookies from a private window "
+                    "(and close it), or remove YOUTUBE_COOKIES."
+                )
+            YOUTUBE_BREAKER.success()
+            return result
     YOUTUBE_BREAKER.failure(key)
     _raise_ytdlp_failure(last_exc, saw_bot_check)
-
-
-# Clients in yt-dlp that do not support cookies (passing cookiefile causes yt-dlp
-# to skip the client or fail with a bot-check).
-_COOKIELESS_ONLY_YT_CLIENTS = {"android_vr", "android", "ios", "android_sdkless"}
 
 
 def _build_ydl_opts_base(outdir, player_clients, cookies_file: str | None = "__default__"):
@@ -2857,10 +2831,7 @@ def _build_ydl_opts_base(outdir, player_clients, cookies_file: str | None = "__d
     if outdir:
         opts["outtmpl"] = os.path.join(outdir, "%(id)s.%(ext)s")
     if cookies_file == "__default__":
-        cookies_file = _active_youtube_cookies()
-        # Do not attach cookies if all requested player_clients are cookieless-only
-        if player_clients and all(c in _COOKIELESS_ONLY_YT_CLIENTS for c in player_clients):
-            cookies_file = None
+        cookies_file = COOKIES_FILE
     cookie_copy = _private_cookie_copy(cookies_file, outdir)
     if cookie_copy:
         opts["cookiefile"] = cookie_copy
@@ -2928,104 +2899,27 @@ def _private_cookie_copy(cookies_file: str | None, outdir: str | None) -> str | 
         log.warning("could not make a private cookie copy (%s), falling back to the shared file", e)
         return cookies_file
 
-_IG_SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)")
-_CRAWLER_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
-
-
-def _scrape_instagram_embed(url: str, outdir: str, want_video: bool = True):
-    """Fallback for Instagram posts/reels when yt-dlp fails with 'There is no
-    video in this post', 'No video formats found!', or 'Instagram sent an
-    empty media response'. Fetches Instagram's public `/p/<code>/embed/captioned/`
-    endpoint (which works without login cookies even from datacenter IPs) and
-    extracts the direct video_url or display_url/EmbeddedMediaImage."""
-    m = _IG_SHORTCODE_RE.search(url or "")
-    if not m:
-        return None
-    shortcode = m.group(1)
-    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
+    """Last-resort image grab that doesn't depend on yt-dlp at all: fetch the
+    page HTML directly and pull the og:image meta tag. Used when yt-dlp's
+    extractor can't even build metadata for a post (some Pinterest image
+    pins raise 'No video formats found!' during extraction itself, before
+    any format selection or thumbnail data is available)."""
     try:
-        req = urllib.request.Request(
-            embed_url,
-            headers={
-                "User-Agent": DEFAULT_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        log.info("Instagram embed fetch failed for %s: %s", shortcode, _short(e))
+        log.warning("og:image scrape failed to fetch page %s: %s", url, e)
         return None
 
-    # 1. Try video_url in embedded JSON if want_video is True
-    if want_video:
-        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
-        for raw_vid in vid_matches:
-            try:
-                vid_url = raw_vid.encode("utf-8").decode("unicode_escape").replace("\/", "/")
-                vid_url = _html.unescape(vid_url)
-                if vid_url.startswith("http"):
-                    filepath = os.path.join(outdir, f"ig_{shortcode}.mp4")
-                    _http_download(vid_url, filepath, GENERAL_PROXY, max_bytes=TELEGRAM_UPLOAD_LIMIT_BYTES)
-                    w, h, dur = _probe_media_dims(filepath)
-                    return filepath, {"id": shortcode, "title": shortcode, "ext": "mp4", "width": w, "height": h, "duration": dur}
-            except Exception as e:
-                log.info("Instagram embed video download failed for %s: %s", shortcode, _short(e))
-
-    # 2. Try EmbeddedMediaImage src or display_url in embedded JSON
-    img_candidates = []
-    for pat in (
-        r'<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"',
-        r'<img[^>]+src="([^"]+)"[^>]+class="[^"]*EmbeddedMediaImage[^"]*"',
-        r'"display_url"\s*:\s*"([^"]+)"',
-    ):
-        for found in re.findall(pat, html):
-            cleaned = found.encode("utf-8").decode("unicode_escape") if "\\u" in found or "\\/" in found else found
-            cleaned = _html.unescape(cleaned.replace("\/", "/"))
-            if cleaned.startswith("http") and cleaned not in img_candidates:
-                img_candidates.append(cleaned)
-
-    for img_url in img_candidates:
-        try:
-            filepath = os.path.join(outdir, f"ig_{shortcode}.jpg")
-            _http_download(img_url, filepath, GENERAL_PROXY, max_bytes=40 * 1024 * 1024)
-            return filepath, {"id": shortcode, "title": shortcode, "ext": "jpg", "_media_kind": "image"}
-        except Exception as e:
-            log.info("Instagram embed image download failed for %s: %s", shortcode, _short(e))
-
-    return None
-
-
-def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
-    """Last-resort image/media grab that doesn't depend on yt-dlp at all: fetch
-    the page HTML directly and pull the og:image meta tag. Tries both desktop
-    User-Agent and Facebook's crawler User-Agent (Instagram serves OpenGraph
-    tags to crawler UAs even when serving a login shell to browsers)."""
-    if "instagram.com" in (url or "").lower():
-        ig_res = _scrape_instagram_embed(url, outdir, want_video=False)
-        if ig_res:
-            return ig_res
-
-    img_url = None
-    for ua in (DEFAULT_UA, _CRAWLER_UA):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": ua})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-        except Exception as e:
-            log.info("og:image scrape fetch (%s) failed for %s: %s", ua[:18], url, _short(e))
-            continue
-
-        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if not m:
-            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, re.I)
-        if m:
-            img_url = _html.unescape(m.group(1))
-            break
-
-    if not img_url:
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+    if not m:
+        # some pages put content before property
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
+    if not m:
         return None
+    img_url = m.group(1).replace("&amp;", "&")
 
     last_err = None
     for cand in _pinimg_candidates(img_url):  # Pinterest: /originals/ first, given size as fallback
@@ -3045,13 +2939,15 @@ def _scrape_og_image(url: str, outdir: str, filename_prefix: str = "image"):
 def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = None):
     """Some posts (Instagram photo-only posts, some Pinterest image pins)
     have no video formats at all, so yt-dlp's normal video download raises
-    'No video formats found!' or 'There is no video in this post'. This grabs
-    the highest-res display image directly instead."""
-    if "instagram.com" in (url or "").lower():
-        ig_res = _scrape_instagram_embed(url, outdir, want_video=False)
-        if ig_res:
-            return ig_res
+    'No video formats found!'. This grabs the highest-res display image
+    directly instead. Used as a safety net for both platforms.
 
+    Note: for some Pinterest image pins, yt-dlp's own extractor raises this
+    same "No video formats found!" error DURING metadata extraction itself
+    (even with download=False) - there's no info dict to pull a thumbnail
+    from at all in that case. When that happens this falls through to a
+    plain HTML og:image scrape instead of propagating the error.
+    """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -3080,11 +2976,13 @@ def _download_image_fallback(url: str, outdir: str, cookies_file: str | None = N
     except Exception as e:
         log.info("yt-dlp metadata extraction for image fallback failed (%s), trying og:image scrape instead.", e)
 
+    # yt-dlp couldn't help at all - try a plain HTML scrape as a last resort.
     return _scrape_og_image(url, outdir, filename_prefix="pin" if "pinterest" in url.lower() or "pin.it" in url.lower() else "image")
 
 
 def _probe_video_stream(input_path: str) -> tuple[str, str]:
-    """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner."""
+    """Returns (vcodec, pix_fmt) by parsing ffmpeg's own -i banner (no
+    ffprobe binary is bundled, only imageio-ffmpeg's ffmpeg)."""
     try:
         proc = subprocess.run(
             [FFMPEG_PATH, "-i", input_path], capture_output=True, text=True, timeout=20
@@ -3103,69 +3001,78 @@ def _probe_video_stream(input_path: str) -> tuple[str, str]:
 
 
 def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, int, int]:
-    """Make a downloaded video play correctly on Telegram-iOS without OOM-killing
-    the 1 GB Railway container.
+    """Make a downloaded video play correctly on Telegram-iOS.
 
-    Fixes applied from production logs (12 OOM kills `code -9` and 1 240s timeout):
-    1. Treat both `yuv420p` and `yuvj420p` (and any `h264`/`avc1` stream that isn't
-       10-bit) as already iOS-compatible so it takes the instant `-c copy` remux
-       path (<0.3s, ~10 MB RAM) instead of launching libx264.
-    2. Skip re-encode (remux only) whenever the file is > 28 MB or process RSS is
-       already > 480 MB.
-    3. When a real re-encode IS needed (e.g. a small VP9/HEVC/AV1 clip), cap both
-       width and height to 720x1280, cap framerate to 30fps, and use `-preset ultrafast`
-       with `rc-lookahead=0:sync-lookahead=0:ref=1:bframes=0` and `-threads 1`.
-       This cuts libx264 memory usage from ~450 MB down to ~45 MB and finishes 4x faster.
+    Why this is needed: Instagram (and some other platforms) often serve a
+    single progressive stream that yt-dlp passes through untouched, and
+    that stream can be HEVC or have the moov atom at the end of the file.
+    Android/desktop Telegram decode/stream that fine, but iOS's
+    VideoToolbox decoder is much stricter about codec/profile compliance
+    and needs a front-loaded moov to start progressive playback - when it
+    can't, it just shows the first frame while the (separately-decoded,
+    more tolerant) AAC audio keeps playing.
+
+    Two paths, in order of preference:
+    1. If the video is ALREADY H.264/yuv420p (the common case for
+       Instagram), just remux it (-c copy, stream copy) - this only
+       rewrites the container to move moov to the front and costs almost
+       no time/CPU/memory, with zero quality loss.
+    2. Only if the codec itself is incompatible (HEVC/VP9/AV1/etc.) do we
+       pay for a real re-encode - and even then at a quality-first CRF
+       since this path is now the rare exception, not the common case.
+
+    Returns (output_path, width, height, duration_seconds), parsed from
+    ffmpeg's own stderr banner (no ffprobe binary is bundled).
     """
     output_path = os.path.join(outdir, f"ios_{uuid.uuid4().hex[:8]}.mp4")
     vcodec, pix_fmt = _probe_video_stream(input_path)
-    is_already_compatible = (
-        vcodec in ("h264", "avc1")
-        and ("10le" not in pix_fmt)
-        and (pix_fmt.startswith(("yuv420", "yuvj420")) or pix_fmt == "")
-    )
+    is_already_compatible = vcodec in ("h264", "avc1") and pix_fmt.startswith("yuv420")
     size_mb = os.path.getsize(input_path) / (1024 * 1024) if os.path.exists(input_path) else 0
-    rss_mb = _current_rss_mb() or 0
-    MAX_REENCODE_MB = 28
+    MAX_REENCODE_MB = 60  # protects against OOM-killing the re-encode on Railway
 
-    if is_already_compatible or size_mb > MAX_REENCODE_MB or rss_mb > 480:
+    if is_already_compatible or size_mb > MAX_REENCODE_MB:
+        # Fast path: lossless remux, just fixes the moov position. Also used
+        # as the safe fallback for oversized incompatible-codec files -
+        # a real re-encode of those risks an OOM kill, so we settle for
+        # "faststart fixed, codec left as-is" rather than crashing.
         if not is_already_compatible:
-            log.info(
-                "skipping re-encode for %.1fMB non-H264 file (RSS=%.0fMB, OOM protection) - remuxing only",
-                size_mb, rss_mb,
-            )
+            log.info("skipping re-encode for %.1fMB non-H264 file (OOM risk) - remuxing only", size_mb)
         cmd = [
             FFMPEG_PATH, "-y", "-nostats", "-i", input_path,
             "-c", "copy",
             "-movflags", "+faststart",
             output_path,
         ]
-        needs_reencode_slot = False
     else:
+        # Slow path: the codec itself isn't iOS-safe, a real re-encode is
+        # unavoidable - but keep quality high since this is now the rare case.
+        # Gated by its own semaphore (see REENCODE_SLOTS): this is the one
+        # step that actually risks an OOM kill, so only one of these runs at
+        # a time even if HEAVY_JOB_SLOTS allows two downloads concurrently.
         cmd = [
             FFMPEG_PATH, "-y", "-nostats", "-i", input_path,
-            "-vf", "scale='min(720,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-r", "30",
+            # only cap truly oversized video, never touch normal Reels/Stories res
+            "-vf", "scale='min(1920,iw)':'-2'",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
-            "-profile:v", "main", "-level", "4.0",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-profile:v", "high", "-level", "4.1",
             "-pix_fmt", "yuv420p",
-            "-x264-params", "rc-lookahead=0:sync-lookahead=0:ref=1:bframes=0:sliced-threads=0",
-            "-threads", "1",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-x264-params", "rc-lookahead=20:ref=3",
+            "-threads", "2",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
             "-movflags", "+faststart",
             output_path,
         ]
-        needs_reencode_slot = True
 
+    needs_reencode_slot = not (is_already_compatible or size_mb > MAX_REENCODE_MB)  # the slow path only
     if needs_reencode_slot:
         _REENCODE_SEMAPHORE.acquire()
     try:
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
         except subprocess.TimeoutExpired:
-            raise RuntimeError("ffmpeg iOS-normalize timed out after 90s")
+            raise RuntimeError("ffmpeg iOS-normalize timed out after 240s")
     finally:
         if needs_reencode_slot:
             _REENCODE_SEMAPHORE.release()
@@ -3175,73 +3082,14 @@ def _ffmpeg_normalize_for_ios(input_path: str, outdir: str) -> tuple[str, int, i
         raise RuntimeError(f"ffmpeg iOS-normalize failed (code {proc.returncode}){killed}: {stderr[-500:]}")
 
     width = height = duration = 0
-    # Match the LAST Video: line in stderr (the output stream dimensions after scaling)
-    v_matches = re.findall(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
-    if v_matches:
-        width, height = int(v_matches[-1][0]), int(v_matches[-1][1])
+    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", stderr)
+    if m:
+        width, height = int(m.group(1)), int(m.group(2))
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
     if m:
         h, mnt, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
         duration = int(h * 3600 + mnt * 60 + s)
     return output_path, width, height, duration
-
-
-def _shrink_video_to_upload_limit(input_path: str, outdir: str) -> str | None:
-    """If a downloaded video exceeds TELEGRAM_UPLOAD_LIMIT_BYTES (49 MB),
-    attempt a fast 1-thread ultrafast transcode at a calculated bitrate to fit
-    into ~44 MB instead of discarding the download and returning an error."""
-    try:
-        size = os.path.getsize(input_path)
-    except OSError:
-        return None
-    if size <= TELEGRAM_UPLOAD_LIMIT_BYTES:
-        return input_path
-    if size > 130 * 1024 * 1024:
-        return None  # too large to transcode quickly on 1GB RAM
-    rss = _current_rss_mb() or 0
-    if rss > 520:
-        return None
-    _, _, duration = _probe_media_dims(input_path)
-    if duration <= 0 or duration > 600:
-        return None
-    # Target ~43 MB total -> (43 * 8192) kbits / duration
-    total_kbps = int((43 * 8192) / max(duration, 1))
-    audio_kbps = 96
-    video_kbps = max(200, min(2500, total_kbps - audio_kbps))
-    shrunk_path = os.path.join(outdir, f"shrunk_{uuid.uuid4().hex[:8]}.mp4")
-    cmd = [
-        FFMPEG_PATH, "-y", "-nostats", "-i", input_path,
-        "-vf", "scale='min(720,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-r", "30",
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.15)}k", "-bufsize", f"{video_kbps * 2}k",
-        "-pix_fmt", "yuv420p",
-        "-x264-params", "rc-lookahead=0:sync-lookahead=0:ref=1:bframes=0:sliced-threads=0",
-        "-threads", "1",
-        "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ar", "44100",
-        "-movflags", "+faststart",
-        shrunk_path,
-    ]
-    _REENCODE_SEMAPHORE.acquire()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-    except Exception as e:
-        log.warning("video shrink timed out/failed: %s", _short(e))
-        return None
-    finally:
-        _REENCODE_SEMAPHORE.release()
-    if proc.returncode == 0 and os.path.exists(shrunk_path) and os.path.getsize(shrunk_path) <= TELEGRAM_UPLOAD_LIMIT_BYTES:
-        log.info(
-            "shrunk oversized video from %.1fMB to %.1fMB to fit Telegram 50MB limit",
-            size / 1048576, os.path.getsize(shrunk_path) / 1048576,
-        )
-        return shrunk_path
-    try:
-        if os.path.exists(shrunk_path):
-            os.remove(shrunk_path)
-    except OSError:
-        pass
-    return None
 
 
 _instagram_cookie_hint_logged = False
@@ -3305,21 +3153,17 @@ def _execute_ytdlp_download(ydl_opts: dict, url: str, outdir: str):
 
 
 def _download_youtube(url: str, outdir: str, use_proxy: bool):
-    """YouTube downloader with H.264 preference and <48 MB size-aware format
-    selection so 50-100 MB 1080p60 streams aren't downloaded when a 720p/480p
-    stream fits inside Telegram's 50 MB Bot API upload limit."""
+    """YouTube is the one platform that needs the InnerTube player_client
+    fallback loop. Merges best video+audio. The rotation, circuit breaker and
+    error tagging live in _yt_with_clients(); an optional proxy is layered on
+    top via YOUTUBE_PROXY / YOUTUBE_PROXY_LIST if configured."""
 
     def configure(ydl_opts: dict) -> None:
-        ydl_opts["format"] = (
-            "bv*[vcodec^=avc1][filesize<44M]+ba[ext=m4a][filesize<5M]/"
-            "bv*[vcodec^=avc1][filesize_approx<44M]+ba[ext=m4a]/"
-            "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/"
-            "b[vcodec^=avc1][filesize<48M]/b[vcodec^=avc1][height<=720]/"
-            "bv*[ext=mp4][filesize<44M]+ba[ext=m4a]/"
-            "bv*[ext=mp4][height<=720]+ba[ext=m4a]/"
-            "bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]/"
-            "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
-        )
+        # Prefer H.264 (avc1) explicitly. `[ext=mp4]` only restricts the
+        # container: YouTube also serves AV1 inside mp4, which many phones /
+        # Telegram players can't decode - the result is a BLACK picture with
+        # working sound. Fallbacks keep the old behaviour if no H.264 exists.
+        ydl_opts["format"] = SMART_YOUTUBE_VIDEO_FORMAT
         ydl_opts["merge_output_format"] = "mp4"
 
     def runner(ydl_opts: dict):
@@ -3329,115 +3173,72 @@ def _download_youtube(url: str, outdir: str, use_proxy: bool):
 
 
 def _download_tiktok(url: str, outdir: str):
-    """TikTok: never proxied, prefers H.264 (avc1) under 48 MB."""
+    """TikTok: never proxied (its CDN blocks most proxy ranges harder than
+    going direct), single attempt, no cookies needed for public videos."""
     ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
-    ydl_opts["format"] = (
-        "bv*[vcodec^=avc1][filesize<45M]+ba[ext=m4a]/"
-        "b[vcodec^=avc1][filesize<48M]/bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]/"
-        "bestvideo[ext=mp4][filesize<45M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<48M]/"
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    )
+    ydl_opts["format"] = SMART_GENERIC_VIDEO_FORMAT
     ydl_opts["merge_output_format"] = "mp4"
     return _execute_ytdlp_download(ydl_opts, url, outdir)
 
 
 def _is_empty_response_error(exc: Exception) -> bool:
     msg = str(exc).lower()
-    return (
-        "failed to parse json" in msg
-        or "expecting value" in msg
-        or "empty media response" in msg
-        or "cookies are no longer valid" in msg
-    )
-
-
-def _is_instagram_no_video_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return (
-        "no video formats found" in msg
-        or "there is no video in this post" in msg
-        or "no video in this post" in msg
-    )
+    return "failed to parse json" in msg or "expecting value" in msg
 
 
 def _download_instagram(url: str, outdir: str, use_proxy: bool):
-    """Instagram downloader:
-    1. Prefers H.264 (`vcodec^=avc1`) and `<45M` formats so Reels don't pull
-       60-85 MB VP9/HEVC streams that require heavy re-encoding or exceed 50 MB.
-    2. Handles both 'No video formats found!' and 'There is no video in this post'
-       by falling back to `_download_image_fallback` (using Instagram's embed endpoint).
-    3. Recognizes 'Instagram sent an empty media response' as a stale-cookie /
-       empty-response signal, retries without cookies, and falls back to
-       `_scrape_instagram_embed` if yt-dlp still fails.
+    """Instagram: optional login cookies (rate-limit/private-account errors
+    otherwise), a photo-only-post image fallback, and an iOS-compatibility
+    remux/re-encode pass since it frequently serves a single progressive
+    stream that Telegram-iOS can't always play directly.
+
+    On an "empty response" failure (Instagram returned no JSON body - the
+    single symptom shared by stale cookies, a rate limit and a login wall,
+    see _note_instagram_empty_response) this retries once WITHOUT cookies:
+    if cookies are the problem that alone fixes it; if not, both attempts
+    fail the same way and that is a much stronger signal to alert on than
+    either failure alone.
     """
-    global _INSTAGRAM_COOKIES_INVALIDATED
-    if "/reels/audio/" in url.lower() or "/audio/" in url.lower():
-        raise RuntimeError(f"UNSUPPORTED_INSTAGRAM_AUDIO_URL: {url}")
 
     def attempt(cookies_file: str | None):
         opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=cookies_file)
-        opts["format"] = (
-            "bv*[vcodec^=avc1][filesize<44M]+ba[ext=m4a]/"
-            "bv*[vcodec^=avc1][filesize_approx<44M]+ba[ext=m4a]/"
-            "b[vcodec^=avc1][filesize<48M]/"
-            "bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]/"
-            "best[ext=mp4][filesize<48M]/bv*[ext=mp4][filesize<44M]+ba[ext=m4a]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        )
+        opts["format"] = SMART_GENERIC_VIDEO_FORMAT
         opts["merge_output_format"] = "mp4"
         if use_proxy and GENERAL_PROXY:
             opts["proxy"] = GENERAL_PROXY
         return _execute_ytdlp_download(opts, url, outdir)
 
-    active_ig_cookies = _active_instagram_cookies()
     try:
-        filename, info = attempt(active_ig_cookies)
+        filename, info = attempt(INSTAGRAM_COOKIES_FILE)
     except Exception as e:
-        if _is_instagram_no_video_error(e):
-            result = _download_image_fallback(url, outdir, active_ig_cookies)
+        if "no video formats found" in str(e).lower():
+            result = _download_image_fallback(url, outdir, INSTAGRAM_COOKIES_FILE)
             if result:
                 return result
             raise
         if not _is_empty_response_error(e):
-            # Even for other errors on public posts/reels, try embed fallback once
-            embed_res = _scrape_instagram_embed(url, outdir, want_video=True)
-            if embed_res:
-                filename, info = embed_res
-            else:
-                _handle_instagram_hard_failure(e)
-                raise
+            _handle_instagram_hard_failure(e)
+            raise
+        if not INSTAGRAM_COOKIES_FILE:
+            # no cookies configured - this WAS already the (only) cookieless
+            # attempt, so there is nothing left to escalate to.
+            _note_instagram_empty_response(e, retried_without_cookies=True)
+            raise
+        log.info("Instagram empty response with cookies, retrying without cookies: %s", url)
+        try:
+            filename, info = attempt(None)
+        except Exception as e2:
+            if not _is_empty_response_error(e2):
+                _handle_instagram_hard_failure(e2)
+                raise e2
+            _note_instagram_empty_response(e2, retried_without_cookies=True)
+            raise e2
         else:
-            if not active_ig_cookies:
-                embed_res = _scrape_instagram_embed(url, outdir, want_video=True)
-                if embed_res:
-                    filename, info = embed_res
-                else:
-                    _note_instagram_empty_response(e, retried_without_cookies=True)
-                    raise
-            else:
-                log.info("Instagram empty response with cookies, retrying without cookies: %s", url)
-                try:
-                    filename, info = attempt(None)
-                except Exception as e2:
-                    if _is_instagram_no_video_error(e2):
-                        result = _download_image_fallback(url, outdir, None)
-                        if result:
-                            return result
-                    embed_res = _scrape_instagram_embed(url, outdir, want_video=True)
-                    if embed_res:
-                        filename, info = embed_res
-                    else:
-                        if not _is_empty_response_error(e2):
-                            _handle_instagram_hard_failure(e2)
-                            raise e2
-                        _note_instagram_empty_response(e2, retried_without_cookies=True)
-                        raise e2
-                else:
-                    _INSTAGRAM_COOKIES_INVALIDATED = True
-                    log.warning(
-                        "INSTAGRAM_COOKIES_HARMFUL: this request failed WITH cookies but worked "
-                        "WITHOUT them - auto-disabling INSTAGRAM_COOKIES for this session."
-                    )
+            log.warning(
+                "INSTAGRAM_COOKIES_HARMFUL: this request failed WITH cookies but worked "
+                "WITHOUT them - INSTAGRAM_COOKIES is likely stale. Export fresh cookies from "
+                "a logged-in session, or remove INSTAGRAM_COOKIES."
+            )
 
     ext = os.path.splitext(filename)[1].lower()
     if SKIP_IOS_NORMALIZE:
@@ -3445,13 +3246,9 @@ def _download_instagram(url: str, outdir: str, use_proxy: bool):
     if ext in (".mp4", ".mov", ".mkv", ".webm"):
         try:
             norm_path, w, h, dur = _ffmpeg_normalize_for_ios(filename, outdir)
-            if norm_path != filename and os.path.exists(filename):
-                os.remove(filename)
+            os.remove(filename)
             filename = norm_path
-            if w and h:
-                info["width"], info["height"] = w, h
-            if dur:
-                info["duration"] = dur
+            info["width"], info["height"], info["duration"] = w, h, dur
         except Exception as e:
             log.warning("iOS normalize failed, sending original file instead: %s", e)
     return filename, info
@@ -3869,7 +3666,7 @@ def _pinterest_fetch_media(media: dict, pin_id: str | None, outdir: str, proxy: 
 
 def _pinterest_ytdlp(url: str, outdir: str, use_proxy: bool):
     ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
-    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    ydl_opts["format"] = SMART_GENERIC_VIDEO_FORMAT
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
@@ -3932,8 +3729,8 @@ def _download_facebook(url: str, outdir: str, use_proxy: bool):
     (datacenter IP) requests, so cookies matter a lot more here than for
     other platforms. Prefers a single progressive format since Facebook's
     extractor often doesn't expose separate video+audio streams to merge."""
-    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=_active_facebook_cookies())
-    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=FACEBOOK_COOKIES_FILE)
+    ydl_opts["format"] = SMART_GENERIC_VIDEO_FORMAT
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
@@ -3955,7 +3752,7 @@ def _download_snapchat(url: str, outdir: str, use_proxy: bool):
     and a shorter socket timeout since a story that has expired tends to
     hang rather than fail fast otherwise."""
     ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
-    ydl_opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    ydl_opts["format"] = SMART_GENERIC_VIDEO_FORMAT
     ydl_opts["merge_output_format"] = "mp4"
     ydl_opts["socket_timeout"] = 20
     if use_proxy and GENERAL_PROXY:
@@ -3982,7 +3779,7 @@ def _run_ytdlp_download(url: str, outdir: str, use_proxy: bool, platform: str | 
         return _download_snapchat(url, outdir, use_proxy)
     # Unknown/unlisted platform - best-effort generic attempt.
     ydl_opts = _build_ydl_opts_base(outdir, ["web"], cookies_file=None)
-    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    ydl_opts["format"] = SMART_GENERIC_VIDEO_FORMAT
     ydl_opts["merge_output_format"] = "mp4"
     if use_proxy and GENERAL_PROXY:
         ydl_opts["proxy"] = GENERAL_PROXY
@@ -4028,18 +3825,8 @@ def classify_download_error(exc: Exception) -> str:
     # genuinely gone/region-blocked/age-restricted for this server, not a
     # bug in the format selector - treat it like a deleted/unavailable post
     # rather than a generic error.
-    if (
-        "video unavailable" in msg
-        or "video is unavailable" in msg
-        or "video is not available" in msg
-        or "this video is not available" in msg
-        or "requested format is not available" in msg
-        or "no video formats found" in msg
-        or "there is no video in this post" in msg
-    ):
+    if "video unavailable" in msg or "video is unavailable" in msg or "requested format is not available" in msg or "no video formats found" in msg:
         return "ERROR_DELETED"
-    if "unsupported url" in msg or "unsupported_instagram_audio_url" in msg:
-        return "ERROR_UNSUPPORTED"
     return "ERROR_UNKNOWN"
 
 
@@ -4116,7 +3903,7 @@ def _run_soundcloud_search_download(query: str, outdir: str) -> tuple[str, str] 
     and tracks longer than MAX_TRACK_SECONDS. Returns (mp3_path,
     webpage_url) or None if nothing playable was found."""
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": SMART_AUDIO_FORMAT,
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -4315,7 +4102,7 @@ def _youtube_audio_download(url: str, outdir: str, deadline: float | None = None
     circuit breaker via _yt_with_clients). Returns the mp3 path."""
 
     def configure(ydl_opts: dict) -> None:
-        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["format"] = SMART_AUDIO_FORMAT
         ydl_opts["match_filter"] = _duration_match_filter()
         ydl_opts["postprocessors"] = [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
@@ -4390,56 +4177,33 @@ def _vk_configured() -> bool:
     )
 
 
-_NOISY_TITLE_RE = re.compile(
-    r"\s*(?:\([^)]*(?:official|video|audio|clip|lyrics?|music|visualizer|remaster|hd|4k|live|version|klip|premyera)[^)]*\)"
-    r"|\[[^\]]*(?:official|video|audio|clip|lyrics?|music|visualizer|remaster|hd|4k|live|version|klip|premyera)[^\]]*\])",
-    re.I,
-)
-
-
-def _clean_song_query_variants(query: str, title: str = "", performer: str = "") -> list[str]:
-    """Build a deduplicated list of search query variants from a potentially
-    noisy YouTube/SoundCloud title so fallback searches on SoundCloud/VK succeed."""
-    candidates = []
-    for raw in (f"{performer} {title}".strip(), title.strip(), query.strip()):
-        if not raw:
-            continue
-        cleaned = _NOISY_TITLE_RE.sub("", raw)
-        cleaned = re.sub(r"\b(?:official\s+music\s+video|official\s+video|official\s+audio|music\s+video|4k|hd)\b", "", cleaned, flags=re.I)
-        cleaned = " ".join(cleaned.replace("|", " ").split()).strip(" -–—")
-        for item in (cleaned, raw):
-            if item and item not in candidates:
-                candidates.append(item)
-    return candidates or [query.strip()]
-
-
-async def search_and_download_song(query: str, outdir: str, fallback_queries: list[str] | None = None) -> tuple[str, str]:
+async def search_and_download_song(query: str, outdir: str) -> tuple[str, str]:
     """Search order: YouTube -> SoundCloud -> VK Music (VK only when
-    configured). If `fallback_queries` are provided (e.g. cleaned title or
-    original user search query), tries them on SoundCloud/VK before failing."""
+    configured). YouTube first because, once a JS runtime (Deno) and
+    yt-dlp-ejs are installed and cookies are valid, it resolves almost
+    everything and gives the most reliable/highest-quality match; the
+    circuit breaker (YOUTUBE_BREAKER) still makes this fail FAST during any
+    future YouTube outage instead of stalling every search. Only the audio
+    stream is downloaded (bestaudio, not the video track) and extracted to
+    mp3 - the end result the user gets is identical to downloading the full
+    video and stripping the picture, but without wasting bandwidth/time on
+    a video stream nobody asked for. Raises RuntimeError if everything fails.
+    """
     loop = asyncio.get_running_loop()
-    queries = []
-    for q in [query] + (fallback_queries or []) + _clean_song_query_variants(query):
-        q = (q or "").strip()
-        if q and q not in queries:
-            queries.append(q)
-
-    result = await loop.run_in_executor(None, _run_youtube_search_download, queries[0], outdir)
+    result = await loop.run_in_executor(None, _run_youtube_search_download, query, outdir)
     if result:
         return result
-    log.info("YouTube had no usable result for '%s' - trying SoundCloud", queries[0])
-    for q in queries[:3]:
-        result = await loop.run_in_executor(None, _run_soundcloud_search_download, q, outdir)
+    log.info("YouTube had no usable result for '%s' - trying SoundCloud", query)
+    result = await loop.run_in_executor(None, _run_soundcloud_search_download, query, outdir)
+    if result:
+        return result
+    if _vk_configured():
+        log.info("SoundCloud had no usable result for '%s' - trying VK Music", query)
+        result = await vk_search_and_download(query, outdir)
         if result:
             return result
-    if _vk_configured():
-        log.info("SoundCloud had no usable result for '%s' - trying VK Music", queries[0])
-        for q in queries[:3]:
-            result = await vk_search_and_download(q, outdir)
-            if result:
-                return result
     else:
-        log.info("SoundCloud had no usable result for '%s' (VK not configured)", queries[0])
+        log.info("SoundCloud had no usable result for '%s' (VK not configured)", query)
     raise RuntimeError(f"'{query}' uchun YouTube, SoundCloud yoki VK Music'da hech narsa topilmadi")
 
 
@@ -4560,26 +4324,14 @@ def _run_youtube_list_search(query: str, limit: int) -> list[dict]:
 
 
 async def text_search_songs(query: str, limit: int = SEARCH_FETCH_LIMIT) -> list[dict]:
-    """When YouTube downloads are healthy, searches YouTube -> SoundCloud -> VK.
-    When YOUTUBE_BREAKER is open (YouTube downloads paused due to bot-check),
-    searches SoundCloud first so the user picks directly playable SoundCloud
-    tracks instead of blocked YouTube video IDs."""
+    """Search order: YouTube -> SoundCloud -> VK Music (matches
+    search_and_download_song's order - see its docstring)."""
     loop = asyncio.get_running_loop()
-    if YOUTUBE_BREAKER.is_open():
-        results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
-        if results:
-            return results
-        if _vk_configured():
-            results = await _vk_list_search(query, limit)
-            if results:
-                return results
-        return await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
-
     results = await loop.run_in_executor(None, _run_youtube_list_search, query, limit)
     if not results:
         log.info("YouTube list search empty for '%s' - trying SoundCloud", query)
         results = await loop.run_in_executor(None, _run_soundcloud_list_search, query, limit)
-    if not results and _vk_configured():
+    if not results:
         log.info("SoundCloud list search empty for '%s' - trying VK Music", query)
         results = await _vk_list_search(query, limit)
     return results
@@ -4591,7 +4343,7 @@ text_search_youtube = text_search_songs
 
 def _run_soundcloud_download_by_url(url: str, outdir: str) -> str:
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": SMART_AUDIO_FORMAT,
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -4737,40 +4489,16 @@ async def recognize_song(audio_path: str) -> dict | None:
     return {"title": track.get("title", "Unknown"), "artist": track.get("subtitle", "Unknown")}
 
 
-def _extract_url_from_message(message: Message) -> str | None:
-    """Extract the first URL from message.text, message.caption, or
-    text_link entities. If the message carries its own playable media
-    (video/audio/voice/video_note), only treat a caption URL as a link
-    request when it points to a supported download platform (Instagram,
-    YouTube, TikTok, Pinterest, Facebook, Snapchat) so forwarded videos
-    with t.me channel links in their caption still reach handle_own_media."""
-    if message.text:
-        m = URL_RE.search(message.text)
-        if m:
-            return m.group(1)
-    if message.entities:
-        for ent in message.entities:
-            if getattr(ent, "url", None) and URL_RE.search(ent.url):
-                return ent.url
-
-    has_playable_media = bool(
-        message.video or message.voice or message.audio or message.video_note
-    )
-    caption_urls: list[str] = []
-    if message.caption:
-        caption_urls.extend(URL_RE.findall(message.caption))
-    if message.caption_entities:
-        for ent in message.caption_entities:
-            if getattr(ent, "url", None) and URL_RE.search(ent.url):
-                caption_urls.append(ent.url)
-    for u in caption_urls:
-        if not has_playable_media or detect_platform(u):
-            return u
-    return None
-
-
 def _has_url(message: Message) -> bool:
-    return _extract_url_from_message(message) is not None
+    """True if a URL appears ANYWHERE in the message text.
+
+    aiogram's F.text.regexp() uses re.match() under the hood, which only
+    checks from the very start of the string. That misses URLs buried
+    inside a longer pasted block (e.g. a video player's debug/stats text
+    that happens to contain a link) - such messages would otherwise fall
+    through to the song-search handler and get searched for verbatim.
+    """
+    return bool(URL_RE.search(message.text or ""))
 
 
 # ============================================================
@@ -4785,10 +4513,11 @@ async def handle_link(message: Message):
         await message.answer(t(lang, "subscribe_required"), reply_markup=subscribe_kb(lang, missing))
         return
 
-    url = _extract_url_from_message(message)
-    if not url:
+    match = URL_RE.search(message.text)
+    if not match:
         await message.answer(t(lang, "no_link"))
         return
+    url = match.group(1)
 
     platform = detect_platform(url)
     if not platform:
@@ -4833,29 +4562,18 @@ async def handle_link(message: Message):
                 await status.edit_text(t(lang, "err_expired"))
             elif code == "ERROR_DELETED":
                 await status.edit_text(t(lang, "link_not_found"))
-            elif code == "ERROR_UNSUPPORTED":
-                await status.edit_text(t(lang, "unsupported_link"))
             else:
                 await status.edit_text(t(lang, "error"))
         return
 
     try:
-        _ensure_within_upload_limit(filepath)
-    except MediaTooLargeError as e:
         loop = asyncio.get_running_loop()
-        shrunk = await loop.run_in_executor(None, _shrink_video_to_upload_limit, filepath, outdir)
-        if shrunk:
-            if shrunk != filepath and os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-            filepath = shrunk
-        else:
-            log.info("media too large to send (%s): %s", platform, e)
-            shutil.rmtree(outdir, ignore_errors=True)
-            await status.edit_text(t(lang, "err_media_too_large"))
-            return
+        parts = await loop.run_in_executor(None, _split_large_media_lossless, filepath, outdir)
+    except MediaTooLargeError as e:
+        log.info("media too large to send or split (%s): %s", platform, e)
+        shutil.rmtree(outdir, ignore_errors=True)
+        await status.edit_text(t(lang, "err_media_too_large"))
+        return
 
     try:
         await status.delete()
@@ -4863,8 +4581,9 @@ async def handle_link(message: Message):
         pass
 
     token = uuid.uuid4().hex[:12]
-    ext = os.path.splitext(filepath)[1].lower()
-    caption = build_media_caption(url)
+    first_path = parts[0]
+    ext = os.path.splitext(first_path)[1].lower()
+    base_caption = build_media_caption(url)
     is_photo = ext in (".jpg", ".jpeg", ".png", ".webp")
     is_gif = ext == ".gif" or info.get("_media_kind") == "gif"
     # A picture / GIF has no soundtrack, so the "recognize music" button would
@@ -4874,40 +4593,50 @@ async def handle_link(message: Message):
     try:
         if is_gif:
             try:
-                await _send_with_retry(lambda: message.answer_animation(FSInputFile(filepath), caption=caption))
+                await message.answer_animation(FSInputFile(first_path), caption=base_caption)
             except TelegramBadRequest as e:
                 log.info("send_animation refused (%s), sending as document", _short(e))
-                await _send_with_retry(lambda: message.answer_document(FSInputFile(filepath), caption=caption))
+                await message.answer_document(FSInputFile(first_path), caption=base_caption)
         elif is_photo:
             # sendPhoto: max 10 MB and strict dimension limits; anything it
             # refuses still reaches the user, uncompressed, as a document.
-            if os.path.getsize(filepath) > TELEGRAM_PHOTO_LIMIT_BYTES:
-                await _send_with_retry(lambda: message.answer_document(FSInputFile(filepath), caption=caption))
+            if os.path.getsize(first_path) > TELEGRAM_PHOTO_LIMIT_BYTES:
+                await message.answer_document(FSInputFile(first_path), caption=base_caption)
             else:
                 try:
-                    await _send_with_retry(lambda: message.answer_photo(FSInputFile(filepath), caption=caption))
+                    await message.answer_photo(FSInputFile(first_path), caption=base_caption)
                 except TelegramBadRequest as e:
                     log.info("send_photo refused (%s), sending as document", _short(e))
-                    await _send_with_retry(lambda: message.answer_document(FSInputFile(filepath), caption=caption))
+                    await message.answer_document(FSInputFile(first_path), caption=base_caption)
         else:
-            try:
-                await _send_with_retry(
-                    lambda: message.answer_video(
-                        FSInputFile(filepath),
-                        caption=caption,
-                        reply_markup=keyboard,
+            total_parts = len(parts)
+            for idx, part_path in enumerate(parts, start=1):
+                part_caption = (
+                    f'{ce("video")} <b>{idx}/{total_parts}</b>\n{base_caption}'
+                    if total_parts > 1
+                    else base_caption
+                )
+                part_kb = keyboard if idx == total_parts else None
+                try:
+                    await message.answer_video(
+                        FSInputFile(part_path),
+                        caption=part_caption,
+                        reply_markup=part_kb,
                         supports_streaming=True,
                         width=info.get("width") or None,
                         height=info.get("height") or None,
-                        duration=info.get("duration") or None,
+                        duration=(info.get("duration") // total_parts if info.get("duration") and total_parts > 1 else info.get("duration")) or None,
                     )
-                )
-            except TelegramBadRequest as e:
-                log.info("send_video refused (%s), sending as document", _short(e))
-                await _send_with_retry(
-                    lambda: message.answer_document(FSInputFile(filepath), caption=caption, reply_markup=keyboard)
-                )
-        _cache_put(FILE_CACHE, token, {"filepath": filepath, "source_url": url}, FILE_CACHE_MAX_SIZE)
+                except TelegramBadRequest as e:
+                    log.info("send_video refused (%s), sending as document", _short(e))
+                    await message.answer_document(FSInputFile(part_path), caption=part_caption, reply_markup=part_kb)
+                # Keep only the first part in /tmp for Shazam recognition; delete extra parts right away!
+                if idx > 1:
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+        _cache_put(FILE_CACHE, token, {"filepath": first_path, "source_url": url}, FILE_CACHE_MAX_SIZE)
         asyncio.create_task(_expire_cache(token, outdir, delay=CACHE_TTL_SECONDS))
     except Exception as e:
         log.warning("send failed: %s", e)
@@ -4928,18 +4657,7 @@ async def _expire_cache(token: str, outdir: str, delay: int):
 # then tries to fetch a clean copy from SoundCloud/VK. If that fails, we
 # fall back to giving a YouTube search link instead of a bare error.
 # ============================================================
-def _is_media_document(message: Message) -> bool:
-    doc = message.document
-    if not doc:
-        return False
-    mime = (doc.mime_type or "").lower()
-    if mime.startswith(("audio/", "video/")):
-        return True
-    ext = os.path.splitext((doc.file_name or "").lower())[1]
-    return ext in (".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".mp4", ".mov", ".mkv", ".webm")
-
-
-@router.message(F.video | F.voice | F.audio | F.video_note | F.func(_is_media_document))
+@router.message(F.video | F.voice | F.audio | F.video_note)
 async def handle_own_media(message: Message):
     lang = await get_user_lang(message.from_user.id)
 
@@ -4948,7 +4666,7 @@ async def handle_own_media(message: Message):
         await message.answer(t(lang, "subscribe_required"), reply_markup=subscribe_kb(lang, missing))
         return
 
-    media = message.video or message.voice or message.audio or message.video_note or message.document
+    media = message.video or message.voice or message.audio or message.video_note
     if not media:
         return
 
@@ -4964,9 +4682,7 @@ async def handle_own_media(message: Message):
         file = await bot.get_file(media.file_id)
         ext = os.path.splitext(file.file_path or "")[1] or ".bin"
         src_path = os.path.join(outdir, f"input{ext}")
-        buf = await bot.download_file(file.file_path)
-        with open(src_path, "wb") as f:
-            f.write(buf.read())
+        await bot.download_file(file.file_path, destination=src_path)
 
         loop = asyncio.get_running_loop()
         async with HeavyJobSlot(status, lang, "recognizing"):
@@ -4997,14 +4713,12 @@ async def handle_own_media(message: Message):
                 await message.answer(text)
             return
 
-        await _send_with_retry(
-            lambda: message.answer_audio(
-                FSInputFile(mp3_path),
-                title=song["title"],
-                performer=song["artist"],
-                caption=build_song_caption(song_link),
-                reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
-            )
+        await message.answer_audio(
+            FSInputFile(mp3_path),
+            title=song["title"],
+            performer=song["artist"],
+            caption=build_song_caption(song_link),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
         )
         try:
             await status.delete()
@@ -5012,24 +4726,19 @@ async def handle_own_media(message: Message):
             pass
     except Exception as e:
         log.warning("own media recognition failed: %s", e)
-        err_key = "err_file_too_big_input" if "file is too big" in str(e).lower() else "error"
+        err_low = str(e).lower()
+        if "file is too big" in err_low:
+            err_key = "err_file_too_big_input"
+        elif "memory_watermark_exceeded" in err_low:
+            err_key = "err_busy"
+        else:
+            err_key = "error"
         try:
             await status.edit_text(t(lang, err_key))
         except Exception:
             await message.answer(t(lang, err_key))
     finally:
         shutil.rmtree(outdir, ignore_errors=True)
-
-
-_BOT_STATUS_PHRASES = (
-    "youtube hozircha vaqtincha ishlamayapti",
-    "youtube сейчас временно не работает",
-    "youtube is temporarily unavailable",
-    "yuklanmoqda, biroz kuting",
-    "xatolik yuz berdi",
-    "bu post topilmadi",
-    "kechirasiz, hozircha tiktok",
-)
 
 
 @router.message(F.text & ~F.func(_has_url) & ~F.text.startswith("/"))
@@ -5041,12 +4750,14 @@ async def handle_text_search(message: Message):
         await message.answer(t(lang, "subscribe_required"), reply_markup=subscribe_kb(lang, missing))
         return
 
-    query = strip_tg_emoji(message.text or "").strip()
+    query = message.text.strip()
     if not query:
         return
-    # Ignore bot's own error/status messages forwarded back by users or overly long blocks
-    q_low = query.lower()
-    if len(query) > 150 or "\n" in query or any(p in q_low for p in _BOT_STATUS_PHRASES):
+    # Ignore bot's own status/error messages if a user copies or forwards them back into chat
+    if any(
+        marker in query.lower()
+        for marker in ("bot hozir band", "бот сейчас перегружен", "bot is under heavy load", "yuklanmoqda, biroz kuting")
+    ):
         await message.answer(t(lang, "send_link"))
         return
 
@@ -5143,34 +4854,24 @@ async def cb_search_action(call: CallbackQuery):
             try:
                 mp3_path = await download_song_by_url(entry["url"], work_dir, source=source)
                 link_for_button = entry.get("url") if source in ("soundcloud", "youtube") else None
-            except MediaTooLargeError:
-                raise
             except Exception as e:
-                # Production logs showed 23 failures in `cb_search_action` where
-                # `source == "youtube"` failed with YOUTUBE_IP_BLOCKED,
-                # YOUTUBE_CIRCUIT_OPEN, or "This video is not available", and
-                # previously never fell back to SoundCloud/VK. Always fall back
-                # to `search_and_download_song` with cleaned title + original query!
-                log.info(
-                    "picked %s track failed (%s), falling back to multi-source search for '%s'",
-                    source, _short(e, 140), title,
-                )
-                fallback_variants = _clean_song_query_variants(
-                    str(data.get("query") or ""), title=title, performer=performer
-                )
-                primary_q = fallback_variants[0] if fallback_variants else f"{performer} {title}".strip()
-                mp3_path, link_for_button = await search_and_download_song(
-                    primary_q, work_dir, fallback_queries=fallback_variants[1:]
-                )
+                if source == "soundcloud" and _is_drm_error(e):
+                    # this specific track is Go+/DRM-locked (now remembered in
+                    # the blocklist) - fall back to a fresh search using its
+                    # title/artist; the search skips the DRM track itself
+                    log.info("picked track is DRM-protected, falling back to search: %s", title)
+                    mp3_path, link_for_button = await search_and_download_song(
+                        f"{performer} {title}".strip(), work_dir
+                    )
+                else:
+                    raise
         _ensure_within_upload_limit(mp3_path)
-        await _send_with_retry(
-            lambda: call.message.answer_audio(
-                FSInputFile(mp3_path),
-                title=title,
-                performer=performer,
-                caption=build_song_caption(link_for_button),
-                reply_markup=song_result_kb(lang, title, performer, link_for_button),
-            )
+        await call.message.answer_audio(
+            FSInputFile(mp3_path),
+            title=title,
+            performer=performer,
+            caption=build_song_caption(link_for_button),
+            reply_markup=song_result_kb(lang, title, performer, link_for_button),
         )
         try:
             await status.delete()
@@ -5230,9 +4931,10 @@ async def cb_recognize_music(call: CallbackQuery):
     video_outdir = os.path.dirname(video_path)
     try:
         loop = asyncio.get_running_loop()
-        audio_sample = await loop.run_in_executor(
-            None, extract_audio_for_recognition, video_path, work_dir
-        )
+        async with HeavyJobSlot(status, lang, "recognizing"):
+            audio_sample = await loop.run_in_executor(
+                None, extract_audio_for_recognition, video_path, work_dir
+            )
         if not audio_sample:
             await status.edit_text(t(lang, "not_recognized"))
             return
@@ -5257,9 +4959,7 @@ async def cb_recognize_music(call: CallbackQuery):
         query = f"{song['artist']} {song['title']}"
         try:
             async with HeavyJobSlot(status, lang, "downloading"):
-                mp3_path, song_link = await search_and_download_song(
-                    query, work_dir, fallback_queries=[song["title"]]
-                )
+                mp3_path, song_link = await search_and_download_song(query, work_dir)
             _ensure_within_upload_limit(mp3_path)
         except Exception as e:
             log.info("music download failed, falling back to YouTube link: %s", e)
@@ -5270,14 +4970,12 @@ async def cb_recognize_music(call: CallbackQuery):
             except Exception:
                 await call.message.answer(text)
             return
-        await _send_with_retry(
-            lambda: call.message.answer_audio(
-                FSInputFile(mp3_path),
-                title=song["title"],
-                performer=song["artist"],
-                caption=build_song_caption(song_link),
-                reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
-            )
+        await call.message.answer_audio(
+            FSInputFile(mp3_path),
+            title=song["title"],
+            performer=song["artist"],
+            caption=build_song_caption(song_link),
+            reply_markup=song_result_kb(lang, song["title"], song["artist"], song_link),
         )
         # the mp3 itself is the result now - clear the "recognizing.../found..." status line
         try:
@@ -5300,17 +4998,6 @@ async def cb_recognize_music(call: CallbackQuery):
 async def _expire_artist_cache(token: str, delay: int):
     await asyncio.sleep(delay)
     ARTIST_SEARCH_CACHE.pop(token, None)
-
-
-@router.message()
-async def handle_unmatched_message(message: Message):
-    """Catch-all for unsupported message types (stickers, locations, contacts,
-    non-media documents, etc.) so updates are gracefully acknowledged instead
-    of logged as 'Update id=... is not handled'."""
-    if message.chat.type != ChatType.PRIVATE:
-        return
-    lang = await get_user_lang(message.from_user.id)
-    await message.answer(t(lang, "send_link"))
 
 
 @router.callback_query(F.data.startswith("asearch:"))
